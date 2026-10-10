@@ -1,0 +1,15 @@
+# Local tooling caches and scratch dirs (package-local)
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.pytest_basetemp/
+.pytest_basetemp_*/
+.pytest_bt*/
+.pb_*/
+*.egg-info/
+build/
+dist/
+.venv/
+.DS_Store
+__pycache__/
+*.pyc

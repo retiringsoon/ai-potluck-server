@@ -1,0 +1,45 @@
+[project]
+name = "ai-potluck-server"
+version = "0.1.0"
+description = "AI potluck center: gateway, settlement books, and operator tooling over the ai-potluck protocol core"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "The ai-potluck authors" },
+]
+requires-python = ">=3.11"
+dependencies = [
+    "ai-potluck>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.11",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+potluck-server = "aipotluck_server.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aipotluck_server"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src/aipotluck_server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
