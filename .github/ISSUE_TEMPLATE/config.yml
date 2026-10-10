@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+# When the standalone public repository exists, enable Discussions and
+# uncomment the contact links below (drop-in ready):
+#
+# contact_links:
+#   - name: Questions & ideas
+#     url: https://github.com/<org>/ai-potluck-server/discussions/categories/q-a
+#     about: Ask anything before filing an issue — early users are especially welcome
+#   - name: Roadmap discussion
+#     url: https://github.com/<org>/ai-potluck-server/discussions/categories/roadmap
+#     about: Weigh in on what ships next (see docs/ROADMAP.md)
