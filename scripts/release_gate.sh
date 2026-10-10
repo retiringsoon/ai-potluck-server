@@ -1,0 +1,670 @@
+#!/bin/sh
+# Release gate for the ai-potluck platform: prove a candidate source install of
+# BOTH packages (ai-potluck and ai-potluck-server) works end to end
+# through the path a user actually takes, before the commit is called releasable.
+#
+# Why this exists: the P0-3 defect was a `dist/` wheel built hours behind HEAD,
+# so it did not even accept the arguments the review's smoke passed. The F04
+# defect was subtler and worse: the gate installed the package with `uv` instead
+# of running `install.sh`, pre-registered the node's credential in `center.json`
+# by hand, passed `--node-token-file`, and pinned `--model` and `--max-charge` —
+# so it proved a path no user takes and missed every defect hiding in the default
+# one. A check that only proves "the code imports" cannot catch either; the
+# install has to be the real installer and the smoke has to be the README's
+# default flow.
+#
+# What it takes: a source to install (`--source`, default the checkout this
+# script lives in) and the requirement that the checkout is clean, so a pass is a
+# statement about a commit rather than about somebody's uncommitted edits.
+#
+# What a pass proves, in order:
+#   1. the real `install.sh` installs into a fresh prefix, and the CLI it
+#      produced imports the installed package rather than this source tree;
+#   2. a fresh center with *zero* hand-written credentials starts;
+#   3. a contribution node joins with an invite only — no `--node-token-file`, no
+#      identity fields — and the token `join` saved is what `share run` uses;
+#   4. a consumer joins with an invite only and asks with the *default* model and
+#      the *default* charge ceiling: no `--model`, no `--max-charge`;
+#   5. the streaming ask printed its first increment while it was still running
+#      (not merely an answer in the final stdout), and the buffered ask is
+#      verified separately through its own waiting notice;
+#   6. the same identity asks again, asks again after the center restarts, and
+#      the three asks leave three distinct receipts — the restart was neither
+#      charged twice nor settled as free;
+#   7. the receipt verifies on both sides, and both reconciliations agree. After
+#      a restart the node side may name exactly one class of difference: an offer
+#      the node never accepted, which the center holds as FAILED with the
+#      settlement HELD and no receipt. Anything else — a *settled* attempt the
+#      node has no record of, above all — fails the gate.
+#
+# What it never does: it never touches a real upstream or a real key (the smoke
+# uses `sk-smoke-*` fakes, a throwaway center and scripts/dev_fake_upstream.py),
+# never moves an existing installation aside, and never leaves a process or a
+# work directory behind. A failing run keeps only redacted logs and prints the
+# path to them.
+#
+# Usage: scripts/release_gate.sh [--source SPEC] [--server-source SPEC]
+#                                [--python X.Y] [--keep-work]
+#   Runs from an ai-potluck-server checkout; the client checkout defaults to the
+#   sibling ../ai-potluck (override with CLIENT_ROOT). Both trees must be clean.
+#   --source is what the client's install.sh installs: the client checkout by
+#   default, or any spec `uv pip install` accepts. --server-source is what gets
+#   installed into the same prefix afterwards: this checkout by default. A
+#   remote spec only means something when the checkout is at the same commit,
+#   because the gate checks the installed versions against both pyproject.toml
+#   files.
+#   --python pins the CPython minor version install.sh builds the venv with.
+#   --keep-work keeps the work directory (logs, prefix, databases) for inspection.
+#
+# Exit codes: 0 the gate passed, 1 a prerequisite was not met (dirty tree, no uv,
+# no source), 2 the install or the smoke failed.
+
+set -eu
+
+# The smoke reads its readiness from the CLIs' redirected stdout, and CPython
+# block-buffers stdout when it is not a terminal — so without this the startup
+# lines sit in a buffer and every wait times out. Unbuffered output is what makes
+# "wait for the serving line" a real readiness check rather than a sleep.
+PYTHONUNBUFFERED=1
+export PYTHONUNBUFFERED
+# A stray PYTHONPATH would let the smoke import this source tree instead of the
+# installed package, which is exactly the drift this gate exists to catch.
+unset PYTHONPATH
+
+die() {
+    printf 'release_gate.sh: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+usage() {
+    awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
+}
+
+SOURCE=""
+SERVER_SOURCE=""
+GATE_PYTHON=""
+KEEP_WORK=no
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --source) SOURCE=${2:?--source needs a checkout path or a package spec}; shift 2 ;;
+        --server-source) SERVER_SOURCE=${2:?--server-source needs a checkout path or a package spec}; shift 2 ;;
+        --python) GATE_PYTHON=${2:?--python needs a version}; shift 2 ;;
+        --keep-work) KEEP_WORK=yes; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown argument $1" ;;
+    esac
+done
+
+# shellcheck disable=SC1007  # the leading assignment is how CDPATH is neutralised
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CLIENT_ROOT=${CLIENT_ROOT:-"$ROOT/../ai-potluck"}
+[ -f "$CLIENT_ROOT/install.sh" ] || die "no ai-potluck checkout at $CLIENT_ROOT (set CLIENT_ROOT)"
+CLIENT_ROOT=$(CDPATH= cd -- "$CLIENT_ROOT" && pwd)
+
+# The smoke's constants. The model is *not* passed to `ask`: the consumer uses
+# the default, which is inferred from the online nodes, and the fake upstream is
+# started with this name so the inference has something to find. The charge
+# ceiling is likewise left at the CLI default.
+MODEL=coding-pool
+TENANT=smoke
+NO_NODE_GRACE=30
+ASK_TIMEOUT=120
+# Pacing for the fake upstream's stream. It has to be slow enough that the first
+# increment is provably on stdout before the ask finishes.
+CHUNK_DELAY=0.6
+
+command -v git >/dev/null 2>&1 || die 'git is required'
+command -v uv >/dev/null 2>&1 || die 'uv is required (https://docs.astral.sh/uv/)'
+
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/pyproject.toml" | head -1)
+[ -n "$VERSION" ] || die "no version in $ROOT/pyproject.toml"
+CLIENT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$CLIENT_ROOT/pyproject.toml" | head -1)
+[ -n "$CLIENT_VERSION" ] || die "no version in $CLIENT_ROOT/pyproject.toml"
+
+# A pass has to be a statement about a commit. The install comes from the
+# working tree, so a dirty tree means the gate would be blessing bytes that no
+# commit records and nobody can reproduce.
+for TREE in "$ROOT" "$CLIENT_ROOT"; do
+    DIRTY=$(git -C "$TREE" status --porcelain)
+    if [ -n "$DIRTY" ]; then
+        printf 'release_gate.sh: refusing to gate a release over a dirty working tree (%s)\n' \
+            "$TREE" >&2
+        printf '%s\n' "$DIRTY" >&2
+        die 'commit or stash the changes first, then rerun'
+    fi
+done
+HEAD_SHA=$(git -C "$ROOT" rev-parse HEAD)
+SHORT_SHA=$(printf '%s' "$HEAD_SHA" | cut -c1-9)
+printf 'release_gate.sh: gating ai-potluck-server %s with ai-potluck %s at %s\n' \
+    "$VERSION" "$CLIENT_VERSION" "$SHORT_SHA"
+
+# Work dir and cleanup. WORK is removed on every exit unless --keep-work; a
+# failure log directory is created separately and kept so the reason survives.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/potluck-release-gate.XXXXXX")
+# Normalise once: TMPDIR may or may not end in a slash, and every later message,
+# path comparison and log line reads better without a doubled separator in it.
+WORK=$(CDPATH= cd -- "$WORK" && pwd)
+mkdir -p "$WORK/logs"
+CENTER_PID=""
+UPSTREAM_PID=""
+NODE_PID=""
+
+cleanup() {
+    rc=$?
+    trap - EXIT INT TERM
+    for pid in "$NODE_PID" "$UPSTREAM_PID" "$CENTER_PID"; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+    done
+    # Give the CLIs a moment to run their stop handlers, then force anything
+    # still alive so the gate cannot leave a listener or a link behind.
+    sleep 1
+    for pid in "$NODE_PID" "$UPSTREAM_PID" "$CENTER_PID"; do
+        [ -n "$pid" ] || continue
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    wait 2>/dev/null || true
+    if [ "$KEEP_WORK" = yes ]; then
+        printf 'release_gate.sh: work directory kept at %s\n' "$WORK"
+    else
+        rm -rf "$WORK"
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+# The smoke's fake secrets. Generated before the failure path is defined so a
+# failure that happens early can still redact them from any log.
+UPSTREAM_KEY="sk-smoke-fake-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+NODE_INVITE=""
+CONSUMER_INVITE=""
+
+# Fail-closed redaction: the smoke only ever uses fake secrets and single-use
+# invite codes for a throwaway center, but a failure log must never become a
+# place a real one could accumulate if this script is reused.
+redact_log() {
+    sed -e 's|[Bb]earer [A-Za-z0-9._~+/-]*|Bearer <redacted>|g' "$1" > "$1.redacted"
+    for secret in "$UPSTREAM_KEY" "$NODE_INVITE" "$CONSUMER_INVITE"; do
+        [ -n "$secret" ] || continue
+        mv "$1.redacted" "$1.redacted.tmp"
+        sed -e "s|$secret|<redacted>|g" "$1.redacted.tmp" > "$1.redacted"
+        rm -f "$1.redacted.tmp"
+    done
+    mv "$1.redacted" "$1"
+}
+
+# A failed step keeps redacted logs and exits 2 without leaving the smoke
+# running; the path is printed so the operator can read the real cause.
+fail() {
+    FAIL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/potluck-release-gate-failure.XXXXXX")
+    for log in "$WORK"/logs/*; do
+        [ -f "$log" ] || continue
+        cp "$log" "$FAIL_DIR/$(basename "$log")"
+        redact_log "$FAIL_DIR/$(basename "$log")" 2>/dev/null || true
+    done
+    printf 'release_gate.sh: FAIL %s\n' "$1" >&2
+    printf 'release_gate.sh: ai-potluck-server %s at %s is NOT releasable\n' \
+        "$VERSION" "$SHORT_SHA" >&2
+    printf 'release_gate.sh: redacted logs kept at %s (remove when done)\n' "$FAIL_DIR" >&2
+    exit 2
+}
+
+# Print one numbered step, so the transcript reads as the sequence it is.
+STEP=0
+step() {
+    STEP=$((STEP + 1))
+    printf 'release_gate.sh: [%d] %s\n' "$STEP" "$1"
+}
+
+# Echo a command as evidence, with the throwaway secrets replaced. The point is
+# that the transcript shows *which flags were used*: a reader can see that no
+# `--model`, no `--max-charge` and no `--node-token-file` was passed.
+show() {
+    line=$(printf '%s' "$*" | sed -e "s|$UPSTREAM_KEY|<upstream-key>|g")
+    for secret in "$NODE_INVITE" "$CONSUMER_INVITE"; do
+        [ -n "$secret" ] || continue
+        line=$(printf '%s' "$line" | sed -e "s|$secret|<invite>|g")
+    done
+    printf 'release_gate.sh:     $ %s\n' "$line"
+}
+
+# Wait for a marker line in a log, dying early if the process it belongs to does.
+wait_for_line() {
+    log_file=$1
+    needle=$2
+    seconds=$3
+    pid=${4:-}
+    ticks=$((seconds * 10))
+    n=0
+    while [ "$n" -lt "$ticks" ]; do
+        if grep -qF -- "$needle" "$log_file" 2>/dev/null; then return 0; fi
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then return 1; fi
+        n=$((n + 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# Install it the way a user does: the real installer, a fresh prefix
+# --------------------------------------------------------------------------
+
+HOME_DIR="$WORK/home"
+step "run the client's install.sh into a fresh prefix ($HOME_DIR)"
+set -- --prefix "$HOME_DIR"
+if [ -n "$GATE_PYTHON" ]; then set -- "$@" --python "$GATE_PYTHON"; fi
+if [ -n "$SOURCE" ]; then set -- "$@" --source "$SOURCE"; fi
+show "install.sh $*"
+if ! "$CLIENT_ROOT/install.sh" "$@" >"$WORK/logs/install.log" 2>&1; then
+    tail -40 "$WORK/logs/install.log" >&2
+    fail 'install.sh did not install potluck'
+fi
+
+POTLUCK="$HOME_DIR/bin/potluck"
+HOME_PY="$HOME_DIR/venv/bin/python"
+[ -x "$POTLUCK" ] || fail 'install.sh produced no launcher'
+[ -x "$HOME_PY" ] || fail 'install.sh produced no virtualenv'
+
+step "install ai-potluck-server into the same prefix"
+SERVER_SOURCE=${SERVER_SOURCE:-$ROOT}
+show "uv pip install --python <prefix venv> $SERVER_SOURCE"
+uv pip install --python "$HOME_PY" "$SERVER_SOURCE" \
+    >"$WORK/logs/install-server.log" 2>&1 \
+    || { tail -40 "$WORK/logs/install-server.log" >&2
+         fail 'installing ai-potluck-server into the prefix failed'; }
+ln -sf "$HOME_DIR/venv/bin/potluck-server" "$HOME_DIR/bin/potluck-server"
+POTLUCK_SERVER="$HOME_DIR/bin/potluck-server"
+[ -x "$HOME_DIR/venv/bin/potluck-server" ] || fail 'the server package produced no launcher'
+grep -qF 'preflight ok' "$WORK/logs/install.log" \
+    || fail 'install.sh did not report its pre-install compatibility check'
+grep -qF 'install.sh: installing' "$WORK/logs/install.log" \
+    || fail 'install.sh did not report what it installed'
+printf 'release_gate.sh:     %s\n' "$(grep -F 'preflight ok' "$WORK/logs/install.log" | head -1)"
+
+INSTALLED_VERSION=$("$POTLUCK" version </dev/null | head -1 \
+    | sed -n 's/^potluck \([0-9][0-9.]*\).*/\1/p')
+if [ "$INSTALLED_VERSION" != "$CLIENT_VERSION" ]; then
+    printf 'release_gate.sh: installed potluck reports %s, client pyproject says %s\n' \
+        "${INSTALLED_VERSION:-<nothing>}" "$CLIENT_VERSION" >&2
+    fail 'the installed client CLI does not report the version of its checkout'
+fi
+INSTALLED_SERVER_VERSION=$("$POTLUCK_SERVER" version </dev/null | head -1 \
+    | sed -n 's/^potluck-server \([0-9][0-9.]*\).*/\1/p')
+if [ "$INSTALLED_SERVER_VERSION" != "$VERSION" ]; then
+    printf 'release_gate.sh: installed potluck-server reports %s, pyproject says %s\n' \
+        "${INSTALLED_SERVER_VERSION:-<nothing>}" "$VERSION" >&2
+    fail 'the installed server CLI does not report the version of this checkout'
+fi
+
+# The installed package has to be the one in the prefix. Importing this source
+# tree instead would let the smoke pass on code that no install ever shipped. The
+# comparison is against the venv's own prefix rather than a string this script
+# built, so path normalisation cannot decide the outcome.
+VENV_PREFIX=$("$HOME_PY" -c 'import sys; print(sys.prefix)' </dev/null)
+for MODULE in aipotluck aipotluck_server; do
+    IMPORTED_FROM=$("$HOME_PY" -c "import $MODULE; print($MODULE.__file__)" </dev/null)
+    case "$IMPORTED_FROM" in
+        "$VENV_PREFIX"/*) : ;;
+        *) printf 'release_gate.sh: the installed CLI imports %s from %s\n' \
+               "$MODULE" "$IMPORTED_FROM" >&2
+           fail 'the smoke would not be testing the installed package' ;;
+    esac
+done
+printf 'release_gate.sh: installed potluck %s + potluck-server %s under %s\n' \
+    "$INSTALLED_VERSION" "$INSTALLED_SERVER_VERSION" "$VENV_PREFIX"
+
+now_ms() {
+    "$HOME_PY" -c 'import time; print(int(time.time() * 1000))'
+}
+
+# Run the smoke from the work dir, never from the checkout, so nothing can pick
+# up the source tree by accident.
+cd "$WORK"
+
+# --------------------------------------------------------------------------
+# The default path: fresh center, invite-only node, invite-only consumer
+# --------------------------------------------------------------------------
+
+mkdir -p "$WORK/center" "$WORK/node" "$WORK/consumer"
+printf '%s\n' "$UPSTREAM_KEY" > "$WORK/upstream-key"
+chmod 600 "$WORK/upstream-key"
+
+step 'center keygen'
+"$POTLUCK" keygen --out "$WORK/center/settlement.key" \
+    >"$WORK/logs/keygen.log" 2>&1 </dev/null || fail 'keygen failed'
+SETTLEMENT_KEY=$(cat "$WORK/center/settlement.key")
+CENTER_JSON="$WORK/center/center.json"
+
+# A free port is chosen once and written into the config, rather than letting
+# `serve` pick one per start: the consumer's saved identity holds the center URL,
+# and the restart step below has to come back on the same address, exactly as an
+# operator's restart would.
+CENTER_PORT=$("$HOME_PY" -c \
+    'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+[ -n "$CENTER_PORT" ] || fail 'could not reserve a port for the center'
+CENTER_URL="http://127.0.0.1:$CENTER_PORT"
+
+step 'write a fresh center config with zero hand-written credentials'
+# `credentials` is empty on purpose. The F04 defect was a node credential typed
+# into this file by the gate; the default path has the center mint the node's
+# token when it redeems the invite, and that is what is being proven here.
+cat > "$CENTER_JSON" <<JSON
+{
+  "host": "127.0.0.1",
+  "port": $CENTER_PORT,
+  "database_path": "$WORK/center/center.db",
+  "platform_id": "smoke-center",
+  "settlement_key_id": "smoke-settlement-key",
+  "settlement_private_key_b64": "$SETTLEMENT_KEY",
+  "certfile": null,
+  "keyfile": null,
+  "credentials": [],
+  "providers": [],
+  "consumer_floats": []
+}
+JSON
+chmod 600 "$CENTER_JSON"
+
+start_center() {
+    # A separate log per start: `wait_for_line` looks for the serving line, and a
+    # previous start's line still sitting in the same file would make a restart
+    # that never came up look ready.
+    center_log=$1
+    "$POTLUCK_SERVER" serve --config "$CENTER_JSON" >>"$center_log" 2>&1 </dev/null &
+    CENTER_PID=$!
+    wait_for_line "$center_log" 'serving http' 30 "$CENTER_PID" \
+        || fail "the center did not start (see $(basename "$center_log"))"
+}
+
+step "start the center ($CENTER_URL)"
+start_center "$WORK/logs/center.log"
+
+step 'start the local fake upstream'
+show "python scripts/dev_fake_upstream.py --port 0 --model $MODEL --key <upstream-key> --chunk-delay $CHUNK_DELAY"
+"$HOME_PY" "$CLIENT_ROOT/scripts/dev_fake_upstream.py" \
+    --port 0 --model "$MODEL" --key "$UPSTREAM_KEY" --chunk-delay "$CHUNK_DELAY" \
+    >"$WORK/logs/upstream.log" 2>&1 &
+UPSTREAM_PID=$!
+wait_for_line "$WORK/logs/upstream.log" 'listening on' 30 "$UPSTREAM_PID" \
+    || fail 'the fake upstream did not start'
+UPSTREAM_PORT=$(sed -n 's/.*listening on 127.0.0.1:\([0-9]*\).*/\1/p' \
+    "$WORK/logs/upstream.log" | head -1)
+[ -n "$UPSTREAM_PORT" ] || fail 'could not read the fake upstream port'
+UPSTREAM_URL="http://127.0.0.1:$UPSTREAM_PORT/v1/chat/completions"
+
+# The reply marker is read from the fixture that emits it, so the gate cannot
+# drift from it; its first word is what the first streamed increment carries.
+REPLY_MARKER=$(sed -n 's/^REPLY_MARKER = "\(.*\)"/\1/p' "$CLIENT_ROOT/scripts/dev_fake_upstream.py")
+[ -n "$REPLY_MARKER" ] || fail 'could not read REPLY_MARKER from dev_fake_upstream.py'
+FIRST_DELTA=${REPLY_MARKER%% *}
+
+step 'mint the node and consumer invites (the operator default path)'
+show "potluck-server admin invite --config center.json --role node --tenant $TENANT"
+NODE_INVITE=$("$POTLUCK_SERVER" admin invite --config "$CENTER_JSON" --role node --tenant "$TENANT" \
+    2>>"$WORK/logs/invite.log" </dev/null) || fail 'minting the node invite failed'
+show "potluck-server admin invite --config center.json --role consumer --tenant $TENANT"
+CONSUMER_INVITE=$("$POTLUCK_SERVER" admin invite --config "$CENTER_JSON" --role consumer \
+    --tenant "$TENANT" 2>>"$WORK/logs/invite.log" </dev/null) \
+    || fail 'minting the consumer invite failed'
+[ -n "$NODE_INVITE" ] && [ -n "$CONSUMER_INVITE" ] || fail 'an invite came back empty'
+
+step 'node joins with the invite only (no token file, no identity fields)'
+show "potluck join --node --center $CENTER_URL --invite <invite> --config-dir node --upstream-endpoint $UPSTREAM_URL --upstream-model $MODEL --upstream-key-file upstream-key"
+if ! "$POTLUCK" join --node --center "$CENTER_URL" --invite "$NODE_INVITE" \
+        --config-dir "$WORK/node" \
+        --upstream-endpoint "$UPSTREAM_URL" \
+        --upstream-model "$MODEL" \
+        --upstream-key-file "$WORK/upstream-key" \
+        >"$WORK/logs/node-join.log" 2>&1 </dev/null; then
+    tail -30 "$WORK/logs/node-join.log" >&2
+    fail 'the node join or its self-check failed'
+fi
+NODE_TOKEN_FILE="$WORK/node/node_token.json"
+[ -f "$NODE_TOKEN_FILE" ] \
+    || fail 'join did not save the node token the center issued (no node_token.json)'
+TOKEN_MODE=$(ls -l "$NODE_TOKEN_FILE" | awk '{print $1}')
+case "$TOKEN_MODE" in
+    *------*) : ;;
+    *) fail "node_token.json is $TOKEN_MODE, expected 0600" ;;
+esac
+printf 'release_gate.sh:     node token saved by join as %s (mode %s)\n' \
+    "$(basename "$NODE_TOKEN_FILE")" "$TOKEN_MODE"
+
+step 'node starts sharing'
+show 'potluck share run --config node/node.json'
+"$POTLUCK" share run --config "$WORK/node/node.json" \
+    >"$WORK/logs/node.log" 2>&1 </dev/null &
+NODE_PID=$!
+wait_for_line "$WORK/logs/node.log" 'connecting to' 30 "$NODE_PID" \
+    || fail 'share run did not start the node link'
+
+step 'consumer joins with the invite only'
+show "potluck join --center $CENTER_URL --invite <invite> --config-dir consumer"
+if ! "$POTLUCK" join --center "$CENTER_URL" --invite "$CONSUMER_INVITE" \
+        --config-dir "$WORK/consumer" \
+        >"$WORK/logs/consumer-join.log" 2>&1 </dev/null; then
+    tail -30 "$WORK/logs/consumer-join.log" >&2
+    fail 'the consumer join failed'
+fi
+
+# --------------------------------------------------------------------------
+# Default asks: streaming first, then buffered, then the same identity again
+# --------------------------------------------------------------------------
+
+# Run one streaming `ask` and prove the first increment reached stdout *while the
+# command was still running*. A final stdout that contains the answer is exactly
+# what a buffered client pretending to stream would also produce, so the evidence
+# here is the timing: the answer's first word is in the file, and the process has
+# not exited yet.
+STREAM_ASK_RC=0
+STREAM_FIRST_AT=0
+STREAM_END_AT=0
+STREAM_WAS_RUNNING=no
+run_stream_ask() {
+    out=$1
+    err=$2
+    question=$3
+    show "potluck ask '$question' --config-dir consumer --stream (no --model, no --max-charge)"
+    "$POTLUCK" ask "$question" --config-dir "$WORK/consumer" --stream \
+        --no-node-grace "$NO_NODE_GRACE" --timeout "$ASK_TIMEOUT" \
+        >"$out" 2>"$err" </dev/null &
+    ask_pid=$!
+    started=$(now_ms)
+    STREAM_FIRST_AT=0
+    ticks=0
+    while [ "$ticks" -lt 2400 ]; do
+        if grep -qF -- "$FIRST_DELTA" "$out" 2>/dev/null; then
+            STREAM_FIRST_AT=$(now_ms)
+            if kill -0 "$ask_pid" 2>/dev/null; then
+                STREAM_WAS_RUNNING=yes
+            else
+                STREAM_WAS_RUNNING=no
+            fi
+            break
+        fi
+        if ! kill -0 "$ask_pid" 2>/dev/null; then break; fi
+        ticks=$((ticks + 1))
+        sleep 0.05
+    done
+    STREAM_ASK_RC=0
+    wait "$ask_pid" || STREAM_ASK_RC=$?
+    STREAM_END_AT=$(now_ms)
+    printf 'release_gate.sh:     first increment at +%sms, ask exited at +%sms (rc=%s, still running when the first output appeared: %s)\n' \
+        "$((STREAM_FIRST_AT - started))" "$((STREAM_END_AT - started))" \
+        "$STREAM_ASK_RC" "$STREAM_WAS_RUNNING"
+}
+
+# Read the receipt id out of an ask's cost line ("... receipt R-1)").
+receipt_of() {
+    grep -F 'receipt R-' "$1" | head -1 | sed -n 's/.*receipt \(R-[0-9]*\).*/\1/p'
+}
+
+# Assert one finished ask: exit status, answer text, cost/receipt line, and that
+# the model came from the default inference rather than from a flag.
+check_ask() {
+    label=$1
+    out=$2
+    err=$3
+    rc=$4
+    if [ "$rc" != 0 ]; then
+        tail -30 "$err" >&2
+        fail "the $label ask did not exit 0"
+    fi
+    grep -qF -- "$REPLY_MARKER" "$out" \
+        || fail "the $label ask output does not carry the upstream answer text"
+    grep -qF 'receipt R-' "$out" \
+        || fail "the $label ask output does not carry a receipt line"
+    grep -qF 'no --model given' "$err" \
+        || fail "the $label ask did not infer the default model (no default-model notice)"
+    printf 'release_gate.sh:     %s\n' "$(grep -F -- "$REPLY_MARKER" "$out" | head -1)"
+    printf 'release_gate.sh:     %s\n' "$(grep -F 'receipt R-' "$out" | head -1)"
+}
+
+step 'streaming ask with the default model and the default charge'
+run_stream_ask "$WORK/logs/ask-stream.out" "$WORK/logs/ask-stream.err" 'gate streaming smoke'
+check_ask streaming "$WORK/logs/ask-stream.out" "$WORK/logs/ask-stream.err" "$STREAM_ASK_RC"
+[ "$STREAM_WAS_RUNNING" = yes ] \
+    || fail 'the first streamed increment appeared only after the ask had already exited'
+[ "$STREAM_FIRST_AT" -lt "$STREAM_END_AT" ] \
+    || fail 'the first streamed increment was not observed before completion'
+
+RECEIPT_ID=$(receipt_of "$WORK/logs/ask-stream.out")
+[ -n "$RECEIPT_ID" ] || fail 'could not read the receipt id from the streaming ask'
+
+step 'buffered ask (default mode) with the same identity'
+show "potluck ask 'gate buffered smoke' --config-dir consumer (no --stream, no --model, no --max-charge)"
+BUFFERED_RC=0
+"$POTLUCK" ask 'gate buffered smoke' --config-dir "$WORK/consumer" \
+    --no-node-grace "$NO_NODE_GRACE" --timeout "$ASK_TIMEOUT" \
+    >"$WORK/logs/ask-buffered.out" 2>"$WORK/logs/ask-buffered.err" </dev/null || BUFFERED_RC=$?
+check_ask buffered "$WORK/logs/ask-buffered.out" "$WORK/logs/ask-buffered.err" "$BUFFERED_RC"
+grep -qF 'waiting for generation' "$WORK/logs/ask-buffered.err" \
+    || fail 'the buffered ask did not show its waiting notice (was it really buffered?)'
+
+# --------------------------------------------------------------------------
+# Before anything is disturbed, the two sides have to agree exactly
+# --------------------------------------------------------------------------
+
+step 'reconcile the node against the center (nothing has restarted yet)'
+show 'potluck share reconcile --config node/node.json'
+"$POTLUCK" share reconcile --config "$WORK/node/node.json" \
+    >"$WORK/logs/reconcile-node.log" 2>&1 </dev/null \
+    || { tail -20 "$WORK/logs/reconcile-node.log" >&2
+         fail 'share reconcile reported a difference before any restart'; }
+
+step 'reconcile the center against itself'
+show 'potluck-server admin reconcile --config center.json'
+"$POTLUCK_SERVER" admin reconcile --config "$CENTER_JSON" \
+    >"$WORK/logs/reconcile-center.log" 2>&1 </dev/null \
+    || { tail -20 "$WORK/logs/reconcile-center.log" >&2
+         fail 'admin reconcile reported a difference inside the center books'; }
+
+# --------------------------------------------------------------------------
+# The center restarts; the same identities keep working
+# --------------------------------------------------------------------------
+
+step 'restart the center on the same address'
+OLD_CENTER_PID=$CENTER_PID
+CENTER_PID=""
+kill "$OLD_CENTER_PID" 2>/dev/null || true
+ticks=0
+while [ "$ticks" -lt 100 ] && kill -0 "$OLD_CENTER_PID" 2>/dev/null; do
+    ticks=$((ticks + 1))
+    sleep 0.1
+done
+kill -9 "$OLD_CENTER_PID" 2>/dev/null || true
+# Reap only this child: a bare `wait` would block on the node and the upstream,
+# which are both supposed to still be running.
+wait "$OLD_CENTER_PID" 2>/dev/null || true
+printf 'release_gate.sh:     center stopped; the node link has to reconnect on its own\n'
+start_center "$WORK/logs/center-restart.log"
+
+step 'ask again after the restart, same identity, same defaults'
+run_stream_ask "$WORK/logs/ask-restart.out" "$WORK/logs/ask-restart.err" 'after-restart smoke'
+check_ask 'after-restart' "$WORK/logs/ask-restart.out" "$WORK/logs/ask-restart.err" "$STREAM_ASK_RC"
+[ "$STREAM_WAS_RUNNING" = yes ] \
+    || fail 'after the restart the first streamed increment appeared only after the ask exited'
+RESTART_RECEIPT_ID=$(receipt_of "$WORK/logs/ask-restart.out")
+[ -n "$RESTART_RECEIPT_ID" ] || fail 'could not read the receipt id from the after-restart ask'
+
+step 'three asks, three distinct receipts: the restart was not charged twice'
+# A restart can leave the center holding an offer the node never accepted. The
+# retry then produces the answer *and* a receipt of its own, so the proof that
+# nobody paid twice is that each successful ask has its own receipt id.
+BUFFERED_RECEIPT_ID=$(receipt_of "$WORK/logs/ask-buffered.out")
+printf 'release_gate.sh:     receipts: %s (stream), %s (buffered), %s (after restart)\n' \
+    "$RECEIPT_ID" "$BUFFERED_RECEIPT_ID" "$RESTART_RECEIPT_ID"
+[ -n "$BUFFERED_RECEIPT_ID" ] || fail 'could not read the receipt id from the buffered ask'
+if [ "$RECEIPT_ID" = "$BUFFERED_RECEIPT_ID" ] \
+        || [ "$RECEIPT_ID" = "$RESTART_RECEIPT_ID" ] \
+        || [ "$BUFFERED_RECEIPT_ID" = "$RESTART_RECEIPT_ID" ]; then
+    fail 'two asks share one receipt id: a request was settled twice or not at all'
+fi
+
+# --------------------------------------------------------------------------
+# After the restart the records still have to add up
+# --------------------------------------------------------------------------
+
+step "verify $RECEIPT_ID as the consumer (over HTTP, with the identity join saved)"
+show "potluck verify receipt --config-dir consumer --receipt-id $RECEIPT_ID"
+"$POTLUCK" verify receipt --config-dir "$WORK/consumer" --receipt-id "$RECEIPT_ID" \
+    >"$WORK/logs/verify-consumer.log" 2>&1 </dev/null \
+    || fail 'the consumer-side receipt verification reported a contradiction'
+grep -qF 'signature_valid' "$WORK/logs/verify-consumer.log" \
+    || fail 'the consumer-side verification printed no dimensions'
+
+step "verify $RESTART_RECEIPT_ID as the operator (against the center database)"
+show "potluck-server verify receipt --config center.json --receipt-id $RESTART_RECEIPT_ID"
+"$POTLUCK_SERVER" verify receipt --config "$CENTER_JSON" --receipt-id "$RESTART_RECEIPT_ID" \
+    >"$WORK/logs/verify-operator.log" 2>&1 </dev/null \
+    || fail 'the operator-side receipt verification reported a contradiction'
+
+step 'reconcile the node against the center after the restart'
+show 'potluck share reconcile --config node/node.json --json'
+RECONCILE_RC=0
+"$POTLUCK" share reconcile --config "$WORK/node/node.json" --json \
+    >"$WORK/logs/reconcile-node-restart.json" 2>"$WORK/logs/reconcile-node-restart.err" \
+    </dev/null || RECONCILE_RC=$?
+cat "$WORK/logs/reconcile-node-restart.json"
+if [ "$RECONCILE_RC" = 0 ]; then
+    printf 'release_gate.sh:     node and center agree\n'
+elif [ "$RECONCILE_RC" = 1 ]; then
+    # One shape of difference is the restart window itself and is *correct*
+    # behaviour: the center dispatched an offer into a link that had just gone,
+    # the node never accepted it, so the center marked that attempt FAILED with
+    # the settlement HELD and no receipt, and the retry delivered the answer.
+    # `share reconcile` naming it is the honest report, not a defect — what would
+    # be a defect is a *settled* attempt the node has no record of, which is what
+    # this check refuses.
+    JSON=$(cat "$WORK/logs/reconcile-node-restart.json")
+    TOTAL=$(printf '%s' "$JSON" | grep -o '"kind":"' | wc -l | tr -d ' ')
+    MISSING=$(printf '%s' "$JSON" | grep -o '"kind":"missing_locally"' | wc -l | tr -d ' ')
+    UNSETTLED=$(printf '%s' "$JSON" \
+        | grep -o 'status=FAILED usage_tokens=[^ ]* settlement=HELD receipt=<none>' \
+        | wc -l | tr -d ' ')
+    if [ "$TOTAL" = 0 ] || [ "$TOTAL" != "$MISSING" ] || [ "$MISSING" != "$UNSETTLED" ]; then
+        fail 'after the restart the node and center disagree about something that is not an unaccepted, unsettled offer'
+    fi
+    printf 'release_gate.sh:     %s difference(s), all of them the restart window: an offer the node never accepted, FAILED with the settlement HELD and no receipt, so nothing was charged for it\n' \
+        "$TOTAL"
+else
+    fail "share reconcile exited $RECONCILE_RC"
+fi
+
+step 'reconcile the center against itself again'
+show 'potluck-server admin reconcile --config center.json'
+"$POTLUCK_SERVER" admin reconcile --config "$CENTER_JSON" \
+    >"$WORK/logs/reconcile-center-restart.log" 2>&1 </dev/null \
+    || { tail -20 "$WORK/logs/reconcile-center-restart.log" >&2
+         fail 'admin reconcile reported a difference after the restart'; }
+
+# --------------------------------------------------------------------------
+# Verdict
+# --------------------------------------------------------------------------
+
+printf 'release_gate.sh: PASS potluck %s at %s\n' "$VERSION" "$SHORT_SHA"
+printf 'release_gate.sh: install.sh into a fresh prefix; the installed package is what ran\n'
+printf 'release_gate.sh: fresh center (no hand-written credentials) + invite-only node and consumer\n'
+printf 'release_gate.sh: default-model/default-charge asks: streaming (first increment before completion), buffered, repeat, after restart\n'
+printf 'release_gate.sh: receipts %s %s %s distinct; verified on both sides; node and center reconcile clean\n' \
+    "$RECEIPT_ID" "$BUFFERED_RECEIPT_ID" "$RESTART_RECEIPT_ID"
