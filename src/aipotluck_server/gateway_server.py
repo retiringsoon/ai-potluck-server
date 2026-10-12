@@ -468,15 +468,23 @@ _ROUTE_ROLES: dict[str, str] = {
     "node_attempts": "node",
 }
 
-#: How long an OpenAI-compatible request waits for a terminal state before it
-#: answers `504`. Deliberately longer than the request's own deadline, so the
-#: center's deadline — which ends the request and records why — fires first, and
-#: the answer names a request the caller can still verify instead of the
-#: transport giving up on work the center is still doing.
-OPENAI_WAIT_DEADLINE_S = 110.0
+#: The wall-clock budget an OpenAI-compatible request is admitted with when the
+#: key does not name its own. Agent sessions are the point of this surface: the
+#: default covers a queue wait plus a long buffered generation, and a key minted
+#: with `--deadline-ms` raises it further up to `MAX_DEADLINE_MS`.
+OPENAI_REQUEST_DEADLINE_MS = 1_800_000
 
-#: The wall-clock budget an OpenAI-compatible request is admitted with.
-OPENAI_REQUEST_DEADLINE_MS = 100_000
+#: The wait window rides a little past the request's own deadline, so the
+#: center's deadline — which ends the request and records why — fires first and
+#: the answer names a request the caller can still verify, instead of the
+#: transport giving up on work the center is still doing.
+OPENAI_WAIT_GRACE_FACTOR = 1.1
+OPENAI_WAIT_GRACE_S = 10.0
+
+
+def openai_wait_deadline_s(budget_ms: int) -> float:
+    """Return how long one connection waits for a request of ``budget_ms``."""
+    return budget_ms / 1000 * OPENAI_WAIT_GRACE_FACTOR + OPENAI_WAIT_GRACE_S
 
 #: Events fetched per poll while an OpenAI-compatible answer is rendered.
 OPENAI_EVENT_BATCH = 256
@@ -934,7 +942,10 @@ class _OpenAiWaitResult:
 
 
 def _openai_unfinished_message(
-    status: str | None, billing_note: str | None, request_id: str
+    status: str | None,
+    billing_note: str | None,
+    request_id: str,
+    wait_deadline_s: float,
 ) -> str:
     """Explain a request this connection stopped waiting for.
 
@@ -946,7 +957,7 @@ def _openai_unfinished_message(
     note = f" ({billing_note})" if billing_note else ""
     return (
         f"request {request_id} {state} within "
-        f"{int(OPENAI_WAIT_DEADLINE_S)}s{note}; it may still be running and is "
+        f"{int(wait_deadline_s)}s{note}; it may still be running and is "
         "charged only if it settles. Quote this request id to the center's "
         "operator, who can verify what it cost with `potluck-server verify "
         "receipt`."
@@ -2911,7 +2922,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         One admitted request, rendered either as a single ``chat.completion`` or
         as an SSE stream of ``chat.completion.chunk`` frames. The two differ only
         in how the same stored events are handed back: both wait for the center's
-        own terminal state inside `OPENAI_WAIT_DEADLINE_S`, and both report the
+        own terminal state inside the derived wait window, and both report the
         settled token counts, so a caller cannot get a different bill for asking
         for a stream.
         """
@@ -2987,6 +2998,11 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         credential = Credential(
             tenant_id=key.tenant_id, subject_id=key.subject_id, role="consumer"
         )
+        # The key may name a longer budget than the surface default; the wait
+        # window always rides past the budget the request actually carries.
+        wait_deadline_s = openai_wait_deadline_s(
+            key.deadline_ms if key.deadline_ms is not None else OPENAI_REQUEST_DEADLINE_MS
+        )
         completion = _OpenAiCompletion.new(request.model)
         if request.stream:
             self._stream_openai_completion(
@@ -2996,6 +3012,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 include_usage=request.include_usage,
                 key=key,
                 started_at=started,
+                wait_deadline_s=wait_deadline_s,
             )
         else:
             self._buffer_openai_completion(
@@ -3004,6 +3021,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 request_id=admitted.request_id,
                 key=key,
                 started_at=started,
+                wait_deadline_s=wait_deadline_s,
             )
 
 
@@ -3084,6 +3102,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         request_id: str,
         *,
         on_delta: Callable[[str], bool] | None,
+        wait_deadline_s: float,
     ) -> _OpenAiWaitResult:
         """Poll one request to a terminal state, rendering increments as they commit.
 
@@ -3103,7 +3122,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         Returns:
             How the wait ended.
         """
-        deadline = time.monotonic() + OPENAI_WAIT_DEADLINE_S
+        deadline = time.monotonic() + wait_deadline_s
         cursor = 0
         split: dict[str, int] | None = None
         parts: list[str] = []
@@ -3192,6 +3211,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         request_id: str,
         key: ApiKeyRecord,
         started_at: float,
+        wait_deadline_s: float,
     ) -> None:
         """Answer with one ``chat.completion`` once the request is terminal.
 
@@ -3203,7 +3223,9 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         answer in hand is guaranteed the line describing it is already in the
         log. `latency_ms` therefore measures the work rather than the flush.
         """
-        result = self._openai_wait(credential, request_id, on_delta=None)
+        result = self._openai_wait(
+            credential, request_id, on_delta=None, wait_deadline_s=wait_deadline_s
+        )
         if result.abandoned:
             self.close_connection = True
             self._log_openai_request(
@@ -3229,7 +3251,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         else:
             status, code = 504, "deadline_passed"
             message = _openai_unfinished_message(
-                result.status, result.billing_note, request_id
+                result.status, result.billing_note, request_id, wait_deadline_s
             )
             outcome = result.status or "deadline_passed"
         self._log_openai_request(
@@ -3260,6 +3282,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         include_usage: bool,
         key: ApiKeyRecord,
         started_at: float,
+        wait_deadline_s: float,
     ) -> None:
         """Render the answer as an SSE stream of ``chat.completion.chunk`` frames.
 
@@ -3306,7 +3329,9 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 _openai_chunk(completion, delta={"content": text}, finish_reason=None)
             )
 
-        result = self._openai_wait(credential, request_id, on_delta=render)
+        result = self._openai_wait(
+            credential, request_id, on_delta=render, wait_deadline_s=wait_deadline_s
+        )
         if result.abandoned:
             self.close_connection = True
             self._log_openai_request(
@@ -3355,7 +3380,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             status = 504
             code = "deadline_passed"
             message = _openai_unfinished_message(
-                result.status, result.billing_note, request_id
+                result.status, result.billing_note, request_id, wait_deadline_s
             )
         if started:
             self._openai_error_frame(status, code, message, request_id)

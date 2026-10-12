@@ -66,6 +66,7 @@ from aipotluck_server.gateway_service import (
     API_KEY_MAX_IN_FLIGHT,
     AUTHORIZATION_SETTLEMENT_GRACE,
     DISPATCHED_EVENT_TYPE,
+    MAX_DEADLINE_MS,
     QUEUE_REOFFER_BACKOFF_S,
     QUEUED_EVENT_TYPE,
     GatewayConfig,
@@ -648,10 +649,39 @@ def test_admission_requires_attempts_and_deadline_to_be_positive(
     harness.connect()
     authorization = harness.authorization(request_id="R-1")
 
-    with pytest.raises(ProtocolError, match="max_attempts"):
-        harness.admit(authorization, max_attempts=0)
-    with pytest.raises(ProtocolError, match="deadline_ms"):
-        harness.admit(authorization, deadline_ms=0)
+
+
+    with pytest.raises(ProtocolError, match="ceiling"):
+        harness.admit(authorization, deadline_ms=MAX_DEADLINE_MS + 1)
+
+
+def test_the_day_ceiling_binds_the_api_key_surface_too(harness: Harness) -> None:
+    """A key minted before the ceiling existed cannot smuggle a longer budget.
+
+    The mint path validates `--deadline-ms`, but the durable row is what the
+    admission reads: the guard lives on the request's effective budget, not on
+    the operator's flag, so an old row cannot hold a slot past the ceiling.
+    """
+    harness.connect()
+    harness.store.add_credential(
+        "consumer-token-x", CONSUMER.tenant_id, "consumer-X", "consumer", REGISTERED_AT
+    )
+    key = harness.store.add_api_key(
+        "ak-legacy",
+        key_id="apikey-old",
+        name="legacy",
+        subject_id="consumer-X",
+        tenant_id=CONSUMER.tenant_id,
+        quota_milli_credits=50_000,
+        created_at=dt.datetime.now(dt.UTC),
+        deadline_ms=MAX_DEADLINE_MS + 1,
+    )
+    with pytest.raises(ProtocolError, match="ceiling"):
+        harness.service.admit_api_key_request(
+            api_key=key,
+            messages=(user_message("write a haiku about ledgers"),),
+            model=MODEL,
+        )
 
 
 # -- node registration and node messages ---------------------------------------
@@ -2673,3 +2703,4 @@ def test_a_waiting_request_survives_a_restart_and_is_still_offered(
         assert harness.status("R-1")["status"] == "RUNNING"
     finally:
         harness.close()
+

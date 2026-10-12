@@ -123,6 +123,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_HEARTBEAT_INTERVAL_S = 15
 DEFAULT_OFFER_ACCEPT_TIMEOUT_S = 10.0
 DEFAULT_DEADLINE_MS = 60_000
+
+#: The only deadline ceiling, everywhere. Agent sessions want long windows and
+#: get them — a key can carry 24 hours — but an unbounded deadline is how a
+#: request that can never finish holds a concurrency slot forever, which is the
+#: exact failure the terminal-state sweep exists to end. 24 hours matches the
+#: industry's own batch ceilings; nothing interactive runs longer.
+MAX_DEADLINE_MS = 86_400_000
 DEFAULT_MAX_ATTEMPTS = 1
 DEFAULT_CONSUMER_QUEUE_SIZE = 256
 
@@ -1130,6 +1137,12 @@ class GatewayService:
             raise ProtocolError(f"max_attempts must be >= 1, got {max_attempts}")
         if deadline_ms < 1:
             raise ProtocolError(f"deadline_ms must be >= 1, got {deadline_ms}")
+        if deadline_ms > MAX_DEADLINE_MS:
+            raise ProtocolError(
+                f"deadline_ms {deadline_ms} is beyond the {MAX_DEADLINE_MS} ms "
+                "ceiling; a request that cannot finish inside a day cannot "
+                "finish, and its slot would never free"
+            )
         session = None if session_id is None else check_session_id(session_id)
         self._sweep_before_admission(moment)
         record = _coerce_record(authorization)
@@ -1365,6 +1378,12 @@ class GatewayService:
         # agent loop gets a window long enough for a long turn, and a key minted
         # for a one-shot question keeps the surface's own.
         budget_ms = key.deadline_ms if key.deadline_ms is not None else deadline_ms
+        if budget_ms > MAX_DEADLINE_MS:
+            raise ProtocolError(
+                f"deadline_ms {budget_ms} is beyond the {MAX_DEADLINE_MS} ms "
+                "ceiling; a request that cannot finish inside a day cannot "
+                "finish, and its slot would never free"
+            )
         credential = Credential(
             tenant_id=key.tenant_id,
             subject_id=key.subject_id,
