@@ -1004,7 +1004,9 @@ def test_a_request_still_running_when_the_window_closes_is_504(
     request is over. The node is held inside the upstream call, which is the only
     honest way to have a request that is running and not answering.
     """
-    monkeypatch.setattr(gateway_server, "OPENAI_WAIT_DEADLINE_S", 0.4)
+    monkeypatch.setattr(gateway_server, "OPENAI_REQUEST_DEADLINE_MS", 100)
+    monkeypatch.setattr(gateway_server, "OPENAI_WAIT_GRACE_FACTOR", 1.0)
+    monkeypatch.setattr(gateway_server, "OPENAI_WAIT_GRACE_S", 0.3)
     adapter = _GatedAdapter(upstream=FakeUpstream(), model=MODEL)
     adapter.upstream.queue(_scripted_response())
     node = Node(center, adapter=adapter)
@@ -1019,10 +1021,12 @@ def test_a_request_still_running_when_the_window_closes_is_504(
         assert error["code"] == "deadline_passed"
         assert error["request_id"].startswith("req-")
         assert "potluck-server verify receipt" in error["message"]
-        # The request exists and is not terminal: nothing was invented about it.
+        # The wait window rides past the request's own deadline, so the center's
+        # sweep ended it before the connection gave up: the 504 names a request
+        # whose fate the center has already recorded.
         stored = center.store.get_request(error["request_id"])
         assert stored is not None
-        assert stored.status not in ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED")
+        assert stored.status == "EXPIRED"
         assert adapter.gate.wait(timeout=0) is False, "the call was still held open"
     finally:
         adapter.gate.set()
@@ -2088,8 +2092,10 @@ def test_a_key_minted_with_a_longer_window_gives_its_requests_that_window(
         ]
         assert len(admitted) == 1
         assert admitted[0].deadline_at is not None
-        # Ten minutes from admission, not the hundred seconds the surface asks for.
-        assert admitted[0].deadline_at > dt.datetime.now(dt.UTC) + dt.timedelta(seconds=500)
+        # Ten minutes from admission, not the thirty minutes the surface defaults to.
+        now = dt.datetime.now(dt.UTC)
+        assert admitted[0].deadline_at > now + dt.timedelta(seconds=500)
+        assert admitted[0].deadline_at < now + dt.timedelta(seconds=700)
 
         # A key with no window of its own keeps the surface's, which is what makes
         # the flag an override rather than a second, always-present deadline.
@@ -2107,7 +2113,9 @@ def test_a_key_minted_with_a_longer_window_gives_its_requests_that_window(
             if record.api_key_id == plain_key.key_id
         )
         assert plain_request.deadline_at is not None
-        assert plain_request.deadline_at < dt.datetime.now(dt.UTC) + dt.timedelta(seconds=500)
+        # The surface default is the agent-sized thirty minutes.
+        assert plain_request.deadline_at > dt.datetime.now(dt.UTC) + dt.timedelta(seconds=1700)
+        assert plain_request.deadline_at < dt.datetime.now(dt.UTC) + dt.timedelta(seconds=1900)
     finally:
         node.stop()
 

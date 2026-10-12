@@ -280,9 +280,9 @@ center that every other key shares:
   refused at its ceiling forever.
 * **60 requests per minute**, counted in the running process; a restart clears
   the window, which costs one window and nothing else.
-* **one wait window of ~110s** per connection, deliberately longer than the
-  request's own 100s budget, so the center's deadline decides first and the
-  answer names a request that can still be verified.
+* **one wait window that rides ~10% past the request's budget** per connection,
+  deliberately longer than the request's own budget, so the center's deadline
+  decides first and the answer names a request that can still be verified.
 
 Per center, so a pool with nothing free holds a bounded amount of work rather
 than every request that arrives:
@@ -315,17 +315,18 @@ Two budgets, and they are not the same thing:
 
 | Budget | Default | Set by | What it ends |
 |---|---|---|---|
-| the **request deadline** | `100000` ms | `admin api-key --deadline-ms` per key, else this surface's default | the *request*, at the center: past it the sweep ends the request `EXPIRED` and it is not billed |
-| the **wait window** | `~110` s | this surface, not configurable | the *HTTP connection*: past it the caller gets `504 deadline_passed` naming the request, which may still be running |
+| the **request deadline** | thirty minutes | `admin api-key --deadline-ms` per key, else this surface's default | the *request*, at the center: past it the sweep ends the request `EXPIRED` and it is not billed |
+| the **wait window** | the request budget +10% | derived, not configurable | the *HTTP connection*: past it the caller gets `504 deadline_passed` naming the request, which by then has ended |
 
-The wait window is deliberately longer than the default deadline so the center's
-own deadline decides first and the answer names a request that can still be
-verified. **A key minted with `--deadline-ms` longer than the wait window does not
-lengthen the connection**: the caller gets a `504` at ~110s while the center keeps
-running the turn to the window the key gave it. That is the right split for an
-agent loop — the work is not abandoned because one HTTP connection ended — but it
-means a long turn is collected by asking about the request, not by holding the
-connection open:
+Both windows are agent-sized by default and `--deadline-ms` raises the request
+deadline to at most twenty-four hours (a hard ceiling, because a deadline that
+never fires is how a request that can never finish holds a concurrency slot
+forever). Through a reverse proxy, long turns should use **streaming**: streamed
+increments keep the connection alive for however long the answer runs, while a
+buffered call that is silently waiting can be closed by an intermediary's own
+idle timeout before the center's deadline says anything. A caller that does lose
+the connection gets the `504` with the request id, and the work — if it settles —
+is still collected and verifiable:
 
 ```bash
 potluck-server verify receipt --config center.json --receipt-id R-12

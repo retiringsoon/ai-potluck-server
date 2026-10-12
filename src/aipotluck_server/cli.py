@@ -61,7 +61,7 @@ from aipotluck.reconcile import ReceiptVerification
 from aipotluck.wire import SESSION_HEADER
 
 from .deploy import CenterInspection, load_center, load_center_for_inspection
-from .gateway_service import API_KEY_BYTES, API_KEY_PREFIX
+from .gateway_service import API_KEY_BYTES, API_KEY_PREFIX, MAX_DEADLINE_MS
 from .persistence import CenterStore
 from .reconcile import reconcile_center, verify_receipt_at_center
 
@@ -660,6 +660,12 @@ def _cmd_admin_api_key(args: argparse.Namespace) -> int:
             "rather than a key worth holding"
         )
     deadline_ms: int | None = args.deadline_ms
+    if deadline_ms is not None and deadline_ms > MAX_DEADLINE_MS:
+        raise PotluckError(
+            f"--deadline-ms {deadline_ms} is beyond the {MAX_DEADLINE_MS} ms "
+            "(24 h) ceiling: an unbounded deadline is how a request that can "
+            "never finish holds a concurrency slot forever"
+        )
     if deadline_ms is not None and deadline_ms < 1:
         raise PotluckError(
             f"--deadline-ms must be >= 1 millisecond, got {deadline_ms}: a request "
