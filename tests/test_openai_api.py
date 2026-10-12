@@ -43,7 +43,7 @@ from aipotluck.connector import Connector, ConnectorConfig
 from aipotluck.identity import generate_key_pair
 from aipotluck.metering import NormalizedUsage
 from aipotluck.persistence import NodeStore
-from aipotluck.wire import user_message
+from aipotluck.wire import SESSION_HEADER, user_message
 from conftest import Keyring, signed_authorization
 
 from aipotluck_server import gateway_server, gateway_service
@@ -85,11 +85,14 @@ def _scripted_response(text: tuple[str, ...] = ("Hello ", "from the node")) -> F
 class Center:
     """A real center: gateway, service, store, one provisioned consumer."""
 
-    def __init__(self, tmp_path: Path, keyring: Keyring) -> None:
+    def __init__(self, tmp_path: Path, keyring: Keyring, **config: Any) -> None:
         self.keyring = keyring
         self.tmp_path = tmp_path
         self.database_path = tmp_path / "center.db"
         self.store = CenterStore.open(self.database_path)
+        # `config` is the dispatch-queue policy a test wants to probe. The
+        # defaults are the shipped ones, so a test that names none is driving what
+        # an operator who wrote no queue field gets.
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
@@ -97,6 +100,7 @@ class Center:
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
+            **config,
         )
         self.service = GatewayService(
             config=self.config, store=self.store, registry=keyring.registry
@@ -251,6 +255,7 @@ def _mint_key(
     quota: int = 100_000,
     name: str = "",
     expires_in: str | None = None,
+    deadline_ms: int | None = None,
 ) -> str:
     """Mint an API key through the operator CLI and return its plaintext.
 
@@ -272,6 +277,8 @@ def _mint_key(
         argv += ["--name", name]
     if expires_in is not None:
         argv += ["--expires-in", expires_in]
+    if deadline_ms is not None:
+        argv += ["--deadline-ms", str(deadline_ms)]
     assert server_main(argv) == 0, capsys.readouterr().err
     return capsys.readouterr().out.strip().splitlines()[0]
 
@@ -386,6 +393,128 @@ def test_a_minted_key_is_printed_once_and_stored_as_a_digest(
     assert record.key_id in listing
     assert "the IDE" in listing
     assert key not in listing
+
+
+def test_a_key_deadline_that_would_admit_nothing_is_refused_at_the_command(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A window of zero expires every request before it can run.
+
+    Refused where the only thing wasted is a command, exactly as ``--quota 0`` is:
+    minting the key would succeed and every request on it would end EXPIRED, which
+    reads as a broken center rather than as a bad flag.
+    """
+    for value in ("0", "-1"):
+        assert (
+            server_main(
+                [
+                    "admin",
+                    "api-key",
+                    "--config",
+                    str(center.config_path),
+                    "--subject",
+                    SUBJECT,
+                    "--quota",
+                    "1000",
+                    "--deadline-ms",
+                    value,
+                ]
+            )
+            == 1
+        )
+        assert "--deadline-ms must be >= 1" in capsys.readouterr().err
+    assert center.store.list_api_keys() == []
+
+
+def test_the_key_listing_shows_the_window_a_key_carries(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An operator reading a listing can tell a long-task key from a default one.
+
+    Both spellings are asserted because the honest answer for a key with no window
+    of its own is "default", not a number this command would have to invent.
+    """
+    _mint_key(center, capsys, name="agent", deadline_ms=600_000)
+    _mint_key(center, capsys, name="plain")
+
+    assert server_main(["admin", "api-key-list", "--config", str(center.config_path)]) == 0
+    listing = capsys.readouterr().out
+    agent = next(line for line in listing.splitlines() if 'name="agent"' in line)
+    plain = next(line for line in listing.splitlines() if 'name="plain"' in line)
+    assert "deadline=600000ms" in agent
+    assert "deadline=default" in plain
+
+
+def test_session_list_can_be_narrowed_to_one_subject(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--subject` narrows the listing, and an empty one says why rather than printing nothing."""
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        node.upstream.queue(_scripted_response())
+        key = _mint_key(center, capsys)
+        status, _headers, raw = _post_chat_with_session(
+            center, _chat_body(), key=key, session="sess-narrow"
+        )
+        assert status == 200, raw
+
+        assert (
+            server_main(
+                [
+                    "admin",
+                    "session-list",
+                    "--config",
+                    str(center.config_path),
+                    "--subject",
+                    SUBJECT,
+                ]
+            )
+            == 0
+        )
+        assert "sess-narrow" in capsys.readouterr().out
+
+        # Another subject has no sessions, and the command says so on stderr with
+        # the way a session comes to exist — silence would read as a broken
+        # command rather than as an empty answer.
+        assert (
+            server_main(
+                [
+                    "admin",
+                    "session-list",
+                    "--config",
+                    str(center.config_path),
+                    "--subject",
+                    "consumer-nobody",
+                ]
+            )
+            == 0
+        )
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "no agent session for subject consumer-nobody" in captured.err
+    finally:
+        node.stop()
+
+
+def test_session_show_names_a_session_the_center_does_not_hold(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unknown session is an error, not an empty report that looks like a zero."""
+    assert (
+        server_main(
+            [
+                "admin",
+                "session-show",
+                "--config",
+                str(center.config_path),
+                "--session",
+                "sess-never",
+            ]
+        )
+        == 1
+    )
+    assert "no agent session 'sess-never'" in capsys.readouterr().err
 
 
 def test_a_key_can_only_be_minted_for_a_consumer_the_center_knows(
@@ -1757,3 +1886,385 @@ def test_an_upgraded_center_admits_an_api_key_request_to_a_verified_receipt(
     finally:
         node.stop()
         center.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Agent sessions over the OpenAI-compatible surface
+# --------------------------------------------------------------------------- #
+
+
+def _post_chat_with_session(
+    center: Center, body: Any, *, key: str, session: str | None
+) -> tuple[int, Any, str]:
+    """POST one request carrying the session header an agent framework would set.
+
+    Through `default_headers` on the real SDK, and through a plain header here: the
+    point of putting the session in a header is that a caller driving this surface
+    with an OpenAI client needs no change to the body it already sends.
+    """
+    connection = http.client.HTTPConnection("127.0.0.1", center.port, timeout=130.0)
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {key}",
+    }
+    if session is not None:
+        headers[SESSION_HEADER] = session
+    raw = body if isinstance(body, str) else json.dumps(body)
+    connection.request("POST", "/openai/v1/chat/completions", body=raw.encode(), headers=headers)
+    response = connection.getresponse()
+    text = response.read().decode("utf-8")
+    connection.close()
+    return response.status, response.getheaders(), text
+
+
+def test_a_session_header_aggregates_the_turns_a_tool_made(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two turns under one header become one aggregate the operator can read.
+
+    The evidence is the operator's own command rather than a store read, because
+    what the feature promises is that an operator can ask what a run cost: the
+    listing has to name the session, count the turns, and total the tokens and
+    credit the books moved.
+    """
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        for _ in range(2):
+            node.upstream.queue(_scripted_response())
+        key = _mint_key(center, capsys)
+
+        for _ in range(2):
+            status, _headers, raw = _post_chat_with_session(
+                center, _chat_body(), key=key, session="sess-agent-run"
+            )
+            assert status == 200, raw
+
+        session = center.store.session(TENANT, SUBJECT, "sess-agent-run")
+        assert session is not None
+        assert session.request_count == 2
+        assert session.total_tokens == 2 * BILLED_TOKENS
+        assert session.total_milli_credits == 2 * BILLED_TOKENS
+        assert session.last_node_id == "node-A"
+
+        assert server_main(
+            ["admin", "session-list", "--config", str(center.config_path)]
+        ) == 0
+        listing = capsys.readouterr().out
+        assert "sess-agent-run" in listing
+        assert f"subject={SUBJECT}" in listing
+        assert "requests=2" in listing
+        assert f"tokens={2 * BILLED_TOKENS}" in listing
+    finally:
+        node.stop()
+
+
+def test_session_show_lists_the_receipts_behind_a_sessions_totals(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A session's totals are a claim; the receipts named beside them are the account.
+
+    Each id this command prints verifies on its own, which is what makes the
+    aggregate auditable rather than merely convenient.
+    """
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        for _ in range(2):
+            node.upstream.queue(_scripted_response())
+        key = _mint_key(center, capsys)
+        for _ in range(2):
+            _post_chat_with_session(center, _chat_body(), key=key, session="sess-shown")
+
+        config_path = _operator_config(center)
+        assert (
+            server_main(
+                [
+                    "admin",
+                    "session-show",
+                    "--config",
+                    str(config_path),
+                    "--session",
+                    "sess-shown",
+                ]
+            )
+            == 0
+        )
+        shown = capsys.readouterr().out
+        assert "requests=2" in shown
+        assert "receipts=2" in shown
+        for receipt in center.store.receipts():
+            assert receipt.receipt_id in shown
+            assert (
+                server_main(
+                    [
+                        "verify",
+                        "receipt",
+                        "--config",
+                        str(config_path),
+                        "--receipt-id",
+                        receipt.receipt_id,
+                    ]
+                )
+                == 0
+            ), capsys.readouterr().err
+    finally:
+        node.stop()
+
+
+def test_a_request_with_no_session_header_is_aggregated_nowhere(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A session exists because a caller declared one, never by inference.
+
+    Asserted because the alternative — attributing every request to an implicit
+    session — would make `session-list` a list of callers rather than of runs, and
+    would report a cost nobody asked to have aggregated.
+    """
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        node.upstream.queue(_scripted_response())
+        key = _mint_key(center, capsys)
+
+        status, _headers, raw = _post_chat_with_session(
+            center, _chat_body(), key=key, session=None
+        )
+
+        assert status == 200, raw
+        assert center.store.sessions() == []
+    finally:
+        node.stop()
+
+
+@pytest.mark.parametrize("session", ["two words", "x" * 129])
+def test_a_session_header_this_platform_cannot_store_is_400(
+    center: Center, capsys: pytest.CaptureFixture[str], session: str
+) -> None:
+    """Refused at the boundary, in the shape this surface answers everything else in.
+
+    Not trimmed and not dropped: a caller that named a session and was silently
+    given none would read an aggregate for a run it never joined.
+    """
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        key = _mint_key(center, capsys)
+
+        status, _headers, document = _post_chat_with_session(
+            center, _chat_body(), key=key, session=session
+        )
+
+        assert status == 400
+        assert json.loads(document)["error"]["code"] == "invalid_request"
+        assert center.store.sessions() == []
+    finally:
+        node.stop()
+
+
+def test_a_key_minted_with_a_longer_window_gives_its_requests_that_window(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--deadline-ms` is an operator's statement about the work a key is for.
+
+    The surface admits every request with its own default budget; a key minted for
+    an agent loop overrides it. What has to be observable is the request row's own
+    deadline, because that is the instant the center's sweep will end the turn — a
+    longer window that was not written down is not a longer window.
+    """
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        node.upstream.queue(_scripted_response())
+        key = _mint_key(center, capsys, name="agent", deadline_ms=600_000)
+        minted = center.store.list_api_keys()[0]
+        assert minted.deadline_ms == 600_000
+
+        status, _headers, raw = _post_chat(center, _chat_body(), key=key)
+        assert status == 200, raw
+
+        admitted = [
+            record for record in center.store.requests() if record.api_key_id == minted.key_id
+        ]
+        assert len(admitted) == 1
+        assert admitted[0].deadline_at is not None
+        # Ten minutes from admission, not the hundred seconds the surface asks for.
+        assert admitted[0].deadline_at > dt.datetime.now(dt.UTC) + dt.timedelta(seconds=500)
+
+        # A key with no window of its own keeps the surface's, which is what makes
+        # the flag an override rather than a second, always-present deadline.
+        node.upstream.queue(_scripted_response())
+        plain = _mint_key(center, capsys, name="plain")
+        status, _headers, raw = _post_chat(center, _chat_body(), key=plain)
+        assert status == 200, raw
+        plain_key = next(
+            record for record in center.store.list_api_keys() if record.key_id != minted.key_id
+        )
+        assert plain_key.deadline_ms is None
+        plain_request = next(
+            record
+            for record in center.store.requests()
+            if record.api_key_id == plain_key.key_id
+        )
+        assert plain_request.deadline_at is not None
+        assert plain_request.deadline_at < dt.datetime.now(dt.UTC) + dt.timedelta(seconds=500)
+    finally:
+        node.stop()
+
+
+def test_a_full_dispatch_queue_answers_429_rather_than_holding_everything(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The bound is what keeps a wait from becoming a promise the center cannot keep.
+
+    The scenario is a pool whose node went away: the model is still in the center's
+    catalogue, so this is contention rather than a request nothing could ever run,
+    and the first request is held instead of refused. With the queue at its bound
+    the next one is refused with the status an OpenAI client already backs off on.
+
+    The part that matters for the books is what the refusal does *not* do: it
+    stores no request row, holds no key slot, and leaves nothing for the deadline
+    sweep to end. A refusal that created a row to refuse would be a center holding
+    work it just said it would not hold.
+    """
+    center = Center(tmp_path, Keyring(), max_queue_depth=1)
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        node.stop()
+        _wait_until(
+            lambda: not center.store.connected_nodes(), what="the node to disconnect"
+        )
+        assert center.store.catalogued_models() == {MODEL}, (
+            "a node that lost its link has not withdrawn its model"
+        )
+        key = _mint_key(center, capsys, deadline_ms=8_000)
+
+        held: list[int] = []
+        thread = threading.Thread(
+            target=lambda: held.append(_post_chat(center, _chat_body(), key=key)[0]),
+            daemon=True,
+        )
+        thread.start()
+        _wait_until(
+            lambda: center.store.count_requests_by_status("ROUTING") == 1,
+            what="the first request to be admitted and wait for a node",
+        )
+
+        status, _headers, raw = _post_chat(center, _chat_body(), key=key)
+
+        error = json.loads(raw)["error"]
+        assert status == 429, raw
+        assert error["code"] == "rate_limit_exceeded"
+        assert error["type"] == "rate_limit_error"
+        assert "queue bound of 1" in error["message"]
+        assert center.store.count_requests_by_status("ROUTING") == 1, (
+            "a refused admission stores nothing to sweep"
+        )
+
+        thread.join(timeout=60)
+        assert held == [504], "the held request ends on its own deadline, honestly"
+    finally:
+        node.stop()
+        center.stop()
+
+
+def test_a_model_no_node_of_the_center_runs_is_still_404_while_a_queue_holds_work(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Queueing does not turn a typo into a timeout.
+
+    A center that held every request it could not dispatch would answer a model
+    name it has never heard of with a 504 a hundred seconds later, naming nothing
+    that was actually wrong. The catalogue check is what keeps the two refusals
+    distinguishable: this model has no node here, so waiting cannot help.
+    """
+    center = Center(tmp_path, Keyring())
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        key = _mint_key(center, capsys)
+
+        status, _headers, raw = _post_chat(
+            center, _chat_body() | {"model": "no-such-model"}, key=key
+        )
+
+        error = json.loads(raw)["error"]
+        assert status == 404
+        assert error["code"] == "model_not_found"
+        assert MODEL in error["message"]
+        assert center.store.requests() == []
+    finally:
+        node.stop()
+        center.stop()
+
+
+def test_a_fractional_parameter_runs_the_whole_chain_to_a_verifiable_receipt(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`temperature: 0.7`, from an OpenAI-shaped body to a receipt that verifies.
+
+    The regression this guards is a real one that shipped: the canonical encoding
+    carries a fraction as its shortest decimal string, and a center that could not
+    re-encode the form it had itself produced refused the request at admission —
+    so a parameter every OpenAI client sends by default could not cross the signed
+    half of the platform at all. Existing tests here assert what the *upstream*
+    received, which a defect in the digest or in the stored inputs would not show.
+    This one drives the whole chain and checks the ends:
+
+    * admission accepts it and stores the parameters it dispatched;
+    * the node receives the fraction as the number it is;
+    * the request settles, and the receipt an operator verifies afterwards is the
+      receipt this request produced.
+    """
+    node = Node(center)
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        node.upstream.queue(_scripted_response())
+        key = _mint_key(center, capsys)
+
+        status, headers, raw = _post_chat(
+            center, _chat_body(temperature=0.7, top_p=0.95), key=key
+        )
+        assert status == 200, raw
+        document = json.loads(raw)
+        assert document["choices"][0]["message"]["content"] == ANSWER
+        assert document["usage"]["total_tokens"] == BILLED_TOKENS
+
+        # The fraction survived the wire as its decimal string and reached the
+        # upstream as the number an upstream expects.
+        assert node.upstream.calls[-1].parameters == {
+            "temperature": "0.7",
+            "top_p": "0.95",
+        }
+
+        # What the center stored to dispatch is what it signed for: the same
+        # parameter set, in the canonical-safe encoding, behind the request.
+        request_id = _header(headers, "x-request-id")
+        inputs = center.store.get_request_input(request_id)
+        assert inputs is not None
+        assert inputs["parameters"] == {"temperature": "0.7", "top_p": "0.95"}
+        stored = center.store.get_request(request_id)
+        assert stored is not None
+        assert stored.status == "SUCCEEDED"
+
+        receipts = center.store.receipts()
+        assert [receipt.request_id for receipt in receipts] == [request_id]
+        config_path = _operator_config(center)
+        assert (
+            server_main(
+                [
+                    "verify",
+                    "receipt",
+                    "--config",
+                    str(config_path),
+                    "--receipt-id",
+                    receipts[0].receipt_id,
+                ]
+            )
+            == 0
+        ), capsys.readouterr().err
+        assert server_main(["admin", "reconcile", "--config", str(config_path)]) == 0
+        capsys.readouterr()
+    finally:
+        node.stop()

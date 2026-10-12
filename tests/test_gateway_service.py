@@ -39,7 +39,12 @@ from aipotluck.errors import (
 from aipotluck.identity import generate_key_pair
 from aipotluck.ledger import Ledger
 from aipotluck.metering import Measurement, NormalizedUsage
-from aipotluck.records import SCHEMA_AUTHORIZATION, SignedRecord, UsageReport
+from aipotluck.records import (
+    SCHEMA_AUTHORIZATION,
+    SignedRecord,
+    UsageReport,
+    signed_record_from_dict,
+)
 from aipotluck.wire import (
     AttemptDecision,
     AttemptEvent,
@@ -55,14 +60,24 @@ from aipotluck.wire import (
 )
 from conftest import Keyring, signed_authorization
 
+from aipotluck_server.errors import ModelUnavailable, QueueFull
+from aipotluck_server.gateway_server import OPENAI_REQUEST_DEADLINE_MS
 from aipotluck_server.gateway_service import (
     API_KEY_MAX_IN_FLIGHT,
+    AUTHORIZATION_SETTLEMENT_GRACE,
+    DISPATCHED_EVENT_TYPE,
+    QUEUE_REOFFER_BACKOFF_S,
+    QUEUED_EVENT_TYPE,
     GatewayConfig,
     GatewayError,
     GatewayService,
     derive_allocation_contract,
 )
 from aipotluck_server.persistence import CenterStore, Credential
+
+#: The wall-clock budget the OpenAI-compatible surface admits a request with, used
+#: here as the default a key with no window of its own has to keep.
+OPENAI_SURFACE_DEFAULT_MS = OPENAI_REQUEST_DEADLINE_MS
 
 #: The instant every test works from. It is also the authorization window's
 #: midpoint, so a signed authorization is valid at it without any juggling.
@@ -262,7 +277,9 @@ class Harness:
     build a second service over the very same bytes.
     """
 
-    def __init__(self, tmp_path: Path, *, now: dt.datetime = BASE) -> None:
+    def __init__(
+        self, tmp_path: Path, *, now: dt.datetime = BASE, **config: Any
+    ) -> None:
         self.keyring = Keyring()
         self.registry = self.keyring.registry
         self.platform_key_id = "settlement-key-test"
@@ -276,6 +293,9 @@ class Harness:
         )
         self.ledger = _funded_ledger()
         self.store = CenterStore.open(tmp_path / "center.db")
+        # `config` is the queue policy a test wants to probe, passed straight
+        # through: the defaults are the shipped ones, so a test that does not name
+        # them is testing what an operator who wrote no queue field gets.
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
@@ -283,6 +303,7 @@ class Harness:
             platform_id="platform-1",
             settlement_key_id=self.platform_key_id,
             settlement_private_key_b64=private_b64,
+            **config,
         )
         self.service = self._build(now)
         self.outbox: dict[str, list[Envelope]] = {}
@@ -463,6 +484,39 @@ def test_admission_refuses_a_reused_key_with_a_different_payload(
         harness.admit(
             second_authorization, idempotency_key="key-1", messages=(user_message("second"),)
         )
+
+
+def test_a_replayed_key_under_a_fresh_request_id_is_a_conflict(harness: Harness) -> None:
+    """Same key, same work, new authorization: a conflict naming both request ids.
+
+    A client that retries by re-signing keeps the idempotency key it already used
+    and gets a fresh ``request_id``, so the payload digest agrees and the store
+    hands back the *first* request. Answering that with the first request's id
+    would report a dispatch the caller never asked for; answering it as an internal
+    failure would tell the caller the center broke and invite it to retry the very
+    request that failed. A conflict is the honest answer, and it names both ids so
+    the caller can act on either.
+    """
+    harness.connect()
+    messages = (user_message("one prompt"),)
+    first = harness.admit(
+        harness.authorization(request_id="R-1", messages=messages),
+        idempotency_key="key-1",
+        messages=messages,
+    )
+
+    with pytest.raises(ConflictError) as refused:
+        harness.admit(
+            harness.authorization(request_id="R-2", messages=messages),
+            idempotency_key="key-1",
+            messages=messages,
+        )
+
+    assert "R-1" in str(refused.value)
+    assert "R-2" in str(refused.value)
+    assert first.request_id == "R-1"
+    assert harness.store.get_request("R-2") is None
+    assert len(harness.store.attempts_for_request("R-1")) == 1
 
 
 def test_admission_refuses_a_ceiling_above_the_signed_cap(harness: Harness) -> None:
@@ -905,10 +959,17 @@ def test_reject_re_offers_to_another_node(harness: Harness) -> None:
     assert "busy" in harness.status("R-1")["billing_note"]
 
 
-def test_reject_with_a_single_node_and_no_budget_fails_the_request(
+def test_a_refusal_puts_the_request_back_in_the_queue_instead_of_ending_it(
     harness: Harness,
 ) -> None:
-    """The budget is one attempt, so a refusal is surfaced rather than retried."""
+    """A node that declined consumed nothing, so the request still may run.
+
+    Two facts are asserted together because they are one decision. The request is
+    waiting rather than ended: a refusal is a statement about a node's capacity at
+    an instant, not about the request. And it is waiting with its attempt budget
+    intact, which is what makes the wait worth having — an offer nobody executed
+    occupies no slot in a budget that exists to bound executions.
+    """
     harness.connect()
     harness.admit(harness.authorization(request_id="R-1"), max_attempts=1)
     offer = harness.sole_offer("node-A")
@@ -918,8 +979,44 @@ def test_reject_with_a_single_node_and_no_budget_fails_the_request(
     )
 
     document = harness.status("R-1")
-    assert document["status"] == "FAILED"
+    assert document["status"] == "ROUTING"
     assert "overloaded" in document["billing_note"]
+    assert harness.store.count_budget_attempts("R-1") == 0
+
+    # The node freed up. The center asks it again once the re-offer backoff has
+    # passed, and the same budget of one attempt still covers the work.
+    harness.take("node-A")
+    harness.tick(BASE + dt.timedelta(seconds=QUEUE_REOFFER_BACKOFF_S + 1))
+    retried = harness.sole_offer("node-A")
+    assert retried.attempt_id == "R-1-a2"
+    assert harness.status("R-1")["status"] == "RUNNING"
+
+
+def test_a_center_that_holds_no_queue_still_fails_a_request_nothing_took(
+    tmp_path: Path,
+) -> None:
+    """``queue_enabled=false`` keeps the old answer: refused, with the reason.
+
+    The knob is an operator's choice between holding work and shedding it, so both
+    halves have to be true — with it off, a request every node declined is ended
+    immediately and its note names the decline.
+    """
+    harness = Harness(tmp_path, queue_enabled=False)
+    try:
+        harness.connect()
+        harness.admit(harness.authorization(request_id="R-1"), max_attempts=1)
+        offer = harness.sole_offer("node-A")
+
+        harness.service.handle_node_message(
+            node_id="node-A", envelope=_reject(offer, reason="overloaded"), now=BASE
+        )
+
+        document = harness.status("R-1")
+        assert document["status"] == "FAILED"
+        assert "no node left to take the work" in document["billing_note"]
+        assert "overloaded" in document["billing_note"]
+    finally:
+        harness.close()
 
 
 # -- output and usage ----------------------------------------------------------
@@ -1963,3 +2060,616 @@ def test_the_lock_is_released_before_a_node_callback_runs(harness: Harness) -> N
     worker.join(timeout=5)
     assert not worker.is_alive()
     assert harness.sole_offer("node-A").request_id == "R-1"
+
+
+# -- agent sessions -------------------------------------------------------------
+
+
+def _settle(
+    harness: Harness,
+    offer: AttemptOffer,
+    node_id: str,
+    *,
+    measured: tuple[int, int] = (800, 200),
+    device_id: str = "device-A",
+    device_key_id: str = "device-key-A",
+    provider_id: str = "provider-A",
+) -> None:
+    """Run one offer to a settled success: accept, publish, report usage.
+
+    The three messages a real node sends, in the order it sends them, so a test
+    about what a session's turn cost is driving the same settlement path the
+    connector drives rather than writing rows behind it. The device and provider
+    default to node-A's and have to be named for any other node, because a report
+    is signed by the device that ran the work and settles into the provider that
+    device is bound to.
+    """
+    acceptance_hash = compute_acceptance_hash(
+        permit_hash=offer.permit_hash,
+        request_id=offer.request_id,
+        attempt_id=offer.attempt_id,
+        epoch=offer.epoch,
+        adapter_name="mock-adapter",
+        accepted_at=BASE,
+    )
+    harness.service.handle_node_message(
+        node_id=node_id,
+        envelope=_accept(offer, acceptance_hash=acceptance_hash),
+        now=BASE,
+    )
+    harness.service.handle_node_message(
+        node_id=node_id, envelope=_delta(offer, 1, "an answer"), now=BASE
+    )
+    harness.service.handle_node_message(
+        node_id=node_id,
+        envelope=_usage_event(
+            harness.keyring,
+            offer,
+            acceptance_hash=acceptance_hash,
+            measured=measured,
+            device_id=device_id,
+            device_key_id=device_key_id,
+            provider_id=provider_id,
+        ),
+        now=BASE,
+    )
+
+
+def test_a_session_aggregates_the_turns_tokens_and_credit_it_settled(
+    harness: Harness,
+) -> None:
+    """One session's totals are the books' own numbers for the turns it made.
+
+    Two turns, both settled, and the aggregate has to agree with what the ledger
+    moved and what the node measured — separately, because the two are different
+    quantities and reporting one as the other would make a session's cost
+    unreadable.
+    """
+    harness.connect()
+    harness.admit(
+        harness.authorization(request_id="R-1"), idempotency_key="k-1", session_id="sess-1"
+    )
+    _settle(harness, harness.sole_offer("node-A"), "node-A")
+    harness.take("node-A")
+    harness.admit(
+        harness.authorization(request_id="R-2"), idempotency_key="k-2", session_id="sess-1"
+    )
+    _settle(harness, harness.sole_offer("node-A"), "node-A")
+
+    session = harness.store.session(TENANT, "consumer-X", "sess-1")
+    assert session is not None
+    assert session.request_count == 2
+    assert session.total_tokens == 2_000, "800 + 200 native tokens per turn, as measured"
+    assert session.total_milli_credits == 2_000
+    assert session.total_milli_credits == 100_000 - harness.ledger.balance("consumer-X")
+    assert session.last_node_id == "node-A"
+
+
+def test_a_session_counts_a_turn_that_never_settled_without_charging_it(
+    harness: Harness,
+) -> None:
+    """A turn the session made is a turn, even when it cost nothing.
+
+    `request_count` answers "how many turns did this run make", which includes the
+    ones that failed; the totals answer "what was billed", which does not. Keeping
+    the two apart is what stops a session with a failed turn from looking like a
+    session that never ran.
+    """
+    harness.connect()
+    harness.admit(
+        harness.authorization(request_id="R-1"), idempotency_key="k-1", session_id="sess-1"
+    )
+    harness.service.cancel_request(
+        credential=CONSUMER, request_id="R-1", origin="consumer_cancel", now=BASE
+    )
+
+    session = harness.store.session(TENANT, "consumer-X", "sess-1")
+    assert session is not None
+    assert session.request_count == 1
+    assert session.total_tokens == 0
+    assert session.total_milli_credits == 0
+    assert session.last_node_id is None
+
+
+def test_a_replayed_usage_report_does_not_count_a_session_turn_twice(
+    harness: Harness,
+) -> None:
+    """The resend after a lost acknowledgement adds nothing, as everywhere else.
+
+    Settlement idempotency is the store's job, and a session total that grew on
+    every replay would be a second place where the same credit is counted twice.
+    """
+    harness.connect()
+    harness.admit(
+        harness.authorization(request_id="R-1"), idempotency_key="k-1", session_id="sess-1"
+    )
+    offer = harness.sole_offer("node-A")
+    acceptance_hash = compute_acceptance_hash(
+        permit_hash=offer.permit_hash,
+        request_id=offer.request_id,
+        attempt_id=offer.attempt_id,
+        epoch=offer.epoch,
+        adapter_name="mock-adapter",
+        accepted_at=BASE,
+    )
+    harness.service.handle_node_message(
+        node_id="node-A", envelope=_accept(offer, acceptance_hash=acceptance_hash), now=BASE
+    )
+    event = _usage_event(harness.keyring, offer, acceptance_hash=acceptance_hash)
+
+    harness.service.handle_node_message(node_id="node-A", envelope=event, now=BASE)
+    harness.service.handle_node_message(node_id="node-A", envelope=event, now=BASE)
+
+    session = harness.store.session(TENANT, "consumer-X", "sess-1")
+    assert session is not None
+    assert session.request_count == 1
+    assert session.total_tokens == 1_000
+    assert session.total_milli_credits == 1_000
+
+
+def test_a_session_goes_back_to_the_node_that_served_its_last_turn(
+    harness: Harness,
+) -> None:
+    """The sticky preference, and why it is worth having.
+
+    Both nodes can run the model and the ordinary rule would pick the lower id
+    every time. The session's second turn goes to the node that served its first
+    one instead, because that node's upstream is the one already holding this
+    conversation.
+    """
+    harness.connect("node-A")
+    harness.connect(
+        "node-B", device_id="device-B", device_key_id="device-key-B", provider_id="provider-B"
+    )
+    harness.admit(
+        harness.authorization(request_id="R-1"),
+        idempotency_key="k-1",
+        session_id="sess-1",
+        max_attempts=1,
+    )
+    # node-A wins the first turn on the ordinary lowest-id rule, and declines it,
+    # so the turn settles on node-B — the preference has to come from the books
+    # rather than from the first node that happened to be asked.
+    harness.service.handle_node_message(
+        node_id="node-A",
+        envelope=_reject(harness.sole_offer("node-A"), reason="busy"),
+        now=BASE,
+    )
+    harness.take("node-A")
+    _settle(
+        harness,
+        harness.sole_offer("node-B"),
+        "node-B",
+        device_id="device-B",
+        device_key_id="device-key-B",
+        provider_id="provider-B",
+    )
+    harness.take("node-B")
+
+    harness.admit(
+        harness.authorization(request_id="R-2"),
+        idempotency_key="k-2",
+        session_id="sess-1",
+        max_attempts=1,
+    )
+
+    assert harness.offers("node-A") == []
+    assert harness.sole_offer("node-B").request_id == "R-2"
+
+
+def test_a_session_preference_yields_to_the_ordinary_rule_when_the_node_is_gone(
+    harness: Harness,
+) -> None:
+    """A preference is not a constraint: an unavailable node is skipped, not waited for.
+
+    This is the half that makes the feature safe. A session pinned to a node that
+    disconnected would stop working, so the moment the preferred node is not also
+    a candidate the deterministic rule applies and the turn runs somewhere else.
+    """
+    harness.connect("node-A")
+    harness.connect(
+        "node-B", device_id="device-B", device_key_id="device-key-B", provider_id="provider-B"
+    )
+    harness.admit(
+        harness.authorization(request_id="R-1"),
+        idempotency_key="k-1",
+        session_id="sess-1",
+        max_attempts=1,
+    )
+    harness.service.handle_node_message(
+        node_id="node-A", envelope=_reject(harness.sole_offer("node-A"), reason="busy"), now=BASE
+    )
+    harness.take("node-A")
+    _settle(
+        harness,
+        harness.sole_offer("node-B"),
+        "node-B",
+        device_id="device-B",
+        device_key_id="device-key-B",
+        provider_id="provider-B",
+    )
+    harness.take("node-B")
+    harness.service.node_disconnected(node_id="node-B", now=BASE)
+
+    harness.admit(
+        harness.authorization(request_id="R-2"),
+        idempotency_key="k-2",
+        session_id="sess-1",
+        max_attempts=1,
+    )
+
+    assert harness.sole_offer("node-A").request_id == "R-2"
+
+
+def test_a_session_belongs_to_the_subject_that_named_it(harness: Harness) -> None:
+    """Two subjects may both call a session "shared" and neither reads the other.
+
+    The identifier is caller-chosen, so the aggregate has to be keyed by the
+    identity the credential authenticated. Without that, one consumer naming a
+    session another consumer already used would spend into — and be reported
+    under — somebody else's run.
+    """
+    harness.connect()
+    harness.admit(
+        harness.authorization(request_id="R-1"), idempotency_key="k-1", session_id="shared"
+    )
+    harness.service.admit_request(
+        credential=FOREIGN,
+        idempotency_key="k-2",
+        messages=(user_message("write a haiku about ledgers"),),
+        authorization=signed_authorization(
+            harness.keyring,
+            request_id="R-2",
+            consumer_id="consumer-Y",
+            payer_account_id="consumer-Y",
+            key_id="consumer-key-2",
+        ),
+        model=MODEL,
+        max_charge_milli_credits=20_000,
+        session_id="shared",
+        now=BASE,
+    )
+
+    rows = harness.store.sessions(session_id="shared")
+    assert sorted(row.subject_id for row in rows) == ["consumer-X", "consumer-Y"]
+    assert all(row.request_count == 1 for row in rows)
+    assert harness.store.session_preference_for("R-2") is None
+
+
+def test_a_request_that_named_no_session_is_aggregated_nowhere(
+    harness: Harness,
+) -> None:
+    """A session exists because a request declared one, never by inference."""
+    harness.connect()
+    harness.admit(harness.authorization(request_id="R-1"), idempotency_key="k-1")
+    _settle(harness, harness.sole_offer("node-A"), "node-A")
+
+    assert harness.store.sessions() == []
+    assert harness.store.session_preference_for("R-1") is None
+
+
+@pytest.mark.parametrize("session_id", ["", "two words", "x" * 129])
+def test_a_session_identifier_the_wire_refuses_is_refused_at_admission(
+    harness: Harness, session_id: str
+) -> None:
+    """The center applies the wire's own rule rather than inventing a second one.
+
+    Refused rather than dropped: a caller that named a session and was silently
+    given none would read an aggregate for a run it never joined.
+    """
+    harness.connect()
+
+    with pytest.raises(PotluckError):
+        harness.admit(
+            harness.authorization(request_id="R-1"),
+            idempotency_key="k-1",
+            session_id=session_id,
+        )
+
+    assert harness.store.sessions() == []
+
+
+def test_a_key_minted_with_its_own_deadline_gives_its_requests_that_window(
+    harness: Harness,
+) -> None:
+    """The key's window wins over the surface default, and it is the one that ends it.
+
+    A long agent turn needs a long budget, and the key is where an operator
+    records that. What has to be true is that the longer window is the one written
+    to the request row and signed into the authorization — a deadline the center
+    ignored would expire a turn it had promised to wait for.
+    """
+    harness.connect()
+    harness.store.add_credential(
+        "consumer-token-x", TENANT, "consumer-X", "consumer", REGISTERED_AT
+    )
+    key = harness.store.add_api_key(
+        "ak-test-deadline",
+        key_id="apikey-deadline",
+        name="agent",
+        subject_id="consumer-X",
+        tenant_id=TENANT,
+        quota_milli_credits=100_000,
+        created_at=BASE,
+        deadline_ms=600_000,
+    )
+
+    result = harness.service.admit_api_key_request(
+        api_key=key,
+        messages=(user_message("a long turn"),),
+        model=MODEL,
+        deadline_ms=OPENAI_SURFACE_DEFAULT_MS,
+        now=BASE,
+    )
+
+    record = harness.store.get_request(result.request_id)
+    assert record is not None
+    assert record.deadline_at == BASE + dt.timedelta(milliseconds=600_000)
+    # The authorization has to cover the longer window too. Settlement runs after
+    # the answer does, and an authorization that expired in between would leave a
+    # node's tokens spent and unbillable.
+    inputs = harness.store.get_request_input(result.request_id)
+    assert inputs is not None
+    authorization = signed_record_from_dict(inputs["authorization"])
+    assert authorization.payload["expires_at"] == (
+        BASE
+        + dt.timedelta(milliseconds=600_000)
+        + AUTHORIZATION_SETTLEMENT_GRACE
+    ).isoformat()
+    assert harness.sole_offer("node-A").request_id == result.request_id
+
+
+def test_a_key_with_no_deadline_of_its_own_keeps_the_surface_default(
+    harness: Harness,
+) -> None:
+    """An operator who named no window gets the one the surface asked for."""
+    harness.connect()
+    harness.store.add_credential(
+        "consumer-token-x", TENANT, "consumer-X", "consumer", REGISTERED_AT
+    )
+    key = harness.store.add_api_key(
+        "ak-test-default",
+        key_id="apikey-default",
+        name="plain",
+        subject_id="consumer-X",
+        tenant_id=TENANT,
+        quota_milli_credits=100_000,
+        created_at=BASE,
+    )
+
+    result = harness.service.admit_api_key_request(
+        api_key=key,
+        messages=(user_message("a short turn"),),
+        model=MODEL,
+        deadline_ms=OPENAI_SURFACE_DEFAULT_MS,
+        now=BASE,
+    )
+
+    record = harness.store.get_request(result.request_id)
+    assert record is not None
+    assert record.deadline_at == BASE + dt.timedelta(milliseconds=OPENAI_SURFACE_DEFAULT_MS)
+
+
+# -- dispatch queue -------------------------------------------------------------
+
+
+def test_a_request_nothing_can_dispatch_waits_instead_of_being_refused(
+    harness: Harness,
+) -> None:
+    """Admitted with no node connected, and still alive: that is what a queue is.
+
+    The request is not ended, not billed and not forgotten. It sits in the status
+    the dispatch loop reads, with its own deadline still running, and its own
+    event stream says so.
+    """
+    result = harness.admit(harness.authorization(request_id="R-1"), idempotency_key="k-1")
+
+    assert result.created is True
+    assert harness.status("R-1")["status"] == "ROUTING"
+    assert harness.store.attempts_for_request("R-1") == []
+    events = harness.service.request_events(
+        credential=CONSUMER, request_id="R-1", cursor=0
+    )
+    assert [event.event_type for event in events] == [QUEUED_EVENT_TYPE]
+
+
+def test_a_waiting_request_runs_when_a_node_arrives(harness: Harness) -> None:
+    """A node freeing up is what ends the wait, and the stream records the exit.
+
+    This is the whole point of holding the request rather than refusing it: the
+    capacity problem ended on its own, and the request that survived it is
+    dispatched, metered and settled like any other.
+    """
+    harness.admit(harness.authorization(request_id="R-1"), idempotency_key="k-1")
+    harness.connect()
+
+    harness.tick(BASE + dt.timedelta(seconds=1))
+
+    assert harness.sole_offer("node-A").request_id == "R-1"
+    assert harness.status("R-1")["status"] == "RUNNING"
+    events = harness.service.request_events(
+        credential=CONSUMER, request_id="R-1", cursor=0
+    )
+    assert [event.event_type for event in events] == [
+        QUEUED_EVENT_TYPE,
+        DISPATCHED_EVENT_TYPE,
+    ]
+    assert events[1].payload["node_id"] == "node-A"
+
+
+def test_a_request_dispatched_straight_from_admission_never_joins_the_queue(
+    harness: Harness,
+) -> None:
+    """No queue frames for a request that did not wait.
+
+    An event is a claim that something happened. A request dispatched by its own
+    admission never sat in the queue, so its stream starts with the node's own
+    output rather than with a transition that did not occur.
+    """
+    harness.connect()
+    harness.admit(harness.authorization(request_id="R-1"), idempotency_key="k-1")
+
+    assert harness.service.request_events(
+        credential=CONSUMER, request_id="R-1", cursor=0
+    ) == []
+
+
+def test_the_queue_is_offered_oldest_first(tmp_path: Path) -> None:
+    """First come, first served — as far as a best-effort ordering can promise.
+
+    Three requests wait for one node. When it arrives the center offers the oldest
+    one, and only that one: the position is not a guarantee about the future, but
+    the order the dispatch loop reads in is the order the requests arrived in.
+    """
+    harness = Harness(tmp_path, max_queue_depth=3)
+    try:
+        for index in (1, 2, 3):
+            harness.admit(
+                harness.authorization(request_id=f"R-{index}"),
+                idempotency_key=f"k-{index}",
+                now=BASE + dt.timedelta(seconds=index),
+            )
+        harness.connect()
+
+        harness.tick(BASE + dt.timedelta(seconds=10))
+
+        # The center places no per-node cap of its own — a node declines what its
+        # local policy will not take — so what first-come-first-served means here
+        # is the order the offers go out in, and that order is arrival order.
+        assert [offer.request_id for offer in harness.offers("node-A")] == [
+            "R-1",
+            "R-2",
+            "R-3",
+        ]
+        assert harness.offers("node-A")[0].attempt_id == "R-1-a1"
+    finally:
+        harness.close()
+
+
+def test_admission_is_refused_once_the_queue_is_at_its_bound(tmp_path: Path) -> None:
+    """The bound is what keeps a wait from becoming a promise the center cannot keep.
+
+    With every slot taken, admitting another request would be agreeing to hold work
+    the center has already agreed to hold too much of. The refusal names the bound
+    and the fact that nothing can dispatch, so a caller knows to back off rather
+    than to re-authenticate or change its model.
+    """
+    harness = Harness(tmp_path, max_queue_depth=2)
+    try:
+        for index in (1, 2):
+            harness.admit(
+                harness.authorization(request_id=f"R-{index}"), idempotency_key=f"k-{index}"
+            )
+
+        with pytest.raises(QueueFull) as refused:
+            harness.admit(
+                harness.authorization(request_id="R-3"), idempotency_key="k-3"
+            )
+
+        assert "queue bound of 2" in str(refused.value)
+        assert harness.store.get_request("R-3") is None, "a refused admission stores nothing"
+    finally:
+        harness.close()
+
+
+def test_a_retry_at_the_bound_still_gets_its_own_request_back(tmp_path: Path) -> None:
+    """A full queue does not break the idempotency key's promise.
+
+    The key means "this is the same request again", and a caller retrying under
+    load is exactly the caller who needs that to hold. Refusing the retry would
+    leave a client that already has a request in flight unable to ask about it.
+    """
+    harness = Harness(tmp_path, max_queue_depth=1)
+    try:
+        authorization = harness.authorization(request_id="R-1")
+        first = harness.admit(authorization, idempotency_key="k-1")
+
+        second = harness.admit(authorization, idempotency_key="k-1")
+
+        assert first.request_id == second.request_id == "R-1"
+        assert second.created is False
+    finally:
+        harness.close()
+
+
+def test_a_waiting_request_still_expires_at_its_own_deadline(harness: Harness) -> None:
+    """Queuing changes when a request is answered, never whether it is billed honestly.
+
+    The same sweep that has always ended an overdue request ends a queued one, with
+    the same status and the same recorded reason. A wait nothing ever ended is an
+    EXPIRED request with no attempt behind it — no tokens, no charge, no receipt.
+    """
+    harness.admit(
+        harness.authorization(request_id="R-1"), idempotency_key="k-1", deadline_ms=30_000
+    )
+
+    harness.tick(BASE + dt.timedelta(seconds=31))
+
+    document = harness.status("R-1")
+    assert document["status"] == "EXPIRED"
+    assert "deadline" in document["billing_note"]
+    assert harness.store.attempts_for_request("R-1") == []
+    assert harness.ledger.balance("consumer-X") == 100_000
+
+
+def test_a_center_that_holds_no_queue_refuses_at_admission(tmp_path: Path) -> None:
+    """``queue_enabled=false`` is the operator's other choice, and it is a real one.
+
+    A center that sheds load answers immediately and creates nothing, so a caller's
+    own backoff decides what happens next instead of the center's memory.
+    """
+    harness = Harness(tmp_path, queue_enabled=False)
+    try:
+        with pytest.raises(ModelUnavailable):
+            harness.admit(harness.authorization(request_id="R-1"), idempotency_key="k-1")
+
+        assert harness.store.get_request("R-1") is None
+        assert harness.store.count_requests_by_status("ROUTING") == 0
+    finally:
+        harness.close()
+
+
+def test_a_replayed_queue_event_never_writes_a_second_frame(harness: Harness) -> None:
+    """The queue's frames obey the same replay rule every other stored event does.
+
+    A dispatch loop that runs twice over one waiting request — a tick that overlaps
+    an admission, or one that follows a restart — must not leave two copies of a
+    transition on a stream a consumer reads in order.
+    """
+    harness.admit(harness.authorization(request_id="R-1"), idempotency_key="k-1")
+    before = harness.service.request_events(
+        credential=CONSUMER, request_id="R-1", cursor=0
+    )
+
+    harness.admit(harness.authorization(request_id="R-1"), idempotency_key="k-1")
+    after = harness.service.request_events(
+        credential=CONSUMER, request_id="R-1", cursor=0
+    )
+
+    assert [event.event_type for event in before] == [QUEUED_EVENT_TYPE]
+    assert len(after) == len(before)
+    assert [event.cursor for event in after] == [1]
+
+
+def test_a_waiting_request_survives_a_restart_and_is_still_offered(
+    tmp_path: Path,
+) -> None:
+    """The queue is durable state, not a scheduler's in-memory list.
+
+    A center interrupted while requests waited must come back holding them, because
+    the alternative is a restart that silently drops work it told callers it was
+    holding — and the request row, its deadline and its stored inputs are exactly
+    what makes that recoverable.
+    """
+    harness = Harness(tmp_path)
+    try:
+        harness.admit(harness.authorization(request_id="R-1"), idempotency_key="k-1")
+        harness.restart()
+        harness.connect()
+
+        harness.tick(BASE + dt.timedelta(seconds=1))
+
+        assert harness.sole_offer("node-A").request_id == "R-1"
+        assert harness.status("R-1")["status"] == "RUNNING"
+    finally:
+        harness.close()

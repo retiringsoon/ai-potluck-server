@@ -23,6 +23,7 @@ from aipotluck.errors import ConflictError, PotluckError
 from aipotluck.identity import generate_key_pair
 
 from aipotluck_server.deploy import load_center
+from aipotluck_server.gateway_service import DEFAULT_MAX_QUEUE_DEPTH
 from aipotluck_server.persistence import Credential
 
 CONSUMER_TOKEN = "consumer-token-deploy-secret"
@@ -194,3 +195,85 @@ def test_load_center_refuses_float_and_duplicate_key_json(tmp_path: Path) -> Non
     assert "duplicate JSON key" in str(duplicate_exc.value)
 
 
+
+
+def test_a_center_that_names_no_queue_field_gets_the_documented_default(
+    tmp_path: Path,
+) -> None:
+    """Queueing is on by default, and the default is the one the docs name.
+
+    Asserted against the loader rather than against the dataclass, because the
+    claim an operator relies on is about the file they did *not* write: a center
+    upgraded in place, with a ``center.json`` that predates the field, has to come
+    up holding work rather than shedding it.
+    """
+    document = _center_document(tmp_path)
+    assert "queue_enabled" not in document and "max_queue_depth" not in document
+    deployment = load_center(_write_json(tmp_path / "center.json", document))
+    try:
+        assert deployment.config.queue_enabled is True
+        assert deployment.config.max_queue_depth == DEFAULT_MAX_QUEUE_DEPTH
+    finally:
+        deployment.store.close()
+
+
+def test_a_center_may_turn_the_queue_off_and_bound_it(tmp_path: Path) -> None:
+    """Both fields reach the running service's configuration."""
+    document = _center_document(tmp_path) | {
+        "queue_enabled": False,
+        "max_queue_depth": 7,
+    }
+
+    deployment = load_center(_write_json(tmp_path / "center.json", document))
+    try:
+        assert deployment.config.queue_enabled is False
+        assert deployment.config.max_queue_depth == 7
+    finally:
+        deployment.store.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("queue_enabled", "on"),
+        ("queue_enabled", 1),
+        ("queue_enabled", None),
+        ("max_queue_depth", "100"),
+        ("max_queue_depth", True),
+        ("max_queue_depth", -1),
+    ],
+)
+def test_a_queue_field_written_wrong_refuses_the_center_at_load(
+    tmp_path: Path, field: str, value: Any
+) -> None:
+    """A wrong queue setting fails at startup rather than misbehaving at runtime.
+
+    This is the fail-loud rule the rest of the loader already follows. The tempting
+    alternative — reading ``queue_enabled`` with a default when it is not a boolean
+    — would turn ``"on"`` into ``False``, so an operator who meant to hold work
+    would run a center that sheds it and would learn so only from their users.
+    ``null`` is refused for the same reason: an absent field is a documented
+    default, while a field somebody wrote as null is a mistake worth reporting.
+    """
+    document = _center_document(tmp_path) | {field: value}
+
+    with pytest.raises(PotluckError) as refused:
+        load_center(_write_json(tmp_path / "center.json", document))
+
+    assert field in str(refused.value)
+
+
+def test_a_fractional_queue_depth_is_refused_by_the_strict_parser_first(
+    tmp_path: Path,
+) -> None:
+    """A float never reaches the field check, because the file is not strict JSON.
+
+    Refused even earlier than a wrong type, and for the reason the whole config
+    boundary gives: an amount that can be encoded two ways is not an amount.
+    """
+    document = _center_document(tmp_path) | {"max_queue_depth": 1.5}
+
+    with pytest.raises(PotluckError) as refused:
+        load_center(_write_json(tmp_path / "center.json", document))
+
+    assert "fractional number" in str(refused.value)

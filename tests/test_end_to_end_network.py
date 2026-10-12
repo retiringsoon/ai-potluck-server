@@ -106,10 +106,13 @@ def _authorization_body(
 class Center:
     """A real gateway over a real store, with credentials provisioned."""
 
-    def __init__(self, tmp_path: Path, keyring: Keyring) -> None:
+    def __init__(self, tmp_path: Path, keyring: Keyring, **config: Any) -> None:
         self.keyring = keyring
         self.tmp_path = tmp_path
         self.store = CenterStore.open(tmp_path / "center.db")
+        # `config` is the dispatch-queue policy a test wants to probe; the defaults
+        # are the shipped ones, so a test that names none drives what an operator
+        # who wrote no queue field gets.
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
@@ -117,6 +120,7 @@ class Center:
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
+            **config,
         )
         self.service = GatewayService(
             config=self.config, store=self.store, registry=keyring.registry
@@ -464,6 +468,109 @@ def test_idempotent_replay_creates_nothing_new(center: Center) -> None:
         assert node.adapter.upstream_calls == calls_after_first, (
             "an idempotent replay must not make another upstream call"
         )
+    finally:
+        node.stop()
+
+
+def test_a_full_dispatch_queue_answers_503_on_the_platforms_own_surface(
+    tmp_path: Path,
+) -> None:
+    """The signed door names the queue's own condition, not a generic bad request.
+
+    A caller cannot act on `400 bad_request`: it says the request was wrong, and
+    this request was not — the center was full. `503` with its own code says "the
+    platform is taking no more work right now", which is a condition that ends, and
+    is the same fact the OpenAI-compatible surface answers as a `429` an existing
+    client already backs off on.
+    """
+    center = Center(tmp_path, Keyring(), max_queue_depth=1)
+    try:
+        first = _admit(center, "R-queue-1", "idem-queue-1")
+        assert center.store.count_requests_by_status("ROUTING") == 1
+
+        status, document = center.post(
+            "/v1/requests",
+            {
+                "idempotency_key": "idem-queue-2",
+                "messages": [{"role": "user", "content": "write a haiku about sockets"}],
+                "model": MODEL,
+                "delivery_mode": "buffered_complete",
+                "max_attempts": 2,
+                "deadline_ms": 60000,
+                "max_charge_milli_credits": 20_000,
+                "authorization": _authorization_body(center.keyring, "R-queue-2"),
+            },
+        )
+
+        assert status == 503, document
+        assert document["error"] == "queue_full"
+        assert "queue bound of 1" in document["detail"]
+        assert center.store.get_request("R-queue-2") is None
+        assert center.store.count_requests_by_status("ROUTING") == 1
+        assert first["request_id"] == "R-queue-1"
+    finally:
+        center.stop()
+
+
+def test_a_replayed_key_under_a_fresh_request_id_is_a_conflict_not_a_crash(
+    center: Center,
+) -> None:
+    """Re-signing the same work under the same key is a 409, in the conflict shape.
+
+    The defect this guards is a 500. A client that retries by re-signing — a fresh
+    authorization, so a fresh ``request_id`` — while keeping the idempotency key it
+    already used arrives with a payload digest the stored row agrees with, so the
+    store hands back the *first* request. The admission then looked up the second
+    request id, found nothing, and asserted: an ``AssertionError`` is not a
+    ``PotluckError``, so the transport had no vocabulary for it and answered
+    ``500 internal_error``.
+
+    A 500 says "the center broke", which invites the caller to retry the very
+    request that broke it. A 409 says "this key already named another request",
+    which is true and is actionable: resubmit with the id the center returned, or
+    mint a fresh key for genuinely new work. Asserted over the real HTTP surface
+    because the status and the error shape are the caller-visible half of the fix.
+    """
+    node = Node(center.tmp_path, center.keyring, center.port)
+    try:
+        _wait_until(
+            lambda: bool(center.store.connected_nodes()), what="the node to register"
+        )
+        messages = [{"role": "user", "content": "one prompt"}]
+        conversation = (user_message("one prompt"),)
+        body = {
+            "idempotency_key": "idem-resigned",
+            "messages": messages,
+            "model": MODEL,
+            "delivery_mode": "buffered_complete",
+            "max_attempts": 2,
+            "deadline_ms": 60000,
+            "max_charge_milli_credits": 20_000,
+            "authorization": _authorization_body(
+                center.keyring, "R-first", messages=conversation
+            ),
+        }
+        status, first = center.post("/v1/requests", body)
+        assert status == 200
+        first_request_id = first["request_id"]
+
+        resigned = {
+            **body,
+            "authorization": _authorization_body(
+                center.keyring, "R-second", messages=conversation
+            ),
+        }
+        status, document = center.post("/v1/requests", resigned)
+
+        assert status == 409, document
+        assert document["error"] == "conflict"
+        assert "R-second" in document["detail"]
+        assert first_request_id in document["detail"]
+        # The stored request is untouched: still one row, still the first one's id,
+        # and the second authorization dispatched nothing of its own.
+        assert center.store.get_request("R-second") is None
+        assert center.store.attempts_for_request(first_request_id)
+        assert node.adapter.upstream_calls <= 1
     finally:
         node.stop()
 

@@ -1288,3 +1288,431 @@ def test_open_existing_refuses_a_database_whose_creation_never_finished(
         CenterStore.open_existing(truncated)
 
     assert truncated.read_bytes() == b"", "the refusal must not write a schema"
+
+
+# -- agent sessions ---------------------------------------------------------
+
+
+def _session_request(
+    store: CenterStore,
+    *,
+    request_id: str,
+    session_id: str | None,
+    idempotency_key: str | None = None,
+    tenant_id: str = "T1",
+    at: dt.datetime = T0,
+) -> None:
+    """Create one request that belongs to a session, as an admission would."""
+    store.create_request(
+        request_id=request_id,
+        tenant_id=tenant_id,
+        subject_id="subject-1",
+        idempotency_key=idempotency_key or f"K-{request_id}",
+        payload_digest=f"sha256:{request_id}",
+        delivery_mode="buffered_complete",
+        max_attempts=1,
+        service_unit_id=request_id,
+        created_at=at,
+        session_id=session_id,
+    )
+    if session_id is not None:
+        store.touch_session(
+            tenant_id=tenant_id, subject_id="subject-1", session_id=session_id, at=at
+        )
+
+
+def _settle_request(
+    store: CenterStore,
+    *,
+    request_id: str,
+    attempt_id: str,
+    receipt_id: str,
+    log_index: int,
+    charge: int,
+    tokens: int,
+    at: dt.datetime = T1,
+) -> None:
+    """Run one request's settlement bundle, as the gateway's settlement does."""
+    store.upsert_attempt(
+        attempt_id=attempt_id,
+        request_id=request_id,
+        node_id="N1",
+        resource_id="res-1",
+        provider_id="provider-1",
+        dispatch_epoch=1,
+        at=at,
+    )
+    store.record_settlement_bundle(
+        settlement=SettlementRecord(
+            service_unit_id=request_id,
+            revision=1,
+            fingerprint=f"fp-{receipt_id}",
+            receipt_id=receipt_id,
+            receipt_hash=f"sha256:{receipt_id}",
+            log_index=log_index,
+            receipt_json="{}",
+            created_at=at,
+        ),
+        receipt=ReceiptRecord(
+            receipt_id=receipt_id,
+            request_id=request_id,
+            receipt_hash=f"sha256:{receipt_id}",
+            log_index=log_index,
+            receipt_json="{}",
+            created_at=at,
+        ),
+        journal_kind="journal",
+        journal_payload={"journal_id": f"J-{receipt_id}", "kind": "success"},
+        attempt_id=attempt_id,
+        usage_tokens=charge,
+        at=at,
+        settled_tokens=tokens,
+    )
+
+
+def test_touch_session_counts_admissions_and_keeps_the_first_instant(
+    center: CenterStore,
+) -> None:
+    """One row per session, counted up, with both instants it needs to be useful.
+
+    `created_at` is when the run started and `last_seen_at` is when it last did
+    something: an operator reading a listing sorts by the second and reads the
+    first to tell a long run from a stale one.
+    """
+    _session_request(center, request_id="R1", session_id="sess-1", at=T0)
+    _session_request(center, request_id="R2", session_id="sess-1", at=T2)
+
+    session = center.session("T1", "subject-1", "sess-1")
+    assert session is not None
+    assert session.request_count == 2
+    assert session.created_at == T0
+    assert session.last_seen_at == T2
+    assert (session.total_tokens, session.total_milli_credits) == (0, 0)
+
+
+def test_a_settlement_adds_its_tokens_and_charge_to_the_session_once(
+    center: CenterStore,
+) -> None:
+    """The totals are the settlement's own numbers, and a replay adds nothing.
+
+    Written inside the settlement transaction and guarded by the settlement row
+    itself, so the resend a node makes after a lost acknowledgement cannot count
+    the same credit twice — the same idempotency the key's quota relies on.
+    """
+    _session_request(center, request_id="R1", session_id="sess-1")
+    arguments: dict[str, Any] = {
+        "request_id": "R1",
+        "attempt_id": "A1",
+        "receipt_id": "RC1",
+        "log_index": 0,
+        "charge": 1_000,
+        "tokens": 800,
+    }
+
+    _settle_request(center, **arguments)
+    _settle_request(center, **arguments)
+
+    session = center.session("T1", "subject-1", "sess-1")
+    assert session is not None
+    assert session.total_milli_credits == 1_000
+    assert session.total_tokens == 800, "native tokens and credit are different quantities"
+    assert session.last_node_id == "N1"
+
+
+def test_a_settlement_of_a_request_with_no_session_updates_no_aggregate(
+    center: CenterStore,
+) -> None:
+    """A session exists because a request declared one, never by inference."""
+    _session_request(center, request_id="R1", session_id=None)
+
+    _settle_request(
+        center,
+        request_id="R1",
+        attempt_id="A1",
+        receipt_id="RC1",
+        log_index=0,
+        charge=1_000,
+        tokens=800,
+    )
+
+    assert center.sessions() == []
+
+
+def test_two_subjects_may_name_one_session_without_sharing_it(
+    center: CenterStore,
+) -> None:
+    """The identifier is caller-chosen, so the key has to carry the identity too.
+
+    Without the subject in the key, one consumer naming a session another already
+    used would spend into — and be reported under — somebody else's run.
+    """
+    center.create_request(
+        request_id="R1",
+        tenant_id="T1",
+        subject_id="subject-1",
+        idempotency_key="K1",
+        payload_digest="sha256:R1",
+        delivery_mode="buffered_complete",
+        max_attempts=1,
+        service_unit_id="R1",
+        created_at=T0,
+        session_id="shared",
+    )
+    center.touch_session(tenant_id="T1", subject_id="subject-1", session_id="shared", at=T0)
+    center.create_request(
+        request_id="R2",
+        tenant_id="T1",
+        subject_id="subject-2",
+        idempotency_key="K2",
+        payload_digest="sha256:R2",
+        delivery_mode="buffered_complete",
+        max_attempts=1,
+        service_unit_id="R2",
+        created_at=T1,
+        session_id="shared",
+    )
+    center.touch_session(tenant_id="T1", subject_id="subject-2", session_id="shared", at=T1)
+
+    rows = center.sessions(session_id="shared")
+    assert sorted(row.subject_id for row in rows) == ["subject-1", "subject-2"]
+    assert all(row.request_count == 1 for row in rows)
+    assert center.sessions(subject_id="subject-2")[0].session_id == "shared"
+    # Dispatch reads the preference through the request, so it can only ever reach
+    # the aggregate of the subject that request belongs to.
+    assert center.session_preference_for("R1") is None
+    assert center.session_preference_for("R2") is None
+
+
+def test_receipts_for_session_are_the_records_behind_its_totals(
+    center: CenterStore,
+) -> None:
+    """A session listing is a claim; the receipts are what an operator checks it against."""
+    _session_request(center, request_id="R1", session_id="sess-1")
+    _session_request(center, request_id="R2", session_id="sess-1", at=T1)
+    _session_request(center, request_id="R3", session_id="sess-2", at=T1)
+    _settle_request(
+        center, request_id="R1", attempt_id="A1", receipt_id="RC1",
+        log_index=0, charge=1_000, tokens=800,
+    )
+    _settle_request(
+        center, request_id="R2", attempt_id="A2", receipt_id="RC2",
+        log_index=1, charge=2_000, tokens=900, at=T2,
+    )
+    _settle_request(
+        center, request_id="R3", attempt_id="A3", receipt_id="RC3",
+        log_index=2, charge=4_000, tokens=100, at=T2,
+    )
+
+    assert [receipt.receipt_id for receipt in center.receipts_for_session("sess-1")] == [
+        "RC1",
+        "RC2",
+    ]
+    assert [receipt.receipt_id for receipt in center.receipts_for_session("sess-2")] == ["RC3"]
+    session = center.session("T1", "subject-1", "sess-1")
+    assert session is not None
+    assert (session.total_tokens, session.total_milli_credits) == (1_700, 3_000)
+
+
+# -- the dispatch queue's own reads -----------------------------------------
+
+
+def test_waiting_requests_are_read_oldest_first_and_counted_whole(
+    center: CenterStore,
+) -> None:
+    """The queue is this ordering, so the ordering is the fairness claim.
+
+    `requests_by_status` is bounded because one tick must not walk a center's whole
+    history; `count_requests_by_status` is not, because a bound that undercounted
+    would let the queue grow past what the operator set. The ordering reads
+    `created_at`, which is the arrival instant an admission wrote, so what
+    first-come-first-served means here is arrival order and nothing else.
+    """
+    arrivals = [("R1", "ROUTING"), ("R2", "RUNNING"), ("R3", "ROUTING"), ("R4", "ROUTING")]
+    for index, (request_id, status) in enumerate(arrivals):
+        _create_request(
+            center,
+            request_id=request_id,
+            idempotency_key=f"K{index}",
+            at=T0 + dt.timedelta(seconds=index),
+        )
+        center.set_request_status(request_id, status, at=T0 + dt.timedelta(seconds=index))
+
+    waiting = center.requests_by_status("ROUTING", limit=2)
+    assert [record.request_id for record in waiting] == ["R1", "R3"], (
+        "oldest first, and bounded so one tick cannot walk the center's history"
+    )
+    assert center.count_requests_by_status("ROUTING") == 3
+    assert center.count_requests_by_status("SUCCEEDED") == 0
+
+
+def test_a_refused_offer_occupies_no_slot_in_the_attempt_budget(
+    center: CenterStore,
+) -> None:
+    """The budget bounds executions, and a refusal executed nothing.
+
+    Counting refusals would let one busy node spend a request's whole budget on
+    zero work, and then have the center report the request as exhausted rather
+    than as waiting for a node that frees up.
+    """
+    _create_request(center, request_id="R1", max_attempts=1)
+    _add_attempt(center, attempt_id="A1", request_id="R1", node_id="N1")
+    center.set_attempt_status("A1", "FAILED", at=T1)
+    center.mark_attempt_refused("A1", at=T1)
+    _add_attempt(center, attempt_id="A2", request_id="R1", node_id="N2", dispatch_epoch=2)
+
+    assert center.count_budget_attempts("R1") == 1
+    attempts = center.attempts_for_request("R1")
+    assert {attempt.attempt_id: attempt.refused_before_execution for attempt in attempts} == {
+        "A1": True,
+        "A2": False,
+    }
+
+
+def test_mark_attempt_refused_names_an_attempt_it_does_not_hold(
+    center: CenterStore,
+) -> None:
+    """A mark that could be written against nothing would be a silent no-op."""
+    with pytest.raises(StateTransitionError):
+        center.mark_attempt_refused("A-missing", at=T0)
+
+
+def test_request_by_idempotency_key_is_scoped_to_its_tenant(
+    center: CenterStore,
+) -> None:
+    """The read an admission gate uses to honour a retry must not cross tenants."""
+    _create_request(center, request_id="R1", tenant_id="T1", idempotency_key="K1")
+    center.create_request(
+        request_id="R2",
+        tenant_id="T2",
+        subject_id="subject-2",
+        idempotency_key="K1",
+        payload_digest="sha256:R2",
+        delivery_mode="buffered_complete",
+        max_attempts=1,
+        service_unit_id="R2",
+        created_at=T0,
+    )
+
+    assert center.request_by_idempotency_key("T1", "K1").request_id == "R1"
+    assert center.request_by_idempotency_key("T2", "K1").request_id == "R2"
+    assert center.request_by_idempotency_key("T3", "K1") is None
+
+
+def test_the_catalogue_outlives_the_link_that_advertised_it(
+    center: CenterStore,
+) -> None:
+    """A node that lost its socket has not withdrawn its model.
+
+    This is what keeps ``model_not_found`` honest: it answers a model no node of
+    this center runs, not a model whose nodes are all mid-restart — the second is
+    contention, and contention is what the queue holds.
+    """
+    store_node = NodeRecord(
+        node_id="N1",
+        device_id="dev-1",
+        provider_id="prov-1",
+        adapter_name="ollama",
+        model="llama",
+        share_enabled=True,
+        max_concurrency=2,
+        max_local_reserved_milli_credits=500,
+        policy_version=1,
+        connected=True,
+        last_seen_at=T0,
+    )
+    center.upsert_node(store_node)
+    assert center.catalogued_models() == {"llama"}
+
+    center.set_node_connected("N1", connected=False, at=T1)
+    assert center.connected_nodes() == []
+    assert center.catalogued_models() == {"llama"}
+
+    center.upsert_node(
+        NodeRecord(**{**store_node.__dict__, "share_enabled": False, "connected": True})
+    )
+    assert center.catalogued_models() == set(), "a node that paused withdrew its model"
+
+
+def test_a_database_from_before_sessions_gains_the_columns_it_needs(
+    tmp_path: Path,
+) -> None:
+    """An upgraded center keeps its requests, its keys and its attempts.
+
+    Every column this release adds is read back by a path that runs on every
+    request, so a database an earlier release created has to gain them at open
+    rather than fail the first admission — and a row written before they existed
+    has to read back as the honest absence: no session, no key window, no refusal.
+    """
+    path = tmp_path / "center.db"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE requests (request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,"
+            " subject_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,"
+            " payload_digest TEXT NOT NULL, delivery_mode TEXT NOT NULL,"
+            " max_attempts INTEGER NOT NULL, service_unit_id TEXT NOT NULL,"
+            " status TEXT NOT NULL, selected_attempt_id TEXT, deadline_at TEXT,"
+            " billing_note TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+            " UNIQUE (tenant_id, idempotency_key))"
+        )
+        connection.execute(
+            "CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY,"
+            " request_id TEXT NOT NULL, node_id TEXT, resource_id TEXT NOT NULL,"
+            " provider_id TEXT NOT NULL, dispatch_epoch INTEGER NOT NULL,"
+            " status TEXT NOT NULL, output_eligible INTEGER NOT NULL,"
+            " usage_status TEXT NOT NULL, usage_tokens INTEGER,"
+            " settlement_status TEXT NOT NULL, execution_state TEXT,"
+            " updated_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE api_keys (key_id TEXT PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE,"
+            " name TEXT NOT NULL DEFAULT '', subject_id TEXT NOT NULL,"
+            " tenant_id TEXT NOT NULL, quota_milli_credits INTEGER NOT NULL,"
+            " used_milli_credits INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,"
+            " created_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT,"
+            " last_used_at TEXT)"
+        )
+        stamp = T0.strftime("%Y-%m-%dT%H:%M:%S.%f%z")
+        connection.execute(
+            "INSERT INTO requests (request_id, tenant_id, subject_id, idempotency_key,"
+            " payload_digest, delivery_mode, max_attempts, service_unit_id, status,"
+            " created_at, updated_at) VALUES ('R-legacy', 'T1', 'subject-1', 'K-legacy',"
+            " 'sha256:legacy', 'buffered_complete', 1, 'R-legacy', 'SUCCEEDED', ?, ?)",
+            (stamp, stamp),
+        )
+        connection.execute(
+            "INSERT INTO attempts (attempt_id, request_id, node_id, resource_id,"
+            " provider_id, dispatch_epoch, status, output_eligible, usage_status,"
+            " settlement_status, updated_at)"
+            " VALUES ('A-legacy', 'R-legacy', 'N1', 'res-1', 'provider-1', 1,"
+            " 'COMPLETED', 1, 'COMPLETE', 'SETTLED', ?)",
+            (stamp,),
+        )
+        connection.execute(
+            "INSERT INTO api_keys (key_id, key_hash, name, subject_id, tenant_id,"
+            " quota_milli_credits, status, created_at)"
+            " VALUES ('apikey-legacy', ?, 'old', 'subject-1', 'T1', 5000, 'active', ?)",
+            (canonical_digest("ak-legacy"), stamp),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = CenterStore.open(path)
+    try:
+        legacy = store.get_request("R-legacy")
+        assert legacy is not None
+        assert legacy.session_id is None
+        assert legacy.api_key_id is None
+        attempt = store.get_attempt("A-legacy")
+        assert attempt is not None
+        assert attempt.refused_before_execution is False
+        keys = store.list_api_keys()
+        assert len(keys) == 1 and keys[0].deadline_ms is None
+        assert store.sessions() == []
+        assert store.count_budget_attempts("R-legacy") == 1
+        # The upgraded store writes the new shape beside the old rows.
+        _session_request(store, request_id="R-new", session_id="sess-new", at=T1)
+        assert store.session("T1", "subject-1", "sess-new") is not None
+    finally:
+        store.close()

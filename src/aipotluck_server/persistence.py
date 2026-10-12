@@ -215,6 +215,39 @@ class RequestRecord:
     #: quota, so a key's spend is a fact about the request rather than a
     #: connection the books have to reconstruct.
     api_key_id: str | None = None
+    #: The agent session this request belongs to, or `None` for one that named no
+    #: session. A caller-chosen label rather than a credential: the aggregate it
+    #: feeds is keyed by the tenant and subject the *credential* authenticated,
+    #: so naming somebody else's session cannot attribute a charge to them.
+    session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SessionRecord:
+    """One agent session's aggregate, keyed by `(tenant_id, subject_id, session_id)`.
+
+    The counters are what an operator asks of a long-running agent loop: how many
+    turns it made, what they consumed, what they cost, and when it last did
+    either. `last_node_id` is the node that served the session's most recent
+    settled turn, and it exists so dispatch can prefer it — one session's turns
+    share a conversation, and the node that already holds that context in its
+    upstream's cache is the cheapest place to run the next one.
+
+    The totals count only *settled* turns. A turn that failed or was cancelled
+    still counts in `request_count`, because it was a request the center
+    admitted, but it adds no tokens and no charge: nothing here may report money
+    the books did not move.
+    """
+
+    tenant_id: str
+    subject_id: str
+    session_id: str
+    request_count: int
+    total_tokens: int
+    total_milli_credits: int
+    last_node_id: str | None
+    created_at: dt.datetime
+    last_seen_at: dt.datetime
 
 
 @dataclass(frozen=True)
@@ -234,6 +267,10 @@ class AttemptRecord:
     settlement_status: str
     execution_state: str | None
     updated_at: dt.datetime
+    #: Whether the node refused this offer before executing anything. A refusal
+    #: consumed no tokens, so it does not occupy a slot in the request's attempt
+    #: budget; see `_ADDED_COLUMNS`.
+    refused_before_execution: bool = False
 
 
 @dataclass(frozen=True)
@@ -446,6 +483,13 @@ class ApiKeyRecord:
     #: has never been used is the one thing an operator can revoke without
     #: wondering what it will break.
     last_used_at: dt.datetime | None
+    #: The wall-clock budget a request admitted on this key is given, in
+    #: milliseconds, or `None` for the surface's own default. An operator mints
+    #: it with ``admin api-key --deadline-ms``, and it exists for the keys an
+    #: agent loop holds: a long turn needs a longer window than a one-shot
+    #: question does, and the key is the only place that fact can be recorded
+    #: without teaching the OpenAI-compatible surface a new body field.
+    deadline_ms: int | None
 
     @property
     def remaining_milli_credits(self) -> int:
@@ -536,6 +580,9 @@ CREATE TABLE IF NOT EXISTS requests (
     billing_note TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    api_key_id TEXT,
+    api_key_charge_milli_credits INTEGER,
+    session_id TEXT,
     UNIQUE (tenant_id, idempotency_key)
 );
 
@@ -552,7 +599,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     usage_tokens INTEGER,
     settlement_status TEXT NOT NULL,
     execution_state TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    refused_before_execution INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_request ON attempts(request_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_node ON attempts(node_id);
@@ -694,9 +742,29 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at TEXT NOT NULL,
     expires_at TEXT,
     revoked_at TEXT,
-    last_used_at TEXT
+    last_used_at TEXT,
+    deadline_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_subject ON api_keys(subject_id);
+
+-- One agent session's aggregate. Keyed by (tenant, subject, session) because the
+-- session identifier is caller-chosen: two subjects may both name a session
+-- "default", and only the credential decides whose aggregate a turn lands in.
+-- The counters are written by the admission that counted the turn and by the
+-- settlement transaction that moved the credit, so a session's totals are the
+-- books' own numbers rather than a second opinion about them.
+CREATE TABLE IF NOT EXISTS sessions (
+    tenant_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    total_milli_credits INTEGER NOT NULL DEFAULT 0,
+    last_node_id TEXT,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, subject_id, session_id)
+);
 """
 
 #: Indexes are created after `_migrate` has added any column an older database
@@ -714,6 +782,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_identities_role_owner
 CREATE UNIQUE INDEX IF NOT EXISTS ux_identities_auto_tenant
     ON identities(role, tenant_id)
     WHERE tenant_scope = 'auto' AND provider_id IS NULL;
+-- Session reads: an operator's `session-list` narrows by subject, and dispatch
+-- reads the session a request belongs to on every offer it makes.
+CREATE INDEX IF NOT EXISTS idx_sessions_subject ON sessions(subject_id);
+CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);
+-- The dispatch queue is this index: waiting requests are read oldest-first on
+-- every tick, and the queue's depth is counted at every admission gate.
+CREATE INDEX IF NOT EXISTS idx_requests_status_created ON requests(status, created_at);
 """
 
 #: Columns added after the first release, each as ``table -> (column, DDL)``.
@@ -738,6 +813,25 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "requests": (
         ("api_key_id", "TEXT"),
         ("api_key_charge_milli_credits", "INTEGER"),
+        # The agent session a request belongs to. NULL for every request a
+        # center written before sessions holds, and for one whose caller named
+        # none: a request with no session is simply not aggregated, which is
+        # what keeps a session's totals a statement about the turns that
+        # declared one.
+        ("session_id", "TEXT"),
+    ),
+    # An offer a node refused before executing anything. Set by the reject path
+    # and read by the dispatch budget: an attempt is a slot in that budget
+    # because two upstream calls consume two sets of tokens, and a refusal
+    # consumed none, so counting it would let one busy node spend a request's
+    # whole budget on zero work.
+    "attempts": (
+        ("refused_before_execution", "INTEGER NOT NULL DEFAULT 0"),
+    ),
+    # The wall-clock budget a request on this key gets. NULL means the surface's
+    # own default, so a key minted before this column behaves exactly as it did.
+    "api_keys": (
+        ("deadline_ms", "INTEGER"),
     ),
     # `request_inputs` is absent from this table on purpose: it carried a
     # flattened `prompt` before the request model became a conversation, and
@@ -1549,6 +1643,7 @@ class CenterStore(_Store):
         quota_milli_credits: int,
         created_at: dt.datetime,
         expires_at: dt.datetime | None = None,
+        deadline_ms: int | None = None,
     ) -> ApiKeyRecord:
         """Register an API key by the digest of its plaintext.
 
@@ -1567,22 +1662,26 @@ class CenterStore(_Store):
                 account, in total.
             created_at: When the key was minted.
             expires_at: Optional expiry; `None` never expires.
+            deadline_ms: The wall-clock budget a request on this key is given, or
+                `None` for the surface's own default.
 
         Returns:
             The stored key.
 
         Raises:
-            ValueError: If the quota is negative.
+            ValueError: If the quota is negative, or the deadline is not positive.
         """
         if quota_milli_credits < 0:
             raise ValueError("quota_milli_credits must be >= 0")
+        if deadline_ms is not None and deadline_ms < 1:
+            raise ValueError(f"deadline_ms must be >= 1 or None, got {deadline_ms}")
         conn = self._connection()
         with self._immediate(conn):
             conn.execute(
                 "INSERT OR IGNORE INTO api_keys (key_id, key_hash, name, subject_id,"
                 " tenant_id, quota_milli_credits, used_milli_credits, status,"
-                " created_at, expires_at, revoked_at, last_used_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, NULL, NULL)",
+                " created_at, expires_at, revoked_at, last_used_at, deadline_ms)"
+                " VALUES (?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, NULL, NULL, ?)",
                 (
                     key_id,
                     canonical_digest(key),
@@ -1592,6 +1691,7 @@ class CenterStore(_Store):
                     quota_milli_credits,
                     _to_text(created_at),
                     None if expires_at is None else _to_text(expires_at),
+                    deadline_ms,
                 ),
             )
             row = conn.execute(
@@ -1715,6 +1815,121 @@ class CenterStore(_Store):
                 (key_id, request_id),
             )
 
+    # -- sessions -----------------------------------------------------------
+
+    def touch_session(
+        self,
+        *,
+        tenant_id: str,
+        subject_id: str,
+        session_id: str,
+        at: dt.datetime,
+    ) -> SessionRecord:
+        """Count one admitted request against its session aggregate.
+
+        Called by the admission that created the request and by nothing else, so
+        `request_count` counts admissions rather than turns that happened to
+        settle: a request that failed, was cancelled or expired still belongs to
+        the run that made it. An idempotent replay is not counted, because the
+        admission that replays creates no request.
+
+        The token and credit totals are deliberately *not* touched here. They are
+        written by the settlement transaction, which is the only place that knows
+        what a turn cost, and counting them at admission would report money the
+        books have not moved.
+
+        Returns:
+            The aggregate after the count.
+        """
+        conn = self._connection()
+        with self._immediate(conn):
+            conn.execute(
+                "INSERT INTO sessions (tenant_id, subject_id, session_id, request_count,"
+                " total_tokens, total_milli_credits, last_node_id, created_at, last_seen_at)"
+                " VALUES (?, ?, ?, 1, 0, 0, NULL, ?, ?)"
+                " ON CONFLICT(tenant_id, subject_id, session_id) DO UPDATE SET"
+                " request_count = request_count + 1, last_seen_at = excluded.last_seen_at",
+                (tenant_id, subject_id, session_id, _to_text(at), _to_text(at)),
+            )
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE tenant_id = ? AND subject_id = ?"
+                " AND session_id = ?",
+                (tenant_id, subject_id, session_id),
+            ).fetchone()
+        return _session_from_row(row)
+
+    def session(
+        self, tenant_id: str, subject_id: str, session_id: str
+    ) -> SessionRecord | None:
+        """Return one subject's session aggregate, or `None`."""
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE tenant_id = ? AND subject_id = ?"
+            " AND session_id = ?",
+            (tenant_id, subject_id, session_id),
+        ).fetchone()
+        return None if row is None else _session_from_row(row)
+
+    def sessions(
+        self, *, subject_id: str | None = None, session_id: str | None = None
+    ) -> list[SessionRecord]:
+        """Return session aggregates, most recently active first.
+
+        Both filters are optional and independent: an operator listing one
+        subject's runs narrows by subject, and ``admin session-show --session``
+        narrows by the identifier a run printed. Neither filter can widen a read
+        past what the store holds, and an identifier two subjects both chose
+        returns both rows rather than silently picking one — the listing names
+        the subject each row belongs to, so the operator sees that it happened.
+        """
+        conn = self._connection()
+        query = "SELECT * FROM sessions"
+        conditions: list[str] = []
+        arguments: list[Any] = []
+        if subject_id is not None:
+            conditions.append("subject_id = ?")
+            arguments.append(subject_id)
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            arguments.append(session_id)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY last_seen_at DESC, session_id"
+        return [_session_from_row(row) for row in conn.execute(query, arguments).fetchall()]
+
+    def session_preference_for(self, request_id: str) -> str | None:
+        """Return the node this request's session last settled on, or `None`.
+
+        One query rather than two reads, because the answer has to come from the
+        session the *request's own* tenant and subject own: a caller-chosen
+        identifier is not a key into somebody else's aggregate.
+        """
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT s.last_node_id AS last_node_id FROM requests r"
+            " JOIN sessions s ON s.tenant_id = r.tenant_id"
+            " AND s.subject_id = r.subject_id AND s.session_id = r.session_id"
+            " WHERE r.request_id = ?",
+            (request_id,),
+        ).fetchone()
+        return None if row is None else _opt_text(row["last_node_id"])
+
+    def receipts_for_session(self, session_id: str) -> list[ReceiptRecord]:
+        """Return every receipt a session's requests produced, oldest first.
+
+        This is what makes ``admin session-show`` an audit rather than a summary:
+        the totals it prints are the aggregate's, and the receipts it lists are
+        the durable records behind them, each independently verifiable with
+        ``verify receipt``.
+        """
+        conn = self._connection()
+        rows = conn.execute(
+            "SELECT rc.* FROM receipts rc JOIN requests r ON r.request_id = rc.request_id"
+            " WHERE r.session_id = ? ORDER BY rc.log_index",
+            (session_id,),
+        ).fetchall()
+        return [_receipt_from_row(row) for row in rows]
+
     # -- requests -----------------------------------------------------------
 
     def create_request(
@@ -1730,6 +1945,7 @@ class CenterStore(_Store):
         service_unit_id: str,
         deadline_at: dt.datetime | None = None,
         created_at: dt.datetime,
+        session_id: str | None = None,
     ) -> tuple[RequestRecord, bool]:
         """Register a request, deduplicating on ``(tenant_id, idempotency_key)``.
 
@@ -1752,8 +1968,8 @@ class CenterStore(_Store):
                     "INSERT INTO requests (request_id, tenant_id, subject_id,"
                     " idempotency_key, payload_digest, delivery_mode, max_attempts,"
                     " service_unit_id, status, selected_attempt_id, deadline_at,"
-                    " billing_note, created_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'CREATED', NULL, ?, NULL, ?, ?)",
+                    " billing_note, created_at, updated_at, session_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'CREATED', NULL, ?, NULL, ?, ?, ?)",
                     (
                         request_id,
                         tenant_id,
@@ -1766,6 +1982,7 @@ class CenterStore(_Store):
                         None if deadline_at is None else _to_text(deadline_at),
                         _to_text(created_at),
                         _to_text(created_at),
+                        session_id,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -1810,13 +2027,48 @@ class CenterStore(_Store):
         return [_request_from_row(row) for row in rows]
 
     def requests_by_status(self, status: str, *, limit: int = 64) -> list[RequestRecord]:
-        """Return requests in `status`, oldest first, bounded by `limit`."""
+        """Return requests in `status`, oldest first, bounded by `limit`.
+
+        Oldest-first is what makes the dispatch order first-come-first-served:
+        the queue *is* this ordering over the requests waiting to be dispatched,
+        so the order a caller reads here is the order the center offers in.
+        """
         conn = self._connection()
         rows = conn.execute(
             "SELECT * FROM requests WHERE status = ? ORDER BY created_at LIMIT ?",
             (status, max(0, limit)),
         ).fetchall()
         return [_request_from_row(row) for row in rows]
+
+    def count_requests_by_status(self, status: str) -> int:
+        """Return how many requests are in `status`.
+
+        The dispatch queue's depth is this count over `ROUTING`, read at an
+        admission gate so a center with nothing to dispatch with admits no more
+        work than it has agreed to hold.
+        """
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM requests WHERE status = ?", (status,)
+        ).fetchone()
+        return int(row["n"])
+
+    def request_by_idempotency_key(
+        self, tenant_id: str, idempotency_key: str
+    ) -> RequestRecord | None:
+        """Return the request a tenant's idempotency key already names, or `None`.
+
+        An admission gate reads this before it refuses on capacity: a retry of a
+        request the center already admitted must get that request back, not a
+        refusal, or the idempotency key would stop meaning what it says exactly
+        when a caller is retrying under load.
+        """
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT * FROM requests WHERE tenant_id = ? AND idempotency_key = ?",
+            (tenant_id, idempotency_key),
+        ).fetchone()
+        return None if row is None else _request_from_row(row)
 
     def set_request_status(
         self,
@@ -1984,6 +2236,43 @@ class CenterStore(_Store):
             )
             if cur.rowcount == 0:
                 raise StateTransitionError(f"unknown attempt {attempt_id}")
+
+    def mark_attempt_refused(self, attempt_id: str, *, at: dt.datetime) -> None:
+        """Record that a node refused this offer before executing anything.
+
+        The mark is what keeps a refusal out of the request's attempt budget. It
+        is written by the reject path only, and never cleared: an attempt that
+        was refused once was refused, and a later offer is a new attempt row.
+
+        Raises:
+            StateTransitionError: If no such attempt exists.
+        """
+        conn = self._connection()
+        with self._immediate(conn):
+            cur = conn.execute(
+                "UPDATE attempts SET refused_before_execution = 1, updated_at = ?"
+                " WHERE attempt_id = ?",
+                (_to_text(at), attempt_id),
+            )
+            if cur.rowcount == 0:
+                raise StateTransitionError(f"unknown attempt {attempt_id}")
+
+    def count_budget_attempts(self, request_id: str) -> int:
+        """How many of a request's attempts occupy a slot in its attempt budget.
+
+        Every attempt except the ones a node refused before executing. The budget
+        exists because two upstream calls consume two sets of tokens even when
+        only one result is delivered, and a refusal consumed none — so counting
+        refusals would let one busy node spend a request's whole budget on zero
+        work and then have the center report the request as exhausted.
+        """
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM attempts WHERE request_id = ?"
+            " AND refused_before_execution = 0",
+            (request_id,),
+        ).fetchone()
+        return int(row["n"])
 
     def record_usage(self, attempt_id: str, tokens: int, *, at: dt.datetime) -> None:
         """Record a known token total for an attempt.
@@ -2457,6 +2746,7 @@ class CenterStore(_Store):
         attempt_id: str,
         usage_tokens: int,
         at: dt.datetime,
+        settled_tokens: int = 0,
     ) -> int:
         """Record a settled service unit and every fact that backs it, atomically.
 
@@ -2490,6 +2780,10 @@ class CenterStore(_Store):
             attempt_id: The winning attempt whose usage is finalized.
             usage_tokens: Milli-credits to record as the attempt's total usage.
             at: The instant every written row records.
+            settled_tokens: The winning attempt's measured native token total, as
+                the node reported it. Recorded on the session aggregate beside
+                the charge, so a session's totals separate what the upstream
+                consumed from what the consumer was billed for it.
 
         Returns:
             The transparency-log index the receipt occupies.
@@ -2517,7 +2811,7 @@ class CenterStore(_Store):
         with self._immediate(conn):
             index = self._bundle_write_leaf(conn, receipt.receipt_hash, receipt.log_index, at)
             self._bundle_write_receipt(conn, receipt)
-            self._bundle_write_settlement(conn, settlement)
+            settled_now = self._bundle_write_settlement(conn, settlement)
             self._bundle_write_journal(conn, journal_kind, journal_payload, at)
             cur = conn.execute(
                 "UPDATE attempts SET usage_status = 'COMPLETE', usage_tokens = ?, updated_at = ?"
@@ -2536,7 +2830,69 @@ class CenterStore(_Store):
                 (_to_text(at), receipt.request_id),
             )
             self._bundle_charge_api_key(conn, receipt.request_id, usage_tokens)
+            if settled_now:
+                self._bundle_record_session_usage(
+                    conn,
+                    request_id=receipt.request_id,
+                    attempt_id=attempt_id,
+                    tokens=settled_tokens,
+                    milli_credits=usage_tokens,
+                    at=at,
+                )
             return index
+
+    @staticmethod
+    def _bundle_record_session_usage(
+        conn: sqlite3.Connection,
+        *,
+        request_id: str,
+        attempt_id: str,
+        tokens: int,
+        milli_credits: int,
+        at: dt.datetime,
+    ) -> None:
+        """Add one settled turn's tokens, charge and node to its session aggregate.
+
+        Must be called inside the settlement transaction, and only when that
+        transaction is the one that wrote the settlement revision — the revision
+        row is the idempotency marker, so the replay a node sends after a lost
+        acknowledgement adds nothing a second time. Splitting the increment from
+        the settlement would leave a window where the credit had moved and the
+        session's totals had not, and a session total that disagrees with the
+        books is worse than no session total.
+
+        A request that named no session updates nothing, and a session row that
+        has gone missing is not invented here: the admission that counted the
+        turn created it, so finding none would mean the store lost a row, which
+        is a discrepancy for `reconcile` to report rather than for a settlement
+        to paper over.
+        """
+        row = conn.execute(
+            "SELECT s.tenant_id AS tenant_id, s.subject_id AS subject_id,"
+            " s.session_id AS session_id, a.node_id AS node_id FROM requests r"
+            " JOIN sessions s ON s.tenant_id = r.tenant_id"
+            " AND s.subject_id = r.subject_id AND s.session_id = r.session_id"
+            " LEFT JOIN attempts a ON a.attempt_id = ?"
+            " WHERE r.request_id = ?",
+            (attempt_id, request_id),
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute(
+            "UPDATE sessions SET total_tokens = total_tokens + ?,"
+            " total_milli_credits = total_milli_credits + ?,"
+            " last_node_id = COALESCE(?, last_node_id), last_seen_at = ?"
+            " WHERE tenant_id = ? AND subject_id = ? AND session_id = ?",
+            (
+                tokens,
+                milli_credits,
+                _opt_text(row["node_id"]),
+                _to_text(at),
+                str(row["tenant_id"]),
+                str(row["subject_id"]),
+                str(row["session_id"]),
+            ),
+        )
 
     @staticmethod
     def _bundle_charge_api_key(
@@ -2655,10 +3011,16 @@ class CenterStore(_Store):
     @staticmethod
     def _bundle_write_settlement(
         conn: sqlite3.Connection, record: SettlementRecord
-    ) -> None:
+    ) -> bool:
         """Store one settlement revision, refusing to overwrite a different one.
 
         Must be called inside a write transaction.
+
+        Returns:
+            True when this call inserted the revision, False when an identical
+            one was already stored. The distinction is what makes the increments
+            that hang off a settlement — a key's quota, a session's totals —
+            run exactly once however often a node replays its report.
 
         Raises:
             ConflictError: If the revision exists with a different fingerprint.
@@ -2675,7 +3037,7 @@ class CenterStore(_Store):
                     f"recorded with fingerprint {stored.fingerprint}, cannot overwrite with "
                     f"{record.fingerprint}"
                 )
-            return
+            return False
         conn.execute(
             "INSERT INTO settlements (service_unit_id, revision, fingerprint, receipt_id,"
             " receipt_hash, log_index, receipt_json, created_at)"
@@ -2691,6 +3053,7 @@ class CenterStore(_Store):
                 _to_text(record.created_at),
             ),
         )
+        return True
 
     @staticmethod
     def _bundle_write_journal(
@@ -2781,6 +3144,26 @@ class CenterStore(_Store):
                 "SELECT * FROM nodes WHERE connected = 1 AND model = ? ORDER BY node_id", (model,)
             ).fetchall()
         return [_node_from_row(row) for row in rows]
+
+    def catalogued_models(self) -> frozenset[str]:
+        """Return every model a willing node of this center advertises.
+
+        Connected or not, and that is the point. The catalogue is a fact about the
+        nodes this center knows, while `connected_nodes` is a fact about which of
+        them hold a socket open this instant — and a pool whose nodes are all
+        restarting still serves the models they advertise. Telling a caller
+        ``model_not_found`` in that moment would be a false statement about the
+        center, and is exactly the moment a dispatch queue exists for.
+
+        A node that turned sharing off has withdrawn its model, so it is no longer
+        part of the catalogue; a node that merely lost its link has not withdrawn
+        anything.
+        """
+        conn = self._connection()
+        rows = conn.execute(
+            "SELECT DISTINCT model FROM nodes WHERE share_enabled = 1"
+        ).fetchall()
+        return frozenset(str(row["model"]) for row in rows)
 
     # -- outbox -------------------------------------------------------------
 
@@ -2980,6 +3363,7 @@ def _request_from_row(row: Any) -> RequestRecord:
         created_at=_from_text(str(row["created_at"])),
         updated_at=_from_text(str(row["updated_at"])),
         api_key_id=_opt_text(row["api_key_id"]),
+        session_id=_opt_text(row["session_id"]),
     )
 
 
@@ -2998,6 +3382,7 @@ def _attempt_from_row(row: Any) -> AttemptRecord:
         settlement_status=str(row["settlement_status"]),
         execution_state=_opt_text(row["execution_state"]),
         updated_at=_from_text(str(row["updated_at"])),
+        refused_before_execution=bool(int(row["refused_before_execution"])),
     )
 
 
@@ -3100,6 +3485,21 @@ def _api_key_from_row(row: Any) -> ApiKeyRecord:
         expires_at=_opt_instant(row["expires_at"]),
         revoked_at=_opt_instant(row["revoked_at"]),
         last_used_at=_opt_instant(row["last_used_at"]),
+        deadline_ms=_opt_int(row["deadline_ms"]),
+    )
+
+
+def _session_from_row(row: Any) -> SessionRecord:
+    return SessionRecord(
+        tenant_id=str(row["tenant_id"]),
+        subject_id=str(row["subject_id"]),
+        session_id=str(row["session_id"]),
+        request_count=int(row["request_count"]),
+        total_tokens=int(row["total_tokens"]),
+        total_milli_credits=int(row["total_milli_credits"]),
+        last_node_id=_opt_text(row["last_node_id"]),
+        created_at=_from_text(str(row["created_at"])),
+        last_seen_at=_from_text(str(row["last_seen_at"])),
     )
 
 

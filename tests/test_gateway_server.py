@@ -181,6 +181,7 @@ class _StubService:
         delivery_mode: str,
         max_attempts: int,
         deadline_ms: int,
+        session_id: str | None = None,
         now: dt.datetime | None = None,
     ) -> _StubAdmitResult:
         """Record the call and hand back a deterministic request id."""
@@ -197,6 +198,7 @@ class _StubService:
                 "delivery_mode": delivery_mode,
                 "max_attempts": max_attempts,
                 "deadline_ms": deadline_ms,
+                "session_id": session_id,
             }
         )
         return _StubAdmitResult(request_id=f"req-{len(self.admissions)}")
@@ -210,6 +212,7 @@ class _StubService:
         parameters: Any = None,
         delivery_mode: str,
         deadline_ms: int,
+        session_id: str | None = None,
         now: dt.datetime | None = None,
     ) -> _StubAdmitResult:
         """Record an API-key admission the way the signed one is recorded."""
@@ -222,6 +225,7 @@ class _StubService:
                 "parameters": parameters,
                 "delivery_mode": delivery_mode,
                 "deadline_ms": deadline_ms,
+                "session_id": session_id,
             }
         )
         return _StubAdmitResult(request_id=f"req-{len(self.api_key_admissions)}")
