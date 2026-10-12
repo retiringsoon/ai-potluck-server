@@ -33,10 +33,14 @@ from aipotluck_server.persistence import (
     RequestRecord,
     SettlementRecord,
 )
+from aipotluck_server.reconcile import reconcile_center
 
 T0 = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
 T1 = T0 + dt.timedelta(seconds=1)
 T2 = T0 + dt.timedelta(seconds=2)
+
+#: The model a stored dispatch input names; the store keeps it as given.
+MODEL = "coding-pool"
 
 
 @pytest.fixture
@@ -781,6 +785,183 @@ def test_a_database_from_before_the_device_binding_gains_the_column(
         assert fresh is not None and fresh.device_id == "dev-9"
     finally:
         store.close()
+
+
+def _legacy_request_inputs(path: Path, rows: tuple[tuple[str, str], ...]) -> None:
+    """Write the `request_inputs` table a center from before the conversation model holds.
+
+    Only that table: opening the store creates everything else, exactly as it did
+    for the centers that upgraded in place.
+    """
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE request_inputs (request_id TEXT PRIMARY KEY,"
+            " prompt TEXT NOT NULL, model TEXT NOT NULL,"
+            " authorization_json TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        for request_id, prompt in rows:
+            connection.execute(
+                "INSERT INTO request_inputs (request_id, prompt, model,"
+                " authorization_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (request_id, prompt, MODEL, "{}", T0.strftime("%Y-%m-%dT%H:%M:%S.%f%z")),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _request_input_columns(path: Path) -> list[tuple[Any, ...]]:
+    """Return `request_inputs`' columns as SQLite describes them, in order."""
+    connection = sqlite3.connect(path)
+    try:
+        return [tuple(row) for row in connection.execute("PRAGMA table_info(request_inputs)")]
+    finally:
+        connection.close()
+
+
+def test_a_database_from_before_the_conversation_model_is_rebuilt_to_the_current_shape(
+    tmp_path: Path,
+) -> None:
+    """An upgraded center ends up with the one shape a new center is created with.
+
+    The table an earlier release created carries ``prompt TEXT NOT NULL``, and no
+    conversation write can satisfy that constraint. SQLite cannot drop a column
+    constraint, so the table is rebuilt; without the rebuild every
+    `set_request_input` on an upgraded center failed, and because the failure was
+    reported as a duplicate and suppressed, the center admitted requests it could
+    never dispatch and left each one in ROUTING with nothing behind it.
+    """
+    fresh = tmp_path / "fresh.db"
+    CenterStore.open(fresh).close()
+
+    upgraded = tmp_path / "upgraded.db"
+    _legacy_request_inputs(upgraded, (("R-1", "write a haiku about ledgers"),))
+    store = CenterStore.open(upgraded)
+    try:
+        assert _request_input_columns(upgraded) == _request_input_columns(fresh)
+        assert "prompt" not in {str(column[1]) for column in _request_input_columns(upgraded)}
+        # The failure the rebuild exists to end: a conversation can be stored.
+        store.set_request_input(
+            "R-2",
+            messages=[{"role": "user", "content": "write a haiku about sockets"}],
+            model=MODEL,
+            parameters={"temperature": "0.7"},
+            authorization={"schema": "auth"},
+            at=T1,
+        )
+        stored = store.get_request_input("R-2")
+        assert stored is not None
+        assert stored["messages"] == [{"role": "user", "content": "write a haiku about sockets"}]
+        assert stored["parameters"] == {"temperature": "0.7"}
+    finally:
+        store.close()
+
+    # The rebuild is idempotent, and a second open changes nothing about the shape.
+    reopened = CenterStore.open(upgraded)
+    try:
+        assert _request_input_columns(upgraded) == _request_input_columns(fresh)
+        assert reopened.get_request_input("R-2") is not None
+    finally:
+        reopened.close()
+
+
+def test_a_row_an_earlier_center_stored_as_a_prompt_is_kept_and_reported(
+    tmp_path: Path,
+) -> None:
+    """A legacy row survives the rebuild and is still reported, never re-read.
+
+    The rebuild carries every row over rather than deleting it, so the answer an
+    operator gets for a request an earlier center admitted is the same after the
+    upgrade as before it: this build cannot offer or settle it, and it says so
+    instead of inventing a one-message conversation nobody signed for.
+    """
+    path = tmp_path / "center.db"
+    _legacy_request_inputs(path, (("R-1", "write a haiku about ledgers"),))
+    store = CenterStore.open(path)
+    try:
+        with pytest.raises(PotluckError, match="earlier center version"):
+            store.get_request_input("R-1")
+        # Reported, not mistaken for a row that was never written.
+        assert store.get_request_input("R-never") is None
+    finally:
+        store.close()
+
+
+def test_a_terminal_legacy_request_keeps_an_upgraded_center_reconcilable(
+    tmp_path: Path,
+) -> None:
+    """The migration touches one table, and the books still agree afterwards.
+
+    A center that ran the earlier build holds terminal requests whose inputs it
+    stored as a flattened prompt. Reconcile, and every receipt path it audits,
+    reads those requests the same way after the rebuild as before it: dropping the
+    retired prompt text changes no billing truth, because what a request cost
+    lives in the receipts, the ledger and the transparency log.
+    """
+    path = tmp_path / "center.db"
+    _legacy_request_inputs(path, (("R-legacy", "write a haiku about ledgers"),))
+    store = CenterStore.open(path)
+    try:
+        _create_request(store, request_id="R-legacy", idempotency_key="K-legacy")
+        store.set_request_status("R-legacy", "FAILED", billing_note="upstream failed", at=T1)
+
+        assert reconcile_center(store=store) == []
+
+        # And a request admitted after the upgrade reconciles beside it.
+        _create_request(store, request_id="R-new", idempotency_key="K-new")
+        store.set_request_input(
+            "R-new",
+            messages=[{"role": "user", "content": "write a haiku about sockets"}],
+            model=MODEL,
+            parameters={},
+            authorization={"schema": "auth"},
+            at=T1,
+        )
+        assert reconcile_center(store=store) == []
+    finally:
+        store.close()
+
+
+def test_a_write_the_table_cannot_hold_is_reported_as_itself_not_as_a_duplicate(
+    center: CenterStore, tmp_path: Path
+) -> None:
+    """A genuine duplicate conflicts; anything else is named as what it is.
+
+    Both arrive as the same `sqlite3.IntegrityError`, and reporting both as a
+    duplicate is what let a store that could not hold a request's inputs look
+    like a request that already had them — which the caller then suppressed.
+    """
+    messages = [{"role": "user", "content": "hi"}]
+    center.set_request_input(
+        "R-dup", messages=messages, model=MODEL, parameters={}, authorization={}, at=T0
+    )
+    with pytest.raises(ConflictError, match="already has stored dispatch inputs"):
+        center.set_request_input(
+            "R-dup", messages=messages, model=MODEL, parameters={}, authorization={}, at=T0
+        )
+
+    # Put the table back into the shape that broke in production — a legacy
+    # `prompt TEXT NOT NULL` beside the conversation columns, which no INSERT this
+    # build writes can satisfy — and the failure must be named as itself.
+    connection = sqlite3.connect(tmp_path / "center.db")
+    try:
+        connection.execute("DROP TABLE request_inputs")
+        connection.execute(
+            "CREATE TABLE request_inputs (request_id TEXT PRIMARY KEY,"
+            " prompt TEXT NOT NULL, model TEXT NOT NULL, messages_json TEXT,"
+            " parameters_json TEXT NOT NULL DEFAULT '{}',"
+            " authorization_json TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(PotluckError, match="could not be stored") as failure:
+        center.set_request_input(
+            "R-broken", messages=messages, model=MODEL, parameters={}, authorization={}, at=T0
+        )
+    assert not isinstance(failure.value, ConflictError)
+    assert center.get_request_input("R-broken") is None
 
 
 # -- settlement, receipts, log ----------------------------------------------

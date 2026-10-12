@@ -30,6 +30,7 @@ import datetime as dt
 import http.client
 import json
 import logging
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -1490,3 +1491,193 @@ def test_the_openai_python_client_reads_refusals_as_its_own_errors(
         assert exhausted.value.body["type"] == "insufficient_quota"
     finally:
         node.stop()
+
+
+# --------------------------------------------------------------------------- #
+# A center upgraded in place from the flattened-prompt model
+# --------------------------------------------------------------------------- #
+
+
+def _precreate_prompt_era_request_inputs(path: Path) -> None:
+    """Create the `request_inputs` table a center from before the conversation model holds.
+
+    Only that table. `Center` then opens the store, which creates everything else
+    and runs the migration — the exact sequence an in-place upgrade performs on a
+    database the earlier build made.
+    """
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE request_inputs (request_id TEXT PRIMARY KEY,"
+            " prompt TEXT NOT NULL, model TEXT NOT NULL,"
+            " authorization_json TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO request_inputs (request_id, prompt, model, authorization_json,"
+            " created_at) VALUES (?, ?, ?, '{}', ?)",
+            (
+                "req-legacy-1",
+                "write a haiku about ledgers",
+                MODEL,
+                BASE.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _operator_config(center: Center) -> Path:
+    """Write the ``center.json`` the operator audit commands open.
+
+    The audit commands load a full configuration rather than the one field the
+    minting commands need, so this names the running center's own settings — the
+    same settlement key, the same database — and nothing else.
+    """
+    path = center.tmp_path / "operator-center.json"
+    document = {
+        "host": center.config.host,
+        "port": center.config.port,
+        "database_path": center.config.database_path,
+        "platform_id": center.config.platform_id,
+        "settlement_key_id": center.config.settlement_key_id,
+        "settlement_private_key_b64": center.config.settlement_private_key_b64,
+        "certfile": None,
+        "keyfile": None,
+        "credentials": [],
+        # The audit builds its own trusted registry from this file, and a
+        # self-declared public key is never accepted: the device key that signed
+        # the usage report has to be named here for `signature_valid` to mean
+        # anything.
+        "providers": [
+            {
+                "device_id": "device-A",
+                "device_key_id": "device-key-A",
+                "provider_id": "provider-A",
+                "public_key_b64": center.keyring.public["device-key-A"],
+                "demo_float_milli_credits": 0,
+            }
+        ],
+        "consumer_floats": [],
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    # The document carries the settlement private key, so it gets the mode a file
+    # holding key material gets.
+    path.chmod(0o600)
+    return path
+
+
+def test_an_upgraded_center_admits_an_api_key_request_to_a_verified_receipt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The production failure, end to end: an upgraded center, a real node, a real key.
+
+    This is the hole the two-package gate had. The signed path was covered end to
+    end and the API-key face was covered by an in-process fake, so nothing drove
+    ``admit_api_key_request`` through a real store, a real connector and a real
+    HTTP caller at once — and a center whose database could not hold a
+    conversation answered every ``POST /openai/v1/chat/completions`` with a 502
+    ``upstream_failed`` naming a request that "has no stored dispatch inputs",
+    while leaving that request in ROUTING to hold its key's concurrency slot for
+    good. Both delivery modes run to a receipt here, because a center that can
+    admit one and not the other would still answer a caller.
+
+    The terminal request the earlier build left behind is asserted on too: the
+    migration carries such a row instead of losing it, and the books around it
+    still reconcile and still verify.
+    """
+    openai = pytest.importorskip("openai")
+    _precreate_prompt_era_request_inputs(tmp_path / "center.db")
+    center = Center(tmp_path, Keyring())
+    node = Node(center)
+    try:
+        _wait_until(
+            lambda: bool(center.store.connected_nodes()), what="the node to register"
+        )
+        # The request row the legacy inputs row belongs to, terminal as production
+        # held it: a failed request from before the upgrade.
+        center.store.create_request(
+            request_id="req-legacy-1",
+            tenant_id=TENANT,
+            subject_id=SUBJECT,
+            idempotency_key="K-1",
+            payload_digest="sha256:legacy",
+            delivery_mode="buffered_complete",
+            max_attempts=1,
+            service_unit_id="req-legacy-1",
+            created_at=BASE,
+        )
+        center.store.set_request_status(
+            "req-legacy-1", "FAILED", billing_note="upstream failed", at=BASE
+        )
+
+        for _ in range(2):
+            node.upstream.queue(_scripted_response())
+        key = _mint_key(center, capsys)
+        client = openai.OpenAI(
+            base_url=f"http://127.0.0.1:{center.port}/openai/v1",
+            api_key=key,
+            max_retries=0,
+            timeout=120.0,
+        )
+
+        buffered = client.chat.completions.create(
+            model=MODEL, messages=[{"role": "user", "content": "hi"}]
+        )
+        assert buffered.choices[0].message.content == ANSWER
+        assert buffered.usage is not None and buffered.usage.total_tokens == BILLED_TOKENS
+
+        stream = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        parts: list[str] = []
+        streamed_usage: Any = None
+        for chunk in stream:
+            if chunk.usage is not None:
+                streamed_usage = chunk.usage
+            for choice in chunk.choices:
+                if choice.delta.content:
+                    parts.append(choice.delta.content)
+        assert "".join(parts) == ANSWER
+        assert streamed_usage is not None and streamed_usage.total_tokens == BILLED_TOKENS
+
+        # Both requests reached a terminal state, and neither holds a slot: the
+        # concurrency budget the stuck rows used to eat is whole again.
+        key_id = center.store.list_api_keys()[0].key_id
+        assert center.store.count_in_flight_api_key_requests(key_id) == 0
+        statuses = {
+            record.request_id: record.status for record in center.store.requests()
+        }
+        assert statuses["req-legacy-1"] == "FAILED"
+        admitted = [status for name, status in statuses.items() if name != "req-legacy-1"]
+        assert admitted == ["SUCCEEDED", "SUCCEEDED"], statuses
+
+        # Each settled request left a receipt an operator can verify.
+        config_path = _operator_config(center)
+        receipts = center.store.receipts()
+        assert len(receipts) == 2
+        for receipt in receipts:
+            exit_code = server_main(
+                [
+                    "verify",
+                    "receipt",
+                    "--config",
+                    str(config_path),
+                    "--receipt-id",
+                    receipt.receipt_id,
+                ]
+            )
+            captured = capsys.readouterr()
+            assert exit_code == 0, captured.out + captured.err
+        # And the migrated legacy row breaks no invariant the audit checks.
+        reconcile_exit = server_main(
+            ["admin", "reconcile", "--config", str(config_path)]
+        )
+        reconciled = capsys.readouterr()
+        assert reconcile_exit == 0, reconciled.out + reconciled.err
+    finally:
+        node.stop()
+        center.stop()
