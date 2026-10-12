@@ -1,5 +1,8 @@
 # ai-potluck-server
 
+[![ci](https://github.com/retiringsoon/ai-potluck-server/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck-server/actions/workflows/ci.yml)
+
+
 The center of an AI potluck network: one process over one embedded SQLite
 database. It runs the HTTP/WebSocket/SSE gateway, keeps the settlement books
 (ledger, transparency log, receipts), and ships the operator CLI
