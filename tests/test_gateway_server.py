@@ -129,6 +129,7 @@ class _StubService:
         self.events: dict[str, list[StoredEvent]] = {}
         self.statuses: dict[str, str] = {}
         self.admissions: list[dict[str, Any]] = []
+        self.api_key_admissions: list[dict[str, Any]] = []
         self.cancel_origins: list[str] = []
         self.receipts: dict[str, dict[str, Any]] = {}
         #: What `node_attempts` answers with, so a test can stage the center's
@@ -169,10 +170,11 @@ class _StubService:
         *,
         credential: Credential,
         idempotency_key: str,
-        prompt: str,
+        messages: Any,
         authorization: SignedRecord,
         model: str,
         max_charge_milli_credits: int,
+        parameters: Any = None,
         delivery_mode: str,
         max_attempts: int,
         deadline_ms: int,
@@ -184,7 +186,8 @@ class _StubService:
             {
                 "credential": credential,
                 "idempotency_key": idempotency_key,
-                "prompt": prompt,
+                "messages": messages,
+                "parameters": parameters,
                 "authorization": authorization,
                 "model": model,
                 "max_charge_milli_credits": max_charge_milli_credits,
@@ -194,6 +197,31 @@ class _StubService:
             }
         )
         return _StubAdmitResult(request_id=f"req-{len(self.admissions)}")
+
+    def admit_api_key_request(
+        self,
+        *,
+        api_key: Any,
+        messages: Any,
+        model: str,
+        parameters: Any = None,
+        delivery_mode: str,
+        deadline_ms: int,
+        now: dt.datetime | None = None,
+    ) -> _StubAdmitResult:
+        """Record an API-key admission the way the signed one is recorded."""
+        del now
+        self.api_key_admissions.append(
+            {
+                "api_key": api_key,
+                "messages": messages,
+                "model": model,
+                "parameters": parameters,
+                "delivery_mode": delivery_mode,
+                "deadline_ms": deadline_ms,
+            }
+        )
+        return _StubAdmitResult(request_id=f"req-{len(self.api_key_admissions)}")
 
     def request_status(self, *, credential: Credential, request_id: str) -> dict[str, Any]:
         """Return a status document, or raise for an unknown request."""
@@ -398,7 +426,7 @@ def _admission_body() -> dict[str, Any]:
     """A complete ``POST /v1/requests`` body."""
     return {
         "idempotency_key": "idem-1",
-        "prompt": "hello",
+        "messages": [{"role": "user", "content": "hello"}],
         "model": "model-a",
         "max_charge_milli_credits": 100,
         "delivery_mode": "buffered_complete",
@@ -1122,7 +1150,7 @@ def test_a_signature_is_bound_to_the_body_it_signed(
     )
 
     changed = _admission_body()
-    changed["prompt"] = "a prompt nobody signed for"
+    changed["messages"] = [{"role": "user", "content": "a turn nobody signed for"}]
     swapped = _http(
         server, "POST", "/v1/requests", token=None, body=changed,
         headers={"Authorization": f"AIPotluck-Sig {header}"},
@@ -1221,7 +1249,8 @@ def test_a_float_in_the_body_is_400(gateway: Callable[..., GatewayServer]) -> No
 def test_a_duplicate_key_in_the_body_is_400(gateway: Callable[..., GatewayServer]) -> None:
     server = gateway(_StubService())
     raw = (
-        '{"idempotency_key": "a", "idempotency_key": "b", "prompt": "p", "model": "m",'
+        '{"idempotency_key": "a", "idempotency_key": "b", "model": "m",'
+        ' "messages": [{"role": "user", "content": "p"}],'
         ' "max_charge_milli_credits": 1, "delivery_mode": "buffered_complete",'
         ' "max_attempts": 1, "deadline_ms": 1, "authorization": {}}'
     )
@@ -1238,7 +1267,7 @@ def test_an_oversized_declared_body_is_refused_before_it_is_read(
         f"POST /v1/requests HTTP/1.1\r\nHost: 127.0.0.1\r\n"
         f"Authorization: Bearer {CONSUMER_TOKEN}\r\n"
         f"Content-Length: {OVERSIZE_BYTES + 1}\r\n\r\n"
-        '{"prompt": "small"}'
+        '{"messages": []}'
     )
     status, body = _raw_exchange(_port(server), request.encode("ascii"))
     assert status == 400
@@ -1263,6 +1292,71 @@ def test_a_body_that_is_not_an_object_is_400(gateway: Callable[..., GatewayServe
     refused = _http(server, "POST", "/v1/requests", body="[1, 2, 3]")
     assert refused.status == 400
     assert refused.json()["detail"] == "the body must be a JSON object"
+
+
+def test_a_kept_alive_connection_survives_a_refusal_it_did_not_read(
+    gateway: Callable[..., GatewayServer],
+) -> None:
+    """One connection, several requests, and a refusal in the middle of them.
+
+    Two ways a gateway can break HTTP/1.1 keep-alive, both invisible to a test
+    that opens a connection per request — which is what every client library
+    does *not* do:
+
+    * a refusal that happens before anything read the body leaves those bytes in
+      the socket, and the next request line parses as the tail of a body;
+    * per-request state on a per-connection handler — "this request has been
+      answered" above all — silences the answer the *next* request is owed.
+
+    Either one turns a `401` the center meant into a transport failure the caller
+    sees, so the fourth request here is the assertion: it is answered, on the
+    same socket, after a refusal that read nothing.
+    """
+    service = _StubService()
+    server = gateway(service)
+    connection = http.client.HTTPConnection("127.0.0.1", _port(server), timeout=10)
+    try:
+        connection.request(
+            "GET", "/v1/nodes", headers={"Authorization": f"Bearer {CONSUMER_TOKEN}"}
+        )
+        first = connection.getresponse()
+        first.read()
+        assert first.status == 200
+
+        body = json.dumps(_admission_body()).encode("utf-8")
+        connection.request(
+            "POST",
+            "/v1/requests",
+            body=body,
+            headers={
+                "Authorization": f"Bearer {CONSUMER_TOKEN}",
+                "Content-Type": "application/json",
+            },
+        )
+        second = connection.getresponse()
+        second.read()
+        assert second.status == 200
+
+        # Refused at the header check, with a body nobody read.
+        connection.request(
+            "POST",
+            "/v1/requests",
+            body=body,
+            headers={
+                "Authorization": "Bearer not-a-token-anyone-issued",
+                "Content-Type": "application/json",
+            },
+        )
+        third = connection.getresponse()
+        assert third.status == 401, third.read()
+        assert json.loads(third.read())["error"] == "unauthorized"
+
+        connection.request("GET", "/healthz")
+        fourth = connection.getresponse()
+        assert fourth.status == 200, fourth.read()
+        assert json.loads(fourth.read()) == {"status": "ok"}
+    finally:
+        connection.close()
 
 
 def test_a_bad_cursor_is_400(gateway: Callable[..., GatewayServer]) -> None:

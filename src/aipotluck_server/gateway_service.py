@@ -43,8 +43,9 @@ import contextlib
 import datetime as dt
 import secrets
 import threading
-from collections import OrderedDict
-from collections.abc import Callable
+import time
+from collections import OrderedDict, deque
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -60,6 +61,7 @@ from aipotluck.errors import (
     ConflictError,
     GatewayError,
     IdentityBindingError,
+    InsufficientFundsError,
     KeyRevokedError,
     PotluckError,
     ProtocolError,
@@ -71,7 +73,11 @@ from aipotluck.ledger import Journal, Ledger, Posting
 from aipotluck.records import (
     DOMAIN_REQUEST_AUTH,
     SCHEMA_AUTHORIZATION,
+    BillingBasis,
     SignedRecord,
+    SpendAuthorization,
+    VerificationPolicy,
+    new_nonce,
     signed_record_from_dict,
     verify_chain,
 )
@@ -84,6 +90,7 @@ from aipotluck.wire import (
     AttemptOffer,
     AttemptRef,
     AttemptState,
+    ChatMessage,
     DeliveryMode,
     Envelope,
     EventAck,
@@ -92,9 +99,13 @@ from aipotluck.wire import (
     NodeHello,
     ResumeDirective,
     compute_permit_hash,
+    compute_request_digest,
+    parse_chat_messages,
 )
 
+from .errors import ApiKeyRateLimited, ApiKeyUnavailable, ModelUnavailable
 from .persistence import (
+    ApiKeyRecord,
     AttemptRecord,
     CenterStore,
     Credential,
@@ -143,6 +154,46 @@ _PURPOSE_BY_ROLE: dict[str, str] = {
 #: prints, so an invited node's credential is no weaker than a hand-provisioned
 #: one. Only its digest is ever stored.
 NODE_TOKEN_BYTES = 24
+
+#: The prefix of a plaintext API key, so a key is recognizable in a config file,
+#: a client's environment, and a log line somebody is grepping for a leaked
+#: secret. 43 characters of url-safe base64 follow it: 32 bytes of entropy,
+#: which is what ``secrets.token_urlsafe(32)`` renders.
+API_KEY_PREFIX = "ak-"
+
+#: Entropy, in bytes, of an operator-issued API key. Only its digest is stored.
+API_KEY_BYTES = 32
+
+#: How many non-terminal requests one API key may have in flight. A ceiling
+#: rather than a policy knob: the endpoint is shared by every key the center has
+#: issued, so one key must not be able to occupy the center's whole dispatch.
+API_KEY_MAX_IN_FLIGHT = 4
+
+#: How many requests one API key may admit per `API_KEY_RATE_WINDOW_S`.
+API_KEY_RATE_LIMIT = 60
+
+#: The length of the rate-limit window, in seconds.
+API_KEY_RATE_WINDOW_S = 60.0
+
+#: The charge ceiling one API-key request exposes by default, in milli-credits.
+#: The same default ceiling a joining consumer's own client signs for, and the
+#: per-request cap is always the smaller of this and the key's remaining quota.
+API_KEY_DEFAULT_MAX_CHARGE_MILLI_CREDITS = 20_000
+
+#: How much longer a center-signed authorization stays valid than the request's
+#: own deadline. Settlement happens after the answer does, and an authorization
+#: that expired in between would leave a node's tokens spent and unbillable.
+AUTHORIZATION_SETTLEMENT_GRACE = dt.timedelta(minutes=10)
+
+#: The pricing terms a center-signed authorization carries. These are the
+#: platform's published defaults — the same rate card, billing basis and
+#: evidence floor a consumer's own client signs — and a request admitted on an
+#: API key cannot ask for weaker ones, because there is no consumer signature to
+#: agree to them.
+PRICING_VERSION = "flat-v1"
+BILLING_BASIS: BillingBasis = "reported_native_usage"
+MINIMUM_EVIDENCE_LEVEL: VerificationPolicy = "node_reported"
+TRUST_POOL = "trusted-beta"
 
 
 def _aware(moment: dt.datetime) -> dt.datetime:
@@ -349,6 +400,14 @@ class GatewayService:
         #: enough to have fallen outside that window.
         self._nonces: dict[str, OrderedDict[str, None]] = {}
         self._nonce_lock = threading.Lock()
+        #: key_id -> the monotonic instants of the requests that key admitted
+        #: inside the rate window. Bounded by the window itself: an entry older
+        #: than `API_KEY_RATE_WINDOW_S` is dropped before the count is read, so a
+        #: key that stops calling costs nothing and a key that floods cannot grow
+        #: this map past its own limit. Deliberately in-memory — a rate limit is a
+        #: decision about the load arriving now, not a fact about the books.
+        self._api_key_windows: dict[str, deque[float]] = {}
+        self._api_key_rate_lock = threading.Lock()
         self._log = self._rebuild_log()
         self._ledger = ledger if ledger is not None else self._rebuild_ledger()
         self._settlement_key = load_private_key(config.settlement_private_key_b64)
@@ -929,10 +988,11 @@ class GatewayService:
         *,
         credential: Credential,
         idempotency_key: str,
-        prompt: str,
+        messages: Sequence[ChatMessage],
         authorization: SignedRecord | dict[str, Any],
         model: str,
         max_charge_milli_credits: int,
+        parameters: Mapping[str, Any] | None = None,
         delivery_mode: str = "buffered_complete",
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         deadline_ms: int = DEFAULT_DEADLINE_MS,
@@ -943,12 +1003,15 @@ class GatewayService:
         Args:
             credential: The authenticated consumer.
             idempotency_key: Client key, scoped to the tenant.
-            prompt: The request text.
+            messages: The conversation to run, forwarded to the upstream as it
+                stands; nothing here flattens it into one prompt.
             authorization: The consumer's signed pre-authorization, either as a
                 record or as the serialized form a client sent.
             model: The model being requested.
             max_charge_milli_credits: The ceiling this admission exposes; it may
                 not exceed the cap the consumer signed.
+            parameters: The forwarded request parameters, in the canonical-safe
+                encoding `wire.encode_chat_parameters` produces.
             delivery_mode: `buffered_complete` or `stream_strict`.
             max_attempts: Hard attempt cap.
             deadline_ms: Wall-clock budget from admission.
@@ -960,11 +1023,12 @@ class GatewayService:
         Raises:
             IdentityBindingError: If the authorization names a consumer the
                 credential does not authenticate, or the payer is not covered.
-            ProtocolError: If the submitted ``prompt``/``model``/``delivery_mode``
-                do not reproduce the authorization's ``request_digest``, if
-                `max_attempts` or `max_charge_milli_credits` exceeds the signed
-                cap, if `model` is outside the signed allowlist, or if the
-                attempt budget and deadline are not positive.
+            ProtocolError: If the submitted ``messages``/``model``/
+                ``delivery_mode``/``parameters`` do not reproduce the
+                authorization's ``request_digest``, if `max_attempts` or
+                `max_charge_milli_credits` exceeds the signed cap, if `model` is
+                outside the signed allowlist, or if the attempt budget and
+                deadline are not positive.
             ConflictError: On a reused idempotency key with different content.
         """
         moment = now or self._moment()
@@ -1013,15 +1077,20 @@ class GatewayService:
         # The authorization binds the exact work it was signed for. Recomputing
         # the digest from what was actually submitted, and comparing it to the
         # signed `request_digest`, is what stops a valid authorization for
-        # "write a haiku" from being re-pointed at "read the secret file".
-        payload_digest = canonical_digest(
-            {"prompt": prompt, "model": model, "delivery_mode": delivery_mode}
+        # "write a haiku" from being re-pointed at "read the secret file", or a
+        # ceiling signed for a short answer from being spent on a long one.
+        forwarded = dict(parameters or {})
+        payload_digest = compute_request_digest(
+            messages=tuple(messages),
+            model=model,
+            delivery_mode=delivery_mode,
+            parameters=forwarded,
         )
         signed_request_digest = str(payload.get("request_digest", ""))
         if signed_request_digest != payload_digest:
             raise ProtocolError(
-                "the submitted prompt/model/delivery_mode do not match the "
-                "request_digest the authorization was signed over"
+                "the submitted messages/model/delivery_mode/parameters do not "
+                "match the request_digest the authorization was signed over"
             )
         signed_max_attempts = int(str(payload.get("max_attempts", "0")))
         if max_attempts > signed_max_attempts:
@@ -1053,6 +1122,319 @@ class GatewayService:
         request_id = str(payload.get("request_id", ""))
         if not request_id:
             raise IdentityBindingError("the authorization names no request_id")
+        return self._admit_and_offer(
+            credential=credential,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            payload_digest=payload_digest,
+            messages=tuple(messages),
+            parameters=forwarded,
+            model=model,
+            delivery_mode=delivery_mode,
+            max_attempts=max_attempts,
+            deadline_ms=deadline_ms,
+            authorization=record,
+            moment=moment,
+        )
+
+    def admit_api_key_request(
+        self,
+        *,
+        api_key: ApiKeyRecord,
+        messages: Sequence[ChatMessage],
+        model: str,
+        parameters: Mapping[str, Any] | None = None,
+        delivery_mode: str = "buffered_complete",
+        max_charge_milli_credits: int = API_KEY_DEFAULT_MAX_CHARGE_MILLI_CREDITS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        deadline_ms: int = DEFAULT_DEADLINE_MS,
+        now: dt.datetime | None = None,
+    ) -> AdmitResult:
+        """Admit one request authenticated by an operator-issued API key.
+
+        The second admission path, and the difference is exactly one thing: who
+        authorized the spend. A signed request carries the consumer's own
+        signature over the work and the ceiling; here the caller proved it holds
+        a key the center issued, and the center signs the terms it is admitting
+        with its own settlement key, labelled ``gateway_authenticated`` so
+        settlement and every later audit read it as the platform's
+        authorization and never as a consumer signature. Nothing else about the
+        request is weakened: it runs the same dispatch, the same metering, the
+        same settlement, and it charges the same account the subject's signed
+        requests charge.
+
+        What the key adds is a ceiling of its own. The per-request cap is the
+        smaller of `max_charge_milli_credits` and the key's remaining quota, and
+        a key that has spent its quota admits nothing, so a key handed to a tool
+        can be capped and revoked without touching the identity behind it or any
+        other key.
+
+        Args:
+            api_key: The key the transport resolved from the credential the
+                request presented. The plaintext never reaches this module: as on
+                the bearer path, the transport resolves the material and the
+                domain receives the record.
+            messages: The conversation to run, forwarded to the upstream as it
+                stands.
+            model: The model being requested.
+            parameters: The forwarded request parameters, in the canonical-safe
+                encoding `wire.encode_chat_parameters` produces.
+            delivery_mode: `buffered_complete` or `stream_strict`.
+            max_charge_milli_credits: The ceiling the caller asked for, capped
+                here by the key's remaining quota.
+            max_attempts: Hard attempt cap.
+            deadline_ms: Wall-clock budget from admission.
+            now: The center's clock; defaults to the wall clock.
+
+        Returns:
+            The admission result, as for a signed request.
+
+        Raises:
+            ApiKeyUnavailable: If the key is no longer usable, or speaks for a
+                subject this center holds no consumer for.
+            ApiKeyRateLimited: If the key is at its concurrency ceiling or its
+                request rate.
+            InsufficientFundsError: If the key has spent its quota.
+            ModelUnavailable: If no connected node can run `model`.
+            ProtocolError: If the conversation is empty or the ceiling is not
+                positive.
+        """
+        moment = now or self._moment()
+        conversation = tuple(messages)
+        if not conversation:
+            raise ProtocolError("a request must carry at least one message")
+        forwarded = dict(parameters or {})
+        # Authenticating the key is the transport's resolution, exactly as on the
+        # bearer path: the plaintext never reaches this module, and the record it
+        # hands over is the center's own answer from a moment ago. What is
+        # re-checked here is what this call owns — that the key is still inside
+        # its window, and that its quota, its rate and its subject still permit
+        # the spend.
+        if not api_key.is_usable_at(moment):
+            raise ApiKeyUnavailable("the presented API key is not usable")
+        key = api_key
+        self._check_api_key_limits(key)
+        remaining = key.remaining_milli_credits
+        if remaining <= 0:
+            raise InsufficientFundsError(
+                f"API key {key.key_id} has spent its {key.quota_milli_credits} "
+                "milli-credit quota; mint another with `potluck-server admin "
+                "api-key`, or raise this one's quota"
+            )
+        binding = self._store.find_consumer_binding(key.subject_id)
+        if binding is None:
+            raise ApiKeyUnavailable(
+                f"API key {key.key_id} speaks for {key.subject_id!r}, which this "
+                "center holds no consumer identity or credential for"
+            )
+        if self._pick_node(model, set(), moment) is None:
+            available = sorted(
+                {
+                    record.model
+                    for record in self._store.connected_nodes()
+                    if record.share_enabled
+                }
+            )
+            raise ModelUnavailable(
+                f"no connected contribution node runs model {model!r}; the models "
+                f"this center can serve right now are {available}"
+            )
+        credential = Credential(
+            tenant_id=key.tenant_id,
+            subject_id=key.subject_id,
+            role="consumer",
+            account_id=binding.account_id,
+        )
+        # The ceiling this request exposes is bounded by what the key has left,
+        # so a single in-flight request can never spend past the quota. Requests
+        # admitted concurrently are each bounded the same way but do not see one
+        # another's spend until they settle, which is why the concurrency ceiling
+        # exists: it bounds how far ahead of the books a key can run.
+        ceiling = min(max_charge_milli_credits, remaining)
+        if ceiling < 1:
+            raise ProtocolError(f"a charge ceiling must be positive, got {ceiling}")
+        request_id = f"req-{secrets.token_hex(16)}"
+        authorization = self._mint_gateway_authorization(
+            request_id=request_id,
+            credential=credential,
+            messages=conversation,
+            model=model,
+            parameters=forwarded,
+            delivery_mode=delivery_mode,
+            max_charge_milli_credits=ceiling,
+            max_attempts=max_attempts,
+            deadline_ms=deadline_ms,
+            moment=moment,
+        )
+        result = self._admit_and_offer(
+            credential=credential,
+            request_id=request_id,
+            idempotency_key=f"api-key-{secrets.token_hex(16)}",
+            payload_digest=compute_request_digest(
+                messages=conversation,
+                model=model,
+                delivery_mode=delivery_mode,
+                parameters=forwarded,
+            ),
+            messages=conversation,
+            parameters=forwarded,
+            model=model,
+            delivery_mode=delivery_mode,
+            max_attempts=max_attempts,
+            deadline_ms=deadline_ms,
+            authorization=authorization,
+            moment=moment,
+            api_key_id=key.key_id,
+        )
+        self._store.mark_api_key_used(key.key_id, moment)
+        return result
+
+    def _check_api_key_limits(self, key: ApiKeyRecord) -> None:
+        """Enforce one key's concurrency ceiling and its request rate.
+
+        The concurrency count is read from the durable request rows, so it means
+        the same thing after a restart as before one and a request an interrupted
+        center left running still occupies its slot. The rate window is this
+        process's own memory: a rate limit is a load-shedding decision about the
+        requests arriving now, not a fact about the books, and a restart clearing
+        it costs one window.
+
+        Raises:
+            ApiKeyRateLimited: If the key is at either limit.
+        """
+        in_flight = self._store.count_in_flight_api_key_requests(key.key_id)
+        if in_flight >= API_KEY_MAX_IN_FLIGHT:
+            raise ApiKeyRateLimited(
+                f"API key {key.key_id} has {in_flight} requests in flight, at its "
+                f"ceiling of {API_KEY_MAX_IN_FLIGHT}; wait for one to finish"
+            )
+        now = time.monotonic()
+        with self._api_key_rate_lock:
+            window = self._api_key_windows.setdefault(key.key_id, deque())
+            while window and now - window[0] >= API_KEY_RATE_WINDOW_S:
+                window.popleft()
+            if len(window) >= API_KEY_RATE_LIMIT:
+                raise ApiKeyRateLimited(
+                    f"API key {key.key_id} admitted {len(window)} requests in the "
+                    f"last {int(API_KEY_RATE_WINDOW_S)}s, at its ceiling of "
+                    f"{API_KEY_RATE_LIMIT} per minute; retry later"
+                )
+            window.append(now)
+
+    def _mint_gateway_authorization(
+        self,
+        *,
+        request_id: str,
+        credential: Credential,
+        messages: Sequence[ChatMessage],
+        model: str,
+        parameters: Mapping[str, Any],
+        delivery_mode: str,
+        max_charge_milli_credits: int,
+        max_attempts: int,
+        deadline_ms: int,
+        moment: dt.datetime,
+    ) -> SignedRecord:
+        """Sign the authorization for a request the center admitted itself.
+
+        The center holds no consumer key — a joiner keeps its own — so the
+        platform's settlement key signs the terms being admitted and the record
+        says so through ``auth_method``. Settlement verifies that signature under
+        the platform purpose, and the receipt keeps the label: this is real
+        evidence of a different strength from a consumer signature, and nothing
+        downstream may read it as one.
+
+        The signature is verified here as well, against the same registry
+        settlement will use. A settlement key that is not registered, or was
+        revoked, then fails the request before any node spends tokens on it
+        rather than at settlement time, when the work is already done and cannot
+        be billed.
+
+        Returns:
+            The signed authorization to store with the request's inputs.
+
+        Raises:
+            SignatureError: If the platform's own key cannot sign an
+                authorization this center can settle.
+        """
+        payer_account_id = credential.account_id or credential.subject_id
+        self._registry.check_spend_authority(
+            spender_id=credential.subject_id,
+            payer_account_id=payer_account_id,
+            amount=max_charge_milli_credits,
+            moment=moment,
+        )
+        authorization = SpendAuthorization(
+            authorization_id=f"auth-{request_id}",
+            payer_account_id=payer_account_id,
+            consumer_id=credential.subject_id,
+            request_id=request_id,
+            request_digest=compute_request_digest(
+                messages=tuple(messages),
+                model=model,
+                delivery_mode=delivery_mode,
+                parameters=parameters,
+            ),
+            max_charge_milli_credits=max_charge_milli_credits,
+            pricing_version=PRICING_VERSION,
+            billing_basis=BILLING_BASIS,
+            minimum_evidence_level=MINIMUM_EVIDENCE_LEVEL,
+            allowed_models=frozenset({model}),
+            allowed_trust_pools=frozenset({TRUST_POOL}),
+            max_attempts=max_attempts,
+            duplicate_execution_policy="bounded_model_only",
+            max_provider_fanout=max_attempts,
+            nonce=new_nonce(),
+            issued_at=moment,
+            expires_at=(
+                moment
+                + dt.timedelta(milliseconds=deadline_ms)
+                + AUTHORIZATION_SETTLEMENT_GRACE
+            ),
+            auth_method="gateway_authenticated",
+            key_id=self._config.settlement_key_id,
+        )
+        record = authorization.sign(self._settlement_key, self._config.settlement_key_id)
+        platform_id = self._registry.get_key(self._config.settlement_key_id).owner_id
+        verify_chain(
+            self._registry,
+            record,
+            "platform_settlement",
+            owner_id=platform_id,
+            witnessed_at=moment,
+        )
+        return record
+
+    def _admit_and_offer(
+        self,
+        *,
+        credential: Credential,
+        request_id: str,
+        idempotency_key: str,
+        payload_digest: str,
+        messages: Sequence[ChatMessage],
+        parameters: Mapping[str, Any],
+        model: str,
+        delivery_mode: str,
+        max_attempts: int,
+        deadline_ms: int,
+        authorization: SignedRecord,
+        moment: dt.datetime,
+        api_key_id: str | None = None,
+    ) -> AdmitResult:
+        """Store one admitted request, and offer its first attempt.
+
+        The shared tail of both admission paths, which differ in how the spend
+        was authorized and not in what an admitted request does next: one row,
+        one stored conversation, one attempt cap, one dispatch. Every authority
+        check has already run by the time this is called, so nothing here decides
+        whether the request may run.
+
+        The API key is bound to the request row before the offer goes out, inside
+        the same lock: settlement reads that binding to count the charge against
+        the key's quota, and a center interrupted between dispatch and settlement
+        must still find it.
+        """
         deliveries: list[tuple[str, Envelope]] = []
         with self._lock:
             stored, created = self._store.create_request(
@@ -1068,15 +1450,18 @@ class GatewayService:
                 created_at=moment,
             )
             if created:
+                if api_key_id is not None:
+                    self._store.bind_request_api_key(request_id, api_key_id)
                 # An idempotent replay must never touch the stored inputs: the
                 # first write wins, or a retry carrying a different authorization
                 # could move the settlement target.
                 with contextlib.suppress(ConflictError):
                     self._store.set_request_input(
                         request_id,
-                        prompt=prompt,
+                        messages=[message.to_payload() for message in messages],
                         model=model,
-                        authorization=_signed_record_to_dict(record),
+                        parameters=dict(parameters),
+                        authorization=_signed_record_to_dict(authorization),
                         at=moment,
                     )
                 self._store.set_request_status(request_id, "ROUTING", at=moment)
@@ -1795,8 +2180,16 @@ class GatewayService:
         authorization = signed_record_from_dict(inputs["authorization"])
         authorization_hash = canonical_digest(dict(authorization.payload))
         max_charge = int(str(authorization.payload.get("max_charge_milli_credits", "0")))
-        request_digest = canonical_digest(
-            {"prompt": inputs["prompt"], "model": inputs["model"]}
+        messages = parse_chat_messages(inputs["messages"])
+        parameters = dict(inputs["parameters"])
+        # The same digest the authorization names, re-derived from what is
+        # actually about to be dispatched: one definition of "the work", so a
+        # node's permit and the consumer's signature cover the same bytes.
+        request_digest = compute_request_digest(
+            messages=messages,
+            model=inputs["model"],
+            delivery_mode=request.delivery_mode,
+            parameters=parameters,
         )
         offer = AttemptOffer(
             request_id=attempt.request_id,
@@ -1808,7 +2201,8 @@ class GatewayService:
             max_milli_credits=max_charge,
             deadline_ms=DEFAULT_DEADLINE_MS,
             delivery_mode=cast(DeliveryMode, request.delivery_mode),
-            prompt=inputs["prompt"],
+            messages=messages,
+            parameters=parameters,
             authorization_hash=authorization_hash,
             permit_hash=compute_permit_hash(
                 request_id=attempt.request_id,

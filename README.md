@@ -6,7 +6,7 @@
 The center of an AI potluck network: one process over one embedded SQLite
 database. It runs the HTTP/WebSocket/SSE gateway, keeps the settlement books
 (ledger, transparency log, receipts), and ships the operator CLI
-`potluck-server` (`serve`, `admin invite|invite-list|revoke-key|reconcile`,
+`potluck-server` (`serve`, `admin invite|invite-list|revoke-key|api-key|api-key-list|api-key-revoke|reconcile`,
 `verify receipt`).
 
 Module layout follows one rule: the protocol and verification primitives live
@@ -42,6 +42,34 @@ potluck-server admin invite --config center.json --role consumer --tenant friend
 potluck-server admin reconcile --config center.json
 potluck-server verify receipt --config center.json --receipt-id R-1
 ```
+
+## OpenAI-compatible endpoint
+
+The same process also serves `POST /openai/v1/chat/completions` and `GET
+/openai/v1/models`, authenticated with an operator-issued API key, so a tool
+that already speaks OpenAI's API works against the pool with nothing but a
+`base_url`:
+
+```bash
+potluck-server admin api-key --config center.json \
+    --subject consumer-1a2b3c --quota 500000 --name "the IDE"
+# ak-…  (printed once; only its digest is stored)
+```
+
+```python
+client = OpenAI(base_url="https://<center>/openai/v1", api_key="ak-…")
+client.chat.completions.create(model="coding-pool", messages=[…])
+```
+
+A key is capped by its own quota, revocable without a restart, rate-limited per
+key, and it spends the **subject's own account** through the same metering,
+settlement, transparency log and receipts as a signed request. The full
+reference — parameters, response and stream shape, the error table, limits,
+observability, and exactly how a key-authorized receipt differs in evidence from
+a consumer-signed one — is [docs/openai-endpoint.md](docs/openai-endpoint.md).
+
+Embeddings and the legacy completions endpoint are not implemented and say so
+(`404`, `error.type: not_supported`) rather than failing quietly.
 
 ## Development
 

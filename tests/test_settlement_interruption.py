@@ -67,7 +67,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from aipotluck.canonical import canonical_digest, sign_payload
+from aipotluck.canonical import sign_payload
 from aipotluck.errors import (
     GatewayError,
     ProtocolError,
@@ -93,6 +93,8 @@ from aipotluck.wire import (
     NodeHello,
     NodePolicy,
     compute_acceptance_hash,
+    compute_request_digest,
+    user_message,
 )
 from conftest import Keyring
 
@@ -252,15 +254,17 @@ def _auth_kwargs(private_key: Any, key_id: str) -> dict[str, Any]:
     }
 
 
-def _authorization(private_key: Any, key_id: str, *, request_id: str, prompt: str) -> Any:
-    """Sign a consumer spend authorization bound to `prompt`/`MODEL`/`DELIVERY`."""
+def _authorization(
+    private_key: Any, key_id: str, *, request_id: str, messages: tuple[Any, ...]
+) -> Any:
+    """Sign a consumer spend authorization bound to `messages`/`MODEL`/`DELIVERY`."""
     return SpendAuthorization(
         authorization_id=f"auth-{request_id}",
         payer_account_id=key_id,
         consumer_id=key_id,
         request_id=request_id,
-        request_digest=canonical_digest(
-            {"prompt": prompt, "model": MODEL, "delivery_mode": DELIVERY}
+        request_digest=compute_request_digest(
+            messages=messages, model=MODEL, delivery_mode=DELIVERY
         ),
         max_charge_milli_credits=20_000,
         pricing_version="flat-v1",
@@ -343,7 +347,7 @@ class _Rig:
     # -- driving one attempt ------------------------------------------------
 
     def prepare(
-        self, code: str, *, request_id: str, prompt: str
+        self, code: str, *, request_id: str, messages: tuple[Any, ...]
     ) -> tuple[Credential, AttemptOffer]:
         """Admit one request and drive it to the point a `usage.final` is due.
 
@@ -359,9 +363,9 @@ class _Rig:
         self.service.admit_request(
             credential=credential,
             idempotency_key=f"idem-{request_id}",
-            prompt=prompt,
+            messages=messages,
             authorization=_authorization(
-                self.joined_private, joined.key_id, request_id=request_id, prompt=prompt
+                self.joined_private, joined.key_id, request_id=request_id, messages=messages
             ),
             model=MODEL,
             max_charge_milli_credits=20_000,
@@ -549,7 +553,9 @@ def test_an_interruption_at_a_durable_write_commits_nothing(
     credit moved — the state a rebuild reads back is "this request is still
     live and unsettled", never a half-written settlement.
     """
-    credential, offer = rig.prepare("code-bd", request_id="req-1", prompt="interrupted")
+    credential, offer = rig.prepare(
+        "code-bd", request_id="req-1", messages=(user_message("interrupted"),)
+    )
     usage = _usage_envelope(rig.keyring, offer, acceptance_hash=rig.acceptance)
 
     with _interrupt_at(rig.store, boundary), pytest.raises(RuntimeError, match=boundary):
@@ -604,7 +610,9 @@ def test_an_interruption_before_settlement_does_not_ack_the_usage(rig: _Rig) -> 
     propagates — and the resend must therefore be re-ingested and settle the
     request, rather than being short-circuited as "already done".
     """
-    _credential, offer = rig.prepare("code-ack", request_id="req-1", prompt="acked?")
+    _credential, offer = rig.prepare(
+        "code-ack", request_id="req-1", messages=(user_message("acked?"),)
+    )
     usage = _usage_envelope(rig.keyring, offer, acceptance_hash=rig.acceptance)
 
     with _interrupt_at(rig.store, "record_settlement_bundle"), pytest.raises(
@@ -635,7 +643,9 @@ def test_the_plain_sequence_number_alone_is_not_a_completion_marker(rig: _Rig) -
     truly final. This is the regression guard for the ACK fix: a later change
     that restores the bare ``event.seq <= acked`` short-circuit fails here.
     """
-    _credential, offer = rig.prepare("code-pred", request_id="req-1", prompt="predicate")
+    _credential, offer = rig.prepare(
+        "code-pred", request_id="req-1", messages=(user_message("predicate"),)
+    )
     usage = _usage_envelope(rig.keyring, offer, acceptance_hash=rig.acceptance)
     event = AttemptEvent.from_payload(usage.payload)
 
@@ -664,7 +674,9 @@ def test_a_lost_acknowledgement_after_a_commit_is_answered_from_durable_state(
     second leaf, no second receipt, no second debit — which is what makes
     "at-least-once delivery, exactly-once settlement" hold.
     """
-    _credential, offer = rig.prepare("code-lost", request_id="req-1", prompt="lost ack")
+    _credential, offer = rig.prepare(
+        "code-lost", request_id="req-1", messages=(user_message("lost ack"),)
+    )
     usage = _usage_envelope(rig.keyring, offer, acceptance_hash=rig.acceptance)
     rig.deliver(usage)
     first = _assert_settled_once(rig, "req-1", offer.attempt_id)
@@ -688,7 +700,9 @@ def test_an_interrupted_settlement_survives_a_restart_as_an_untouched_request(
     "no permit context" rather than settled — the request converges as unknown
     through the recovery path, not by silently completing.
     """
-    _credential, offer = rig.prepare("code-restart", request_id="req-1", prompt="durable?")
+    _credential, offer = rig.prepare(
+        "code-restart", request_id="req-1", messages=(user_message("durable?"),)
+    )
     usage = _usage_envelope(rig.keyring, offer, acceptance_hash=rig.acceptance)
 
     with _interrupt_at(rig.store, "_bundle_write_settlement"), pytest.raises(RuntimeError):
@@ -756,7 +770,9 @@ def test_a_rejected_usage_report_is_refused_every_time_it_is_resent(
     is not the one the node returned. Both are refused on the first delivery and
     on the resend, and neither moves credit nor leaves a receipt.
     """
-    _credential, offer = rig.prepare(f"code-{case}", request_id="req-1", prompt=case)
+    _credential, offer = rig.prepare(
+        f"code-{case}", request_id="req-1", messages=(user_message(case),)
+    )
     usage = _usage_envelope(
         rig.keyring,
         offer,

@@ -38,7 +38,7 @@ import pytest
 from aipotluck.errors import IdentityBindingError
 from aipotluck.identity import generate_key_pair
 from aipotluck.websocket import ClientConnection, WebSocketClosed
-from aipotluck.wire import AttemptOffer, Envelope, NodeHello, NodePolicy
+from aipotluck.wire import AttemptOffer, Envelope, NodeHello, NodePolicy, user_message
 from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
@@ -241,7 +241,7 @@ class Center:
     def admit(self, request_id: str, idempotency_key: str) -> None:
         """Admit one signed consumer request, which offers it to a live node."""
         moment = self.moment()
-        prompt = "write a haiku about bindings"
+        messages = (user_message("write a haiku about bindings"),)
         self.service.admit_request(
             credential=Credential(
                 tenant_id=TENANT,
@@ -250,11 +250,11 @@ class Center:
                 account_id="consumer-X",
             ),
             idempotency_key=idempotency_key,
-            prompt=prompt,
+            messages=messages,
             authorization=signed_authorization(
                 self.keyring,
                 request_id=request_id,
-                prompt=prompt,
+                messages=messages,
                 model=MODEL,
                 issued_at=moment - dt.timedelta(minutes=1),
                 expires_at=moment + dt.timedelta(minutes=10),

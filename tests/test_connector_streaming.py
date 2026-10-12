@@ -35,6 +35,7 @@ from aipotluck.wire import (
     AttemptRef,
     Envelope,
     compute_permit_hash,
+    user_message,
 )
 from conftest import Keyring, signed_authorization
 
@@ -69,6 +70,8 @@ def _wait_until(
 
 
 PROMPT = "write a haiku about sockets"
+#: The conversation every admission here signs and submits, as one user turn.
+MESSAGES = (user_message(PROMPT),)
 
 
 def _authorization_body(
@@ -76,15 +79,15 @@ def _authorization_body(
 ) -> dict[str, Any]:
     """Build the serialized authorization a real client would POST.
 
-    The digest is bound to the exact prompt/model/delivery_mode the caller will
-    submit, because admission recomputes it from what arrived and refuses a
+    The digest is bound to the exact messages/model/delivery_mode the caller
+    will submit, because admission recomputes it from what arrived and refuses a
     request the authorization did not sign over.
     """
     moment = dt.datetime.now(dt.UTC)
     record = signed_authorization(
         keyring,
         request_id=request_id,
-        prompt=PROMPT,
+        messages=MESSAGES,
         model=MODEL,
         delivery_mode=delivery_mode,
         issued_at=moment - dt.timedelta(minutes=1),
@@ -282,7 +285,7 @@ def _admit(
         "/v1/requests",
         {
             "idempotency_key": idempotency_key,
-            "prompt": PROMPT,
+            "messages": [message.to_payload() for message in MESSAGES],
             "model": MODEL,
             "delivery_mode": delivery_mode,
             "max_attempts": 2,
@@ -535,7 +538,8 @@ def _offer(
         max_milli_credits=1000,
         deadline_ms=1000,
         delivery_mode=delivery_mode,
-        prompt="hi",
+        messages=(user_message("hi"),),
+        parameters={},
         authorization_hash="auth-1",
         permit_hash=permit_hash,
     )
@@ -595,13 +599,15 @@ class _BlockingStreamAdapter:
         """This adapter streams by construction."""
         return True
 
-    def complete(self, prompt: str, *, request_digest: str) -> Any:
+    def complete(self, messages: Any, *, request_digest: str, parameters: Any) -> Any:
         """The buffered path is not expected in this test."""
         raise AssertionError("the buffered path must not be used for a streaming adapter")
 
-    def stream(self, prompt: str, *, request_digest: str) -> Iterator[StreamChunk]:
+    def stream(
+        self, messages: Any, *, request_digest: str, parameters: Any
+    ) -> Iterator[StreamChunk]:
         """Emit one chunk, then block forever: the process that never returns."""
-        del prompt, request_digest
+        del messages, request_digest, parameters
         yield StreamChunk(text="partial ")
         self.entered.set()
         self.gate.wait()

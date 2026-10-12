@@ -31,6 +31,7 @@ from aipotluck.cli import main
 from aipotluck.connector import Connector, ConnectorConfig
 from aipotluck.metering import NormalizedUsage
 from aipotluck.persistence import NodeStore
+from aipotluck.wire import user_message
 from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
@@ -151,14 +152,18 @@ class _CliNode:
 
 
 def _authorization_body(
-    keyring: Keyring, request_id: str, *, prompt: str = "write a haiku about sockets"
+    keyring: Keyring,
+    request_id: str,
+    *,
+    messages: tuple[Any, ...] = (user_message("write a haiku about sockets"),),
 ) -> dict[str, Any]:
     """Build the serialized signed authorization a real client would POST.
 
     The window is anchored to the wall clock: this suite exercises the real
     center, so a just-signed authorization must be valid when it settles. The
-    ``request_digest`` is computed for `prompt`, which must match the ``--prompt``
-    the ``request`` command posts, because admission re-derives and compares it.
+    ``request_digest`` is computed for `messages`, which must match the
+    ``--prompt`` the ``request`` command posts as its one user turn, because
+    admission re-derives and compares it.
     """
     moment = dt.datetime.now(dt.UTC)
     record = signed_authorization(
@@ -166,7 +171,7 @@ def _authorization_body(
         request_id=request_id,
         issued_at=moment - dt.timedelta(minutes=1),
         expires_at=moment + dt.timedelta(minutes=10),
-        prompt=prompt,
+        messages=messages,
         model=MODEL,
     )
     return {

@@ -51,6 +51,7 @@ from aipotluck.cli import (
 from aipotluck.connector import Connector, ConnectorConfig
 from aipotluck.metering import NormalizedUsage
 from aipotluck.persistence import NodeStore
+from aipotluck.wire import user_message
 from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
@@ -68,8 +69,9 @@ NODE_PLATFORM_TOKEN = "platform-node-token-SECRET-2"
 
 UPSTREAM_KEY_ENV_NAME = UPSTREAM_KEY_ENV
 NODE_TOKEN_ENV_NAME = NODE_TOKEN_ENV
-#: The one prompt every e2e admission uses; the authorization must bind it.
+#: The one conversation every e2e admission uses; the authorization must bind it.
 PROMPT = "write a haiku about sockets"
+MESSAGES = (user_message(PROMPT),)
 
 
 def _wait_until(condition: Any, *, timeout: float = 10.0, what: str = "condition") -> None:
@@ -645,14 +647,14 @@ class _Centered:
             issued_at=moment - dt.timedelta(minutes=1),
             expires_at=moment + dt.timedelta(minutes=10),
             max_charge_milli_credits=4_000,
-            prompt=PROMPT,
+            messages=MESSAGES,
             model=MODEL,
         )
         status, document = self.post(
             "/v1/requests",
             {
                 "idempotency_key": idempotency_key,
-                "prompt": PROMPT,
+                "messages": [message.to_payload() for message in MESSAGES],
                 "model": MODEL,
                 "delivery_mode": "buffered_complete",
                 "max_attempts": 2,
@@ -700,11 +702,13 @@ class _GatedAdapter(FakeUpstreamAdapter):
         self.entered = threading.Event()
         self.gate = threading.Event()
 
-    def complete(self, prompt: str, *, request_digest: str) -> Any:
+    def complete(self, messages: Any, *, request_digest: str, parameters: Any) -> Any:
         """Signal entry, wait for the gate, then run the scripted response."""
         self.entered.set()
         assert self.gate.wait(timeout=30), "the test never released the in-flight call"
-        return super().complete(prompt, request_digest=request_digest)
+        return super().complete(
+            messages, request_digest=request_digest, parameters=parameters
+        )
 
 
 def _wait_until_share_registered(
