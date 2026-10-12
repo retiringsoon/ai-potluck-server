@@ -189,7 +189,10 @@ center that every other key shares:
 
 * **4 requests in flight**, counted from the durable request rows — the ceiling
   means the same thing after a restart, and a request an interrupted center left
-  running still occupies its slot.
+  running still occupies its slot. A slot is never held past its deadline, though:
+  every admission ends the overdue requests it finds before it decides anything,
+  so a key whose slots are held by requests that can no longer finish is not
+  refused at its ceiling forever.
 * **60 requests per minute**, counted in the running process; a restart clears
   the window, which costs one window and nothing else.
 * **one wait window of ~110s** per connection, deliberately longer than the

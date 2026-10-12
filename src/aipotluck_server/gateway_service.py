@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import logging
 import secrets
 import threading
 import time
@@ -58,7 +59,6 @@ from aipotluck.canonical import (
     verify_payload,
 )
 from aipotluck.errors import (
-    ConflictError,
     GatewayError,
     IdentityBindingError,
     InsufficientFundsError,
@@ -116,11 +116,19 @@ from .persistence import (
     StoredEvent,
 )
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_HEARTBEAT_INTERVAL_S = 15
 DEFAULT_OFFER_ACCEPT_TIMEOUT_S = 10.0
 DEFAULT_DEADLINE_MS = 60_000
 DEFAULT_MAX_ATTEMPTS = 1
 DEFAULT_CONSUMER_QUEUE_SIZE = 256
+
+#: How many requests one deadline sweep examines per non-terminal status.
+#: Bounded because the sweep runs both on the ticker's interval and at every
+#: admission gate, so it must not become a full-table walk on a center with a
+#: long history; a row one pass does not reach, the next one does.
+DEADLINE_SWEEP_BATCH = 256
 
 #: How far a signed request's `issued_at` may sit from the center's clock, in
 #: seconds, in either direction. A window rather than a one-sided deadline so a
@@ -1036,6 +1044,7 @@ class GatewayService:
             raise ProtocolError(f"max_attempts must be >= 1, got {max_attempts}")
         if deadline_ms < 1:
             raise ProtocolError(f"deadline_ms must be >= 1, got {deadline_ms}")
+        self._sweep_before_admission(moment)
         record = _coerce_record(authorization)
         if record.schema != SCHEMA_AUTHORIZATION:
             raise GatewayError(f"expected a spend authorization, got {record.schema}")
@@ -1203,6 +1212,10 @@ class GatewayService:
         conversation = tuple(messages)
         if not conversation:
             raise ProtocolError("a request must carry at least one message")
+        # The sweep runs before this key's own limits are read, because the slots
+        # an overdue request still holds are counted against them: without it a
+        # key whose slots nothing ever swept is refused at its ceiling forever.
+        self._sweep_before_admission(moment)
         forwarded = dict(parameters or {})
         # Authenticating the key is the transport's resolution, exactly as on the
         # bearer path: the plaintext never reaches this module, and the record it
@@ -1452,10 +1465,14 @@ class GatewayService:
             if created:
                 if api_key_id is not None:
                     self._store.bind_request_api_key(request_id, api_key_id)
-                # An idempotent replay must never touch the stored inputs: the
-                # first write wins, or a retry carrying a different authorization
-                # could move the settlement target.
-                with contextlib.suppress(ConflictError):
+                # Only a request this admission created reaches here, so its
+                # inputs are written once by construction: an idempotent replay
+                # returns `created=False` and never touches what the first write
+                # stored, which is what keeps a retry carrying a different
+                # authorization from moving the settlement target. A write that
+                # fails is fatal and is reported, never suppressed — a request row
+                # with no inputs behind it can be neither dispatched nor settled.
+                try:
                     self._store.set_request_input(
                         request_id,
                         messages=[message.to_payload() for message in messages],
@@ -1464,8 +1481,19 @@ class GatewayService:
                         authorization=_signed_record_to_dict(authorization),
                         at=moment,
                     )
+                except PotluckError as exc:
+                    self._terminate_undispatchable(
+                        request_id, "CANCELLED", f"dispatch inputs not stored: {exc}", moment
+                    )
+                    raise
                 self._store.set_request_status(request_id, "ROUTING", at=moment)
-                deliveries.extend(self._offer_new_attempt(stored, moment))
+                try:
+                    deliveries.extend(self._offer_new_attempt(stored, moment))
+                except PotluckError as exc:
+                    self._terminate_undispatchable(
+                        request_id, "FAILED", f"first attempt not offered: {exc}", moment
+                    )
+                    raise
             current = self._store.get_request(request_id)
             assert current is not None
             result = AdmitResult(
@@ -1476,6 +1504,91 @@ class GatewayService:
             )
         self._deliver(deliveries)
         return result
+
+    def _terminate_undispatchable(
+        self, request_id: str, status: str, reason: str, moment: dt.datetime
+    ) -> None:
+        """End a request that can never be dispatched, before its caller is told.
+
+        No path may leave a request row non-terminal: a row sitting in ROUTING
+        occupies its API key's concurrency slot until something ends it, so an
+        admission that is about to raise ends the request it created first, with
+        the reason in the `billing_note` the books and the caller both read.
+
+        `status` is the terminal state the request's own state machine allows
+        from where it got to: a request whose inputs could not be stored never
+        left CREATED, which `aipotluck.statemachine` may cancel but not fail,
+        while one that reached ROUTING and could not be offered is FAILED.
+        """
+        self._store.set_request_status(
+            request_id, status, billing_note=reason, at=moment
+        )
+
+    def _expire_overdue_requests(
+        self, moment: dt.datetime
+    ) -> list[tuple[str, Envelope]]:
+        """End every non-terminal request whose deadline has passed.
+
+        One implementation, three callers: `tick` runs it on its interval, and
+        both admission gates run it before they decide anything. The gate is not
+        a redundancy — an overdue request still occupies its API key's
+        concurrency slot, so without it a key whose slots are held by rows
+        nothing swept is refused at its ceiling forever, and the admission that
+        the ceiling blocks is the very one that would have ended them.
+
+        The status is EXPIRED, the answer `tick` has always given for a passed
+        deadline, so one condition keeps one meaning: the OpenAI surface reports
+        it as a 504 carrying the center's own reason rather than as a 502.
+
+        Returns:
+            `(node_id, cancel)` pairs for the attempts those requests still held,
+            for the caller to deliver outside the lock. The batch bound means one
+            pass can leave rows for the next, which is why the gate and the
+            ticker run the same sweep: neither is the only chance a row gets.
+        """
+        pairs: list[tuple[str, Envelope]] = []
+        for status in ("CREATED", "ROUTING", "RUNNING", "RECOVERING"):
+            for record in self._store.requests_by_status(
+                status, limit=DEADLINE_SWEEP_BATCH
+            ):
+                deadline = record.deadline_at
+                if deadline is None or moment < deadline:
+                    continue
+                self._store.set_request_status(
+                    record.request_id,
+                    "EXPIRED",
+                    billing_note=f"deadline of {deadline.isoformat()} passed",
+                    at=moment,
+                )
+                pairs.extend(self._cancel_pairs(record, "deadline", moment))
+        return pairs
+
+    def _sweep_before_admission(self, moment: dt.datetime) -> None:
+        """Run the deadline sweep at an admission gate, and deliver what it ends."""
+        with self._lock:
+            deliveries = self._expire_overdue_requests(moment)
+        self._deliver(deliveries)
+
+    def _offer_isolated(
+        self, record: RequestRecord, moment: dt.datetime
+    ) -> list[tuple[str, Envelope]]:
+        """Offer one request, reporting a failure instead of ending the round.
+
+        One request that cannot be offered is that request's problem. Raised out
+        of `tick` it becomes everybody's: the round aborts, so nothing else is
+        offered, nothing else expires, and the ticker — which swallows the
+        failure and retries — repeats that forever. That is how a single
+        undispatchable row once stopped every overdue request on the center from
+        ever being ended.
+        """
+        try:
+            return self._offer_new_attempt(record, moment)
+        except Exception:
+            logger.exception(
+                "request %s could not be offered; the rest of the round continues",
+                record.request_id,
+            )
+            return []
 
     def request_status(self, *, credential: Credential, request_id: str) -> dict[str, Any]:
         """Return a request's status document.
@@ -2049,27 +2162,20 @@ class GatewayService:
     def tick(self, *, now: dt.datetime | None = None) -> list[tuple[str, Envelope]]:
         """Advance timers and return the messages to deliver.
 
-        Three jobs, in order: offer requests that were admitted while no node was
-        connected, expire requests past their deadline, and retire offers that
+        Three jobs, in order: expire requests past their deadline, offer requests
+        that were admitted while no node was connected, and retire offers that
         waited past the accept timeout before offering again.
+
+        Expiry runs first and each offer is isolated, so one request that cannot
+        be offered neither gets offered work it is already too late to run nor
+        stops the sweep that ends it.
         """
         moment = now or self._moment()
         pairs: list[tuple[str, Envelope]] = []
         with self._lock:
+            pairs.extend(self._expire_overdue_requests(moment))
             for record in self._store.requests_by_status("ROUTING"):
-                pairs.extend(self._offer_new_attempt(record, moment))
-            for status in ("ROUTING", "RUNNING", "RECOVERING"):
-                for record in self._store.requests_by_status(status, limit=256):
-                    deadline = record.deadline_at
-                    if deadline is None or moment < deadline:
-                        continue
-                    self._store.set_request_status(
-                        record.request_id,
-                        "EXPIRED",
-                        billing_note=f"deadline of {deadline.isoformat()} passed",
-                        at=moment,
-                    )
-                    pairs.extend(self._cancel_pairs(record, "deadline", moment))
+                pairs.extend(self._offer_isolated(record, moment))
             for attempt in self._stuck_attempts(moment):
                 ref = AttemptRef(
                     request_id=attempt.request_id,
@@ -2098,7 +2204,7 @@ class GatewayService:
                     ),
                     at=moment,
                 )
-                pairs.extend(self._offer_new_attempt(record, moment))
+                pairs.extend(self._offer_isolated(owner, moment))
         return pairs
 
     # -- dispatch -----------------------------------------------------------
@@ -2111,7 +2217,9 @@ class GatewayService:
         Returns:
             `(node_id, offer)` pairs to deliver. An empty list means either that
             no node can take the work right now — the request stays live and
-            `tick` offers again — or that the attempt budget is spent.
+            `tick` offers again — that the attempt budget is spent, or that the
+            request holds nothing dispatchable and has just been ended with the
+            reason on its `billing_note`.
         """
         commit = self._store.output_commit(record.request_id)
         if (
@@ -2129,9 +2237,27 @@ class GatewayService:
                     at=moment,
                 )
             return []
-        inputs = self._store.get_request_input(record.request_id)
+        try:
+            inputs = self._store.get_request_input(record.request_id)
+        except PotluckError as exc:
+            # A row an earlier center version stored as a flattened prompt: it has
+            # no conversation to offer and no digest to settle against, and it
+            # never will. Ending it here rather than raising is what keeps one
+            # such row from being offered again on every tick for as long as the
+            # center runs.
+            self._terminate_undispatchable(record.request_id, "FAILED", str(exc), moment)
+            return []
         if inputs is None:
-            raise GatewayError(f"request {record.request_id} has no stored dispatch inputs")
+            # Nothing was ever stored to dispatch, so this request cannot make
+            # progress: end it with the reason on the books instead of leaving it
+            # occupying a slot and failing every caller that looks at it.
+            self._terminate_undispatchable(
+                record.request_id,
+                "FAILED",
+                f"request {record.request_id} has no stored dispatch inputs",
+                moment,
+            )
+            return []
         node = self._pick_node(
             inputs["model"], self._declined.get(record.request_id, set()), moment
         )

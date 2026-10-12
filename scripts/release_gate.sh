@@ -31,7 +31,13 @@
 #   6. the same identity asks again, asks again after the center restarts, and
 #      the three asks leave three distinct receipts — the restart was neither
 #      charged twice nor settled as free;
-#   7. the receipt verifies on both sides, and both reconciliations agree. After
+#   7. an API key minted for the joined consumer answers
+#      ``POST /openai/v1/chat/completions`` over real HTTP — buffered and
+#      streaming — against the same real node, and each of those two requests
+#      settled into a receipt the operator side verifies. This is the second
+#      admission path, and a gate that only ever signs a request cannot see a
+#      defect only an API-key admission can reach;
+#   8. the receipt verifies on both sides, and both reconciliations agree. After
 #      a restart the node side may name exactly one class of difference: an offer
 #      the node never accepted, which the center holds as FAILED with the
 #      settlement HELD and no receipt. Anything else — a *settled* attempt the
@@ -112,6 +118,10 @@ ASK_TIMEOUT=120
 # Pacing for the fake upstream's stream. It has to be slow enough that the first
 # increment is provably on stdout before the ask finishes.
 CHUNK_DELAY=0.6
+# Quota for the API key the OpenAI-compatible face is smoked with. Two small
+# completions cost a fraction of it; the point of naming a ceiling at all is that
+# the gate mints a key the way an operator does, capped and revocable.
+API_KEY_QUOTA=5000
 
 command -v git >/dev/null 2>&1 || die 'git is required'
 command -v uv >/dev/null 2>&1 || die 'uv is required (https://docs.astral.sh/uv/)'
@@ -602,6 +612,206 @@ if [ "$RECEIPT_ID" = "$BUFFERED_RECEIPT_ID" ] \
 fi
 
 # --------------------------------------------------------------------------
+# The OpenAI-compatible face: an API key over real HTTP, both delivery modes
+# --------------------------------------------------------------------------
+
+# Everything above drives the platform's own surface on a signed request. The
+# OpenAI-compatible endpoint admits on an API key instead, through the second
+# admission path, and a defect only that path can reach is invisible to a gate
+# that never mints a key: a center whose store could not hold a conversation
+# answered every POST /openai/v1/chat/completions with a 502 naming a request
+# that "has no stored dispatch inputs", and left each of those requests in
+# ROUTING forever, holding its key's concurrency slot. So the gate mints a key,
+# calls the endpoint over real HTTP against the real node in both delivery modes,
+# and verifies the receipt each request settled into.
+
+cat > "$WORK/openai_smoke.py" <<'PY'
+"""One chat completion against the center's OpenAI-compatible endpoint.
+
+Standard library only: the gate's prefix installs the two packages and nothing
+else, and what has to be proved is the wire contract — the status, the answer, the
+settled counts, the request id — not that one particular SDK parses it. The API
+key arrives on stdin, so it lands in neither the environment nor a log.
+
+Stdout is two lines: a human summary, then the request id. Failures go to stderr.
+"""
+import http.client
+import json
+import os
+import sys
+import urllib.parse
+
+base = urllib.parse.urlsplit(os.environ["CENTER_URL"])
+key = sys.stdin.readline().strip()
+mode = os.environ["MODE"]
+stream = mode == "stream"
+marker = os.environ["REPLY_MARKER"]
+body: dict[str, object] = {
+    "model": os.environ["MODEL"],
+    "messages": [{"role": "user", "content": os.environ["QUESTION"]}],
+    "stream": stream,
+}
+if stream:
+    body["stream_options"] = {"include_usage": True}
+
+connection = http.client.HTTPConnection(base.hostname, base.port, timeout=180)
+connection.request(
+    "POST",
+    "/openai/v1/chat/completions",
+    body=json.dumps(body).encode("utf-8"),
+    headers={"authorization": f"Bearer {key}", "content-type": "application/json"},
+)
+response = connection.getresponse()
+request_id = response.getheader("x-request-id") or ""
+if response.status != 200:
+    print(
+        f"{mode}: the endpoint answered {response.status}: "
+        f"{response.read().decode('utf-8', 'replace')}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+text = ""
+usage = None
+frames = 0
+if stream:
+    terminated = False
+    for line in response:
+        payload = line.decode("utf-8").strip()
+        if not payload.startswith("data: "):
+            continue
+        document = payload[len("data: "):]
+        if document == "[DONE]":
+            terminated = True
+            break
+        frames += 1
+        chunk = json.loads(document)
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices", []):
+            text += (choice.get("delta") or {}).get("content") or ""
+    if not terminated:
+        print(f"{mode}: the stream never reached its terminator", file=sys.stderr)
+        sys.exit(1)
+    if frames < 2:
+        print(f"{mode}: {frames} frame(s) is not an increment stream", file=sys.stderr)
+        sys.exit(1)
+else:
+    completion = json.loads(response.read())
+    text = completion["choices"][0]["message"]["content"]
+    usage = completion.get("usage")
+connection.close()
+
+if marker not in text:
+    print(f"{mode}: the answer is not the upstream's: {text!r}", file=sys.stderr)
+    sys.exit(1)
+if not usage or not usage.get("total_tokens"):
+    print(f"{mode}: the response reported no settled tokens: {usage!r}", file=sys.stderr)
+    sys.exit(1)
+if not request_id.startswith("req-"):
+    print(f"{mode}: no request id came back with the answer: {request_id!r}", file=sys.stderr)
+    sys.exit(1)
+print(f"{mode}: {frames or 1} frame(s), {usage['total_tokens']} tokens settled")
+print(request_id)
+PY
+
+# The receipt a request settled into, read from the center's own books: the
+# endpoint answers with a request id, and `service_unit_id` is that request.
+receipt_for_request() {
+    "$HOME_PY" - "$WORK/center/center.db" "$1" <<'PY'
+import sys
+
+from aipotluck_server.persistence import CenterStore
+
+store = CenterStore.open_existing(sys.argv[1])
+try:
+    for settlement in store.settlements():
+        if settlement.service_unit_id == sys.argv[2]:
+            print(settlement.receipt_id)
+            break
+finally:
+    store.close()
+PY
+}
+
+# Run one chat completion and hand back its stdout, which the caller captures: a
+# summary line and then the request id. Nothing else may print to stdout here,
+# which is why the command this runs is echoed by the step rather than by this
+# function.
+run_openai_completion() {
+    mode=$1
+    question=$2
+    err=$3
+    printf '%s\n' "$API_KEY" \
+        | MODE="$mode" QUESTION="$question" CENTER_URL="$CENTER_URL" MODEL="$MODEL" \
+            REPLY_MARKER="$REPLY_MARKER" "$HOME_PY" "$WORK/openai_smoke.py" 2>"$err"
+}
+
+check_openai_completion() {
+    label=$1
+    out=$2
+    err=$3
+    if [ -z "$out" ]; then
+        tail -20 "$err" >&2
+        fail "the $label chat completion was not answered"
+    fi
+    printf 'release_gate.sh:     %s\n' "$(printf '%s\n' "$out" | head -1)"
+}
+
+step 'mint an API key for the joined consumer'
+CONSUMER_SUBJECT=$("$HOME_PY" -c \
+    'import json, pathlib; print(json.loads(pathlib.Path("consumer/config.json").read_text())["subject_id"])' \
+    </dev/null)
+[ -n "$CONSUMER_SUBJECT" ] || fail 'could not read the joined consumer subject id'
+show "potluck-server admin api-key --config center.json --subject $CONSUMER_SUBJECT --quota $API_KEY_QUOTA"
+# stdout carries the plaintext and nothing else; it is captured, never logged.
+API_KEY=$("$POTLUCK_SERVER" admin api-key --config "$CENTER_JSON" \
+    --subject "$CONSUMER_SUBJECT" --quota "$API_KEY_QUOTA" --name 'release gate' \
+    2>"$WORK/logs/api-key.err" </dev/null) \
+    || { tail -20 "$WORK/logs/api-key.err" >&2; fail 'minting an API key failed'; }
+case "$API_KEY" in
+    ak-*) : ;;
+    *) fail 'admin api-key printed no key on stdout' ;;
+esac
+printf 'release_gate.sh:     minted %s for %s (the plaintext is never written to a log)\n' \
+    "$(printf '%s' "$API_KEY" | cut -c1-6)..." "$CONSUMER_SUBJECT"
+
+step 'the API key answers a buffered chat completion against the real node'
+show 'POST /openai/v1/chat/completions (Authorization: Bearer <api key>, "stream": false)'
+OPENAI_BUFFERED=$(run_openai_completion buffered 'gate api-key buffered' \
+    "$WORK/logs/openai-buffered.err") \
+    || { tail -20 "$WORK/logs/openai-buffered.err" >&2
+         fail 'the buffered chat completion on an API key was not answered'; }
+check_openai_completion buffered "$OPENAI_BUFFERED" "$WORK/logs/openai-buffered.err"
+OPENAI_BUFFERED_REQUEST=$(printf '%s\n' "$OPENAI_BUFFERED" | tail -1)
+
+step 'the same key answers a streaming chat completion'
+show 'POST /openai/v1/chat/completions (Authorization: Bearer <api key>, "stream": true)'
+OPENAI_STREAM=$(run_openai_completion stream 'gate api-key streaming' \
+    "$WORK/logs/openai-stream.err") \
+    || { tail -20 "$WORK/logs/openai-stream.err" >&2
+         fail 'the streaming chat completion on an API key was not answered'; }
+check_openai_completion streaming "$OPENAI_STREAM" "$WORK/logs/openai-stream.err"
+OPENAI_STREAM_REQUEST=$(printf '%s\n' "$OPENAI_STREAM" | tail -1)
+
+if [ "$OPENAI_BUFFERED_REQUEST" = "$OPENAI_STREAM_REQUEST" ]; then
+    fail 'both API-key calls were answered as one request'
+fi
+
+step 'both API-key requests settled into receipts an operator can verify'
+for OPENAI_REQUEST in "$OPENAI_BUFFERED_REQUEST" "$OPENAI_STREAM_REQUEST"; do
+    OPENAI_RECEIPT=$(receipt_for_request "$OPENAI_REQUEST" </dev/null)
+    [ -n "$OPENAI_RECEIPT" ] \
+        || fail "the API-key request $OPENAI_REQUEST settled into no receipt"
+    show "potluck-server verify receipt --config center.json --receipt-id $OPENAI_RECEIPT"
+    "$POTLUCK_SERVER" verify receipt --config "$CENTER_JSON" --receipt-id "$OPENAI_RECEIPT" \
+        >"$WORK/logs/verify-api-key-$OPENAI_RECEIPT.log" 2>&1 </dev/null \
+        || { tail -20 "$WORK/logs/verify-api-key-$OPENAI_RECEIPT.log" >&2
+             fail "the receipt $OPENAI_RECEIPT for $OPENAI_REQUEST did not verify"; }
+    printf 'release_gate.sh:     %s -> %s verified\n' "$OPENAI_REQUEST" "$OPENAI_RECEIPT"
+done
+
+# --------------------------------------------------------------------------
 # After the restart the records still have to add up
 # --------------------------------------------------------------------------
 
@@ -666,5 +876,7 @@ printf 'release_gate.sh: PASS potluck %s at %s\n' "$VERSION" "$SHORT_SHA"
 printf 'release_gate.sh: install.sh into a fresh prefix; the installed package is what ran\n'
 printf 'release_gate.sh: fresh center (no hand-written credentials) + invite-only node and consumer\n'
 printf 'release_gate.sh: default-model/default-charge asks: streaming (first increment before completion), buffered, repeat, after restart\n'
+printf 'release_gate.sh: an API key answered /openai/v1/chat/completions buffered and streaming against the real node: %s %s\n' \
+    "$OPENAI_BUFFERED_REQUEST" "$OPENAI_STREAM_REQUEST"
 printf 'release_gate.sh: receipts %s %s %s distinct; verified on both sides; node and center reconcile clean\n' \
     "$RECEIPT_ID" "$BUFFERED_RECEIPT_ID" "$RESTART_RECEIPT_ID"

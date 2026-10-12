@@ -483,6 +483,33 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
 
 
 
+#: Dispatch inputs: the conversation to execute, the parameters the platform
+#: forwards with it, and the signed pre-authorization settlement is measured
+#: against. All three must survive a restart, or a request can neither be
+#: re-offered nor settled.
+#:
+#: ``messages_json`` is NULL only in a row an earlier center version wrote as a
+#: flattened prompt. Such a row holds no conversation to dispatch, and
+#: `get_request_input` says so rather than inventing a one-message conversation
+#: nobody signed for. It therefore cannot be ``NOT NULL``: the rebuild that
+#: retires the legacy ``prompt`` column carries those rows over instead of
+#: deleting them.
+#:
+#: Defined once and embedded in `_SCHEMA`, because the rebuild in
+#: `_retire_request_inputs_prompt` must create exactly the shape a fresh
+#: database gets — one table, one spelling, whether the center is new or
+#: upgraded.
+_REQUEST_INPUTS_DDL = """
+CREATE TABLE IF NOT EXISTS request_inputs (
+    request_id TEXT PRIMARY KEY,
+    messages_json TEXT,
+    model TEXT NOT NULL,
+    parameters_json TEXT NOT NULL DEFAULT '{}',
+    authorization_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS credentials (
     token_digest TEXT PRIMARY KEY,
@@ -610,18 +637,7 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     created_at TEXT NOT NULL
 );
 
--- Dispatch inputs: the conversation to execute, the parameters the platform
--- forwards with it, and the signed pre-authorization settlement is measured
--- against. All three must survive a restart, or a request can neither be
--- re-offered nor settled.
-CREATE TABLE IF NOT EXISTS request_inputs (
-    request_id TEXT PRIMARY KEY,
-    messages_json TEXT NOT NULL,
-    model TEXT NOT NULL,
-    parameters_json TEXT NOT NULL DEFAULT '{}',
-    authorization_json TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
+""" + _REQUEST_INPUTS_DDL + """
 
 -- Invite records. Only the digest of the invite code is stored; the plaintext
 -- code is printed once by `potluck admin invite` and is never written here, so
@@ -723,14 +739,10 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("api_key_id", "TEXT"),
         ("api_key_charge_milli_credits", "INTEGER"),
     ),
-    # `request_inputs` carried a flattened `prompt` before the request model
-    # became a conversation. The column is added rather than renamed: the two
-    # hold different shapes, and a row written by an older center is reported as
-    # undispatchable rather than silently re-read as a one-message conversation.
-    "request_inputs": (
-        ("messages_json", "TEXT"),
-        ("parameters_json", "TEXT NOT NULL DEFAULT '{}'"),
-    ),
+    # `request_inputs` is absent from this table on purpose: it carried a
+    # flattened `prompt` before the request model became a conversation, and
+    # adding columns cannot retire that one's NOT NULL constraint. It is
+    # rebuilt instead, by `_retire_request_inputs_prompt`.
 }
 
 
@@ -758,8 +770,59 @@ class _Store:
         self._closed = False
         with self._immediate(self._connection()) as conn:
             conn.executescript(_SCHEMA)
+            self._retire_request_inputs_prompt(conn)
             self._migrate(conn)
             conn.executescript(_SCHEMA_INDEXES)
+
+    @staticmethod
+    def _retire_request_inputs_prompt(conn: sqlite3.Connection) -> None:
+        """Rebuild `request_inputs` without the retired flattened-``prompt`` column.
+
+        A database created before the request model became a conversation holds
+        ``prompt TEXT NOT NULL``, and no conversation write can satisfy that
+        constraint: every `set_request_input` then fails, so an upgraded center
+        admits nothing at all. Every request it accepted stayed in ROUTING with
+        no dispatch inputs behind it — undispatchable, unsettleable, and holding
+        its API key's concurrency slot until the deadline sweep ended it.
+        SQLite cannot drop a column constraint, so the table is rebuilt into the
+        one shape this build writes and reads, created from `_SCHEMA` itself so
+        a fresh database and an upgraded one hold the same columns.
+
+        Every row is carried over. A row an earlier center wrote has no
+        conversation, so its ``messages_json`` stays NULL and `get_request_input`
+        reports it as undispatchable instead of inventing one nobody signed for.
+        What the rebuild does drop is that row's retired ``prompt`` text, and the
+        disposition is deliberate: a request that can be neither offered nor
+        settled has no billing truth in this table. What it cost, if anything it
+        cost, is recorded in the receipts, the ledger and the transparency log,
+        and this migration touches none of them.
+        """
+        columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(request_inputs)")
+        }
+        if "prompt" not in columns:
+            return
+        conn.execute("ALTER TABLE request_inputs RENAME TO request_inputs_retired")
+        conn.execute(_REQUEST_INPUTS_DDL)
+        retired = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(request_inputs_retired)")
+        }
+        # A database an intermediate build already opened gained the conversation
+        # columns without losing `prompt`, so it holds rows of both shapes; one
+        # that predates them entirely holds only the flattened prompt. Read the
+        # columns the retired table actually has and carry over what is there.
+        messages = "messages_json" if "messages_json" in retired else "NULL"
+        parameters = (
+            "COALESCE(parameters_json, '{}')" if "parameters_json" in retired else "'{}'"
+        )
+        conn.execute(
+            "INSERT INTO request_inputs (request_id, messages_json, model,"
+            " parameters_json, authorization_json, created_at)"
+            f" SELECT request_id, {messages}, model, {parameters}, authorization_json,"
+            " created_at FROM request_inputs_retired"
+        )
+        conn.execute("DROP TABLE request_inputs_retired")
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -2792,6 +2855,11 @@ class CenterStore(_Store):
 
         Raises:
             ConflictError: If inputs are already stored for the request.
+            PotluckError: If the row could not be written for any other reason.
+                A store that cannot hold a request's inputs is reported as
+                itself: naming every integrity failure a duplicate is what let an
+                upgraded center swallow the failure, admit a request, and then
+                leave it in ROUTING with nothing to dispatch.
         """
         conn = self._connection()
         with self._immediate(conn):
@@ -2810,6 +2878,15 @@ class CenterStore(_Store):
                     ),
                 )
             except sqlite3.IntegrityError as exc:
+                stored = conn.execute(
+                    "SELECT 1 AS present FROM request_inputs WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                if stored is None:
+                    raise PotluckError(
+                        f"the dispatch inputs for request {request_id} could not be"
+                        f" stored: {exc}"
+                    ) from exc
                 raise ConflictError(
                     f"request {request_id} already has stored dispatch inputs"
                 ) from exc

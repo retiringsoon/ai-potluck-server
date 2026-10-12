@@ -20,6 +20,8 @@ The suites are grouped by the boundary they probe:
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import sqlite3
 import threading
 from collections.abc import Callable
 from dataclasses import replace
@@ -30,6 +32,7 @@ import pytest
 from aipotluck.errors import (
     ConflictError,
     IdentityBindingError,
+    PotluckError,
     ProtocolError,
     StateTransitionError,
 )
@@ -53,6 +56,7 @@ from aipotluck.wire import (
 from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_service import (
+    API_KEY_MAX_IN_FLIGHT,
     GatewayConfig,
     GatewayError,
     GatewayService,
@@ -1346,6 +1350,275 @@ def test_tick_leaves_a_request_inside_its_deadline_alone(harness: Harness) -> No
 
     assert pairs == []
     assert harness.status("R-1")["status"] == "RUNNING"
+
+
+def _routing_row_without_inputs(
+    harness: Harness,
+    request_id: str,
+    *,
+    deadline_ms: int = 60_000,
+    api_key_id: str | None = None,
+    at: dt.datetime = BASE,
+) -> None:
+    """Write a ROUTING request row with no dispatch inputs behind it.
+
+    The shape production held: a center whose database could not store a
+    conversation created the row, could not store what the row needs to be
+    dispatched, and then told the caller the request had no inputs. It is written
+    straight to the store because no admission path produces it any more, and the
+    rows already on disk are exactly what a tick has to survive.
+    """
+    harness.store.create_request(
+        request_id=request_id,
+        tenant_id=TENANT,
+        subject_id="consumer-X",
+        idempotency_key=f"idem-{request_id}",
+        payload_digest="sha256:aaaa",
+        delivery_mode="buffered_complete",
+        max_attempts=1,
+        service_unit_id=request_id,
+        deadline_at=at + dt.timedelta(milliseconds=deadline_ms),
+        created_at=at,
+    )
+    if api_key_id is not None:
+        harness.store.bind_request_api_key(request_id, api_key_id)
+    harness.store.set_request_status(request_id, "ROUTING", at=at)
+
+
+def _store_inputs_the_center_cannot_read_back(harness: Harness, request_id: str) -> None:
+    """Write a dispatch input whose authorization is not a signed record.
+
+    A row the store holds and this build cannot parse, which is a genuine offer
+    failure rather than an injected one: nothing about the request is dispatchable,
+    and the failure surfaces where the offer is built.
+    """
+    harness.store.create_request(
+        request_id=request_id,
+        tenant_id=TENANT,
+        subject_id="consumer-X",
+        idempotency_key=f"idem-{request_id}",
+        payload_digest="sha256:aaaa",
+        delivery_mode="buffered_complete",
+        max_attempts=1,
+        service_unit_id=request_id,
+        deadline_at=BASE + dt.timedelta(milliseconds=60_000),
+        created_at=BASE,
+    )
+    harness.store.set_request_input(
+        request_id,
+        messages=[user_message("write a haiku about ledgers").to_payload()],
+        model=MODEL,
+        parameters={},
+        authorization={"schema": "not-a-signed-record"},
+        at=BASE,
+    )
+    harness.store.set_request_status(request_id, "ROUTING", at=BASE)
+
+
+def _break_the_request_inputs_table(path: Path) -> None:
+    """Put `request_inputs` into the shape that made every write fail in production.
+
+    A legacy ``prompt TEXT NOT NULL`` beside the conversation columns: an INSERT
+    that names no prompt cannot satisfy it, so the store cannot hold a request's
+    inputs at all. That is a store fault, and it is what an admission has to
+    survive without leaving a live request behind.
+    """
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE request_inputs")
+        connection.execute(
+            "CREATE TABLE request_inputs (request_id TEXT PRIMARY KEY,"
+            " prompt TEXT NOT NULL, model TEXT NOT NULL, messages_json TEXT,"
+            " parameters_json TEXT NOT NULL DEFAULT '{}',"
+            " authorization_json TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_a_request_with_nothing_to_dispatch_is_ended_rather_than_offered_again(
+    harness: Harness,
+) -> None:
+    """An undispatchable request is ended, with the reason on the books.
+
+    Raising instead left the row in ROUTING, where it held its API key's
+    concurrency slot forever and aborted the tick round that would have expired
+    it — so one such row also kept every other overdue request on the center
+    alive, for as long as the center ran.
+    """
+    harness.connect()
+    _routing_row_without_inputs(harness, "R-poison")
+
+    harness.tick(BASE + dt.timedelta(seconds=1))
+
+    record = harness.store.get_request("R-poison")
+    assert record is not None
+    assert record.status == "FAILED"
+    assert "no stored dispatch inputs" in (record.billing_note or "")
+    assert harness.offers("node-A") == []
+
+
+def test_a_request_an_earlier_center_stored_as_a_prompt_is_ended_too(
+    harness: Harness, tmp_path: Path
+) -> None:
+    """A legacy row is ended with the report that explains it, not offered forever."""
+    harness.connect()
+    _routing_row_without_inputs(harness, "R-legacy")
+    connection = sqlite3.connect(tmp_path / "center.db")
+    try:
+        connection.execute(
+            "INSERT INTO request_inputs (request_id, messages_json, model,"
+            " parameters_json, authorization_json, created_at)"
+            " VALUES ('R-legacy', NULL, 'coding-pool', '{}', '{}', '2026-10-06T12:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    harness.tick(BASE + dt.timedelta(seconds=1))
+
+    record = harness.store.get_request("R-legacy")
+    assert record is not None
+    assert record.status == "FAILED"
+    assert "earlier center version" in (record.billing_note or "")
+
+
+def test_one_undispatchable_request_does_not_stop_the_round_for_the_others(
+    harness: Harness,
+) -> None:
+    """Expiry still ends what is overdue, and offers still go out, in the same round.
+
+    Expiry runs first and each offer is isolated, so the round neither offers work
+    that is already too late to run nor depends on any one request being
+    offerable.
+    """
+    harness.admit(
+        harness.authorization(request_id="R-overdue"),
+        idempotency_key="idem-overdue",
+        deadline_ms=1_000,
+    )
+    harness.admit(
+        harness.authorization(request_id="R-live"),
+        idempotency_key="idem-live",
+        deadline_ms=60_000,
+    )
+    _routing_row_without_inputs(harness, "R-poison")
+    harness.connect()
+
+    harness.tick(BASE + dt.timedelta(seconds=2))
+
+    assert harness.status("R-overdue")["status"] == "EXPIRED"
+    assert harness.status("R-live")["status"] == "RUNNING"
+    assert [offer.request_id for offer in harness.offers("node-A")] == ["R-live"]
+    poison = harness.store.get_request("R-poison")
+    assert poison is not None
+    assert poison.status == "FAILED"
+
+
+def test_an_offer_that_fails_is_reported_and_the_round_continues(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failure one request cannot survive is logged, not raised out of the tick.
+
+    `tick` is the center's only timer and its caller swallows whatever escapes and
+    retries on the next interval, so an exception out of one offer used to cancel
+    the whole round, repeatedly, forever.
+    """
+    _store_inputs_the_center_cannot_read_back(harness, "R-bad")
+    harness.admit(
+        harness.authorization(request_id="R-overdue"),
+        idempotency_key="idem-overdue",
+        deadline_ms=1_000,
+    )
+    harness.admit(
+        harness.authorization(request_id="R-live"),
+        idempotency_key="idem-live",
+        deadline_ms=60_000,
+    )
+    harness.connect()
+
+    with caplog.at_level(logging.ERROR, logger="aipotluck_server.gateway_service"):
+        harness.tick(BASE + dt.timedelta(seconds=2))
+
+    assert harness.status("R-overdue")["status"] == "EXPIRED"
+    assert harness.status("R-live")["status"] == "RUNNING"
+    assert [offer.request_id for offer in harness.offers("node-A")] == ["R-live"]
+    assert any("R-bad" in record.getMessage() for record in caplog.records), caplog.records
+
+
+def test_an_overdue_request_is_ended_by_the_next_admission_and_frees_the_keys_slot(
+    harness: Harness,
+) -> None:
+    """The admission gate sweeps, because the slots an overdue request holds block it.
+
+    A key at its concurrency ceiling is refused before it admits anything, so a
+    sweep that ran only inside an admission would never reach the rows that are
+    refusing it: the four slots held by requests nothing had ended yet would keep
+    answering 429 forever. That is the production shape — four rows in ROUTING,
+    deadlines minutes past, and a key that could never admit again.
+    """
+    harness.store.add_credential(
+        "consumer-token", TENANT, "consumer-X", "consumer", REGISTERED_AT
+    )
+    key = harness.store.add_api_key(
+        "ak-plaintext",
+        key_id="apikey-1",
+        name="",
+        subject_id="consumer-X",
+        tenant_id=TENANT,
+        quota_milli_credits=100_000,
+        created_at=BASE,
+    )
+    harness.connect()
+    for index in range(API_KEY_MAX_IN_FLIGHT):
+        _routing_row_without_inputs(
+            harness,
+            f"R-stuck-{index}",
+            deadline_ms=1_000,
+            api_key_id=key.key_id,
+        )
+    stuck = harness.store.count_in_flight_api_key_requests(key.key_id)
+    assert stuck == API_KEY_MAX_IN_FLIGHT
+
+    admitted = harness.service.admit_api_key_request(
+        api_key=key,
+        messages=(user_message("write a haiku about ledgers"),),
+        model=MODEL,
+        now=BASE + dt.timedelta(seconds=2),
+    )
+
+    assert admitted.created is True
+    for index in range(API_KEY_MAX_IN_FLIGHT):
+        record = harness.store.get_request(f"R-stuck-{index}")
+        assert record is not None
+        assert record.status == "EXPIRED", record.billing_note
+    # The four slots are released, and the request just admitted holds the only one.
+    assert harness.store.count_in_flight_api_key_requests(key.key_id) == 1
+
+
+def test_an_admission_that_cannot_store_its_inputs_ends_the_request_it_created(
+    harness: Harness, tmp_path: Path
+) -> None:
+    """A store fault ends the request before the caller is told about it.
+
+    No path may leave a request non-terminal: the row occupies its key's
+    concurrency slot until something ends it. The status is CANCELLED rather than
+    FAILED because the request never left CREATED, which is the state
+    `aipotluck.statemachine` may cancel but not fail — nothing was dispatched, so
+    nothing failed to run, and the note says what did happen.
+    """
+    harness.connect()
+    _break_the_request_inputs_table(tmp_path / "center.db")
+
+    with pytest.raises(PotluckError, match="could not be stored"):
+        harness.admit(harness.authorization(request_id="R-1"))
+
+    record = harness.store.get_request("R-1")
+    assert record is not None
+    assert record.status == "CANCELLED"
+    assert "could not be stored" in (record.billing_note or "")
+    assert harness.offers("node-A") == []
 
 
 def test_tick_abandons_and_re_offers_an_unanswered_offer(harness: Harness) -> None:

@@ -146,6 +146,17 @@ DEFAULT_READ_TIMEOUT_S = 30.0
 #: Largest request body the gateway will read, in bytes.
 MAX_HTTP_BODY_BYTES = 1024 * 1024
 
+#: How long a closing connection spends discarding request bytes nobody read,
+#: and waiting on a TLS peer's own `close_notify`. Short on purpose: this runs on
+#: every connection the gateway ends, so it may not become a way for one peer to
+#: hold a handler thread.
+GRACEFUL_CLOSE_TIMEOUT_S = 0.5
+
+#: How many still-incoming request bytes a closing connection discards before it
+#: gives up and closes anyway. One full body: that is the most an honest peer can
+#: still be sending, and a peer sending more has already been refused.
+GRACEFUL_CLOSE_DRAIN_BYTES = MAX_HTTP_BODY_BYTES
+
 #: Frames buffered for one SSE connection before it is dropped. Not part of the
 #: frozen interface, but a named constant so the drop policy is one edit away
 #: from being tuned, and so a test can shrink it deliberately.
@@ -1724,6 +1735,10 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
     #: Whether a response status line has already left this handler.
     _answered: bool = False
 
+    #: Whether this request still has body bytes nobody read, which decides
+    #: whether closing the connection has to discard them first. See `finish`.
+    _body_unread: bool = False
+
     #: The body read for this request, if any. A signed request must read the
     #: body before its handler does (the signature covers it), so the bytes are
     #: buffered here and handed back rather than read twice off the socket.
@@ -1745,6 +1760,89 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         """
         with contextlib.suppress(ConnectionError):
             super().handle()
+
+    def finish(self) -> None:
+        """End the connection so the answer already written is what the peer reads.
+
+        Two ways a complete, correctly framed answer still fails to reach a
+        caller, both of which a reverse proxy reports to its operator as "origin
+        sent an invalid response" and neither of which a test that reads the whole
+        body over loopback sees:
+
+        * closing a socket whose receive queue still holds request bytes makes
+          the kernel answer with a reset rather than a FIN, and a peer that has
+          not yet read the response loses it;
+        * closing a TLS socket without a `close_notify` ends the record stream
+          mid-session, which a TLS peer reads as a truncated response even though
+          every byte of the body arrived.
+
+        So the write side is half-closed first — unwrapping TLS, which is what
+        emits `close_notify` — then anything still coming in is discarded within a
+        bound, and only then does the base class close the socket.
+        """
+        self._half_close()
+        self._discard_unread_request_body()
+        super().finish()
+
+    def _half_close(self) -> None:
+        """Tell the peer this response is finished, instead of dropping the socket.
+
+        Over TLS the signal is `close_notify`, which `unwrap` emits; over
+        cleartext it is a FIN on the write side. Both leave the read side open, so
+        what the peer still owes can be discarded afterwards.
+        """
+        with contextlib.suppress(OSError):
+            self.wfile.flush()
+        connection = self.connection
+        previous = connection.gettimeout()
+        try:
+            # Bounded: a peer that sends no `close_notify` of its own must not be
+            # able to hold this handler thread for the life of the connection.
+            connection.settimeout(GRACEFUL_CLOSE_TIMEOUT_S)
+            if isinstance(connection, ssl.SSLSocket):
+                connection.unwrap()
+            else:
+                connection.shutdown(socket.SHUT_WR)
+        except (OSError, ValueError):
+            # Nothing is left to close gracefully: a peer already gone cannot be
+            # told anything, and a socket whose TLS layer is already down has
+            # nothing to send a `close_notify` with. The response was written.
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                connection.settimeout(previous)
+
+    def _discard_unread_request_body(self) -> None:
+        """Throw away request bytes nobody read, so the close is a FIN and not a reset.
+
+        Bounded on both axes — `GRACEFUL_CLOSE_DRAIN_BYTES` and
+        `GRACEFUL_CLOSE_TIMEOUT_S` — because the point is to leave the receive
+        queue empty, not to buffer whatever a peer chooses to send. A peer that
+        outruns either bound gets the reset it is causing, and by then the FIN
+        from `_half_close` has already put this response on its way.
+        """
+        if not self._body_unread:
+            return
+        connection = self.connection
+        previous = connection.gettimeout()
+        deadline = time.monotonic() + GRACEFUL_CLOSE_TIMEOUT_S
+        budget = GRACEFUL_CLOSE_DRAIN_BYTES
+        try:
+            while budget > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                connection.settimeout(remaining)
+                try:
+                    chunk = connection.recv(min(budget, 65536))
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                budget -= len(chunk)
+        finally:
+            with contextlib.suppress(OSError):
+                connection.settimeout(previous)
 
     def do_GET(self) -> None:
         """Route the request before any endpoint-specific work happens."""
@@ -1775,6 +1873,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         # request presented would survive into an error message.
         self._cached_body = None
         self._answered = False
+        self._body_unread = False
         self._presented_token = None
         self._openai_refusal = None
         target = urllib.parse.urlsplit(self.path)
@@ -2417,15 +2516,24 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             # No length means the body is delimited by the peer closing its write
             # side, which is not something to wait for inside a response.
             self.close_connection = True
+            self._body_unread = True
             return
         length = int(declared.strip())
         if length > MAX_HTTP_BODY_BYTES:
             # The handler already refused this body; its bytes are never coming
             # out of the socket in a bounded read, so the connection ends here.
             self.close_connection = True
+            self._body_unread = True
             return
-        with contextlib.suppress(OSError):
-            self.rfile.read(length)
+        try:
+            drained = self.rfile.read(length)
+        except OSError:
+            drained = b""
+        if len(drained) < length:
+            # Still in the socket, and `finish` discards it before the close: a
+            # refusal that leaves a peer's bytes unread is answered with a reset
+            # that takes the refusal itself with it.
+            self._body_unread = True
 
     def _respond(
         self, status: int, payload: Any, *, headers: dict[str, str] | None = None

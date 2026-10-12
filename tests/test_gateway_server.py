@@ -13,14 +13,17 @@ module does not exist.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import http.client
 import inspect
 import json
 import secrets
+import select
 import socket
 import ssl
 import tempfile
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterator
@@ -1359,6 +1362,76 @@ def test_a_kept_alive_connection_survives_a_refusal_it_did_not_read(
         connection.close()
 
 
+def _read_until_closed(sock: socket.socket) -> tuple[bytes, bool]:
+    """Read a socket to the end of the stream, reporting whether it was reset.
+
+    A reset is the difference that matters here: it discards whatever the peer has
+    not read yet, so a response the gateway wrote can still be a response nobody
+    receives.
+    """
+    chunks: list[bytes] = []
+    reset = False
+    while True:
+        try:
+            data = sock.recv(65536)
+        except ConnectionResetError:
+            reset = True
+            break
+        except OSError:
+            break
+        if not data:
+            break
+        chunks.append(data)
+    return b"".join(chunks), reset
+
+
+def test_a_refusal_for_a_body_the_sender_is_still_writing_reaches_the_sender(
+    gateway: Callable[..., GatewayServer],
+) -> None:
+    """A refusal survives the close of a connection whose request is still arriving.
+
+    The gateway refuses an oversized body before reading it, so those bytes are
+    still in flight — and closing a socket with unread request bytes in its
+    receive queue makes the kernel answer with a reset instead of a FIN. A reset
+    takes the response with it: the sender, which is still writing, gets a broken
+    pipe and never reads the `400` that explains it. A reverse proxy in between
+    reports that to its operator as an invalid origin response rather than as the
+    refusal it was.
+
+    The write runs in its own thread because that is what a real sender does: it
+    reads the answer while it is still sending.
+    """
+    server = gateway(_StubService())
+    body = b"x" * (OVERSIZE_BYTES + 1)
+    request = (
+        f"POST /v1/requests HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        f"Authorization: Bearer {CONSUMER_TOKEN}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode("ascii") + body
+
+    with socket.create_connection(("127.0.0.1", _port(server)), timeout=30) as sock:
+        def send() -> None:
+            with contextlib.suppress(OSError):
+                sock.sendall(request)
+
+        sender = threading.Thread(target=send, daemon=True)
+        sender.start()
+        # Read late, the way a proxy does while its own upload is still in flight:
+        # a reset that lands before the read discards an answer that was written.
+        time.sleep(1.0)
+        raw, reset = _read_until_closed(sock)
+        sender.join(timeout=30)
+
+    head, separator, rest = raw.partition(b"\r\n\r\n")
+    assert separator, f"the refusal never arrived: {raw[:200]!r}"
+    assert _head_status(head) == 400
+    # The whole body, exactly as declared, and a clean end of stream.
+    assert len(rest) == _content_length(head)
+    assert json.loads(rest)["error"] == "payload_too_large"
+    assert reset is False, "the connection was reset, which is how the answer gets lost"
+
+
 def test_a_bad_cursor_is_400(gateway: Callable[..., GatewayServer]) -> None:
     service = _StubService()
     service.statuses["req-1"] = "RUNNING"
@@ -1788,6 +1861,141 @@ def test_tls_round_trip_over_https_and_wss(gateway: Callable[..., GatewayServer]
             assert [hello.node_id for hello in service.registered] == ["node-tls"]
         finally:
             client.close()
+
+
+#: TLS record content types are framed in the clear: the first byte of every
+#: record names what it carries, so a byte-level relay can read what the origin
+#: put on the wire without terminating TLS itself.
+_TLS_ALERT_RECORD = 21
+
+
+def _tls_record_types(data: bytes) -> list[int]:
+    """Return the content type of every complete TLS record in `data`."""
+    types: list[int] = []
+    offset = 0
+    while offset + 5 <= len(data):
+        length = int.from_bytes(data[offset + 3 : offset + 5], "big")
+        if offset + 5 + length > len(data):
+            break
+        types.append(data[offset])
+        offset += 5 + length
+    return types
+
+
+class _ByteRelay:
+    """A transparent relay that records every byte the server sends.
+
+    It exists so a test can assert on the origin's own bytes. A TLS client cannot
+    tell a session ended with `close_notify` from one that was dropped: both read
+    as the end of the stream. The only local evidence is the alert record on the
+    wire, which a relay sees and a TLS client consumes.
+    """
+
+    def __init__(self, target_port: int) -> None:
+        """Listen on an ephemeral port and copy one connection to `target_port`."""
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._target_port = target_port
+        self.from_server = bytearray()
+        self._thread = threading.Thread(target=self._relay, daemon=True)
+        self._thread.start()
+
+    @property
+    def port(self) -> int:
+        """The port a client dials to reach the gateway through this relay."""
+        return int(self._listener.getsockname()[1])
+
+    def _relay(self) -> None:
+        """Copy one connection both ways until both peers are done.
+
+        A peer that closes is dropped from the copy instead of ending it. The two
+        closes race, and returning on the first one loses whatever the other side
+        wrote last — which is exactly the record this relay exists to observe.
+        """
+        with self._listener:
+            client, _address = self._listener.accept()
+        try:
+            server = socket.create_connection(("127.0.0.1", self._target_port), timeout=10)
+        except OSError:
+            client.close()
+            return
+        with client, server:
+            peers: dict[socket.socket, socket.socket] = {client: server, server: client}
+            while peers:
+                readable, _, _ = select.select(list(peers), [], [], 10.0)
+                if not readable:
+                    return
+                for source in readable:
+                    try:
+                        data = source.recv(65536)
+                    except OSError:
+                        data = b""
+                    if data and source is server:
+                        self.from_server.extend(data)
+                    sink = peers[source]
+                    if data:
+                        try:
+                            sink.sendall(data)
+                        except OSError:
+                            data = b""
+                    if not data:
+                        del peers[source]
+                        # Pass the end of the stream on, so neither peer waits for
+                        # a close the other has already sent.
+                        with contextlib.suppress(OSError):
+                            sink.shutdown(socket.SHUT_WR)
+
+    def close(self) -> None:
+        """Wait for the copy to finish, then stop listening."""
+        self._thread.join(timeout=15)
+        with contextlib.suppress(OSError):
+            self._listener.close()
+
+
+def test_a_tls_response_ends_with_a_close_notify(gateway: Callable[..., GatewayServer]) -> None:
+    """The origin ends a TLS session with `close_notify` rather than dropping it.
+
+    Every byte of a response can arrive and the session can still be broken: a
+    TLS peer that gets no `close_notify` reads the record stream as truncated,
+    which is what a reverse proxy reports to its operator as an invalid response
+    from the origin. The assertion is on the wire, because that is the only place
+    the difference is visible: a client reads a clean end of stream either way.
+
+    The session is pinned to TLS 1.2 to make the alert readable. In 1.3 the real
+    content type travels inside the encrypted payload and every record after the
+    handshake is framed as application data, so an alert and a body are the same
+    bytes to anybody who does not hold the keys.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        certificate, key = _write_self_signed_certificate(Path(directory))
+        server = gateway(
+            _StubService(),
+            config=GatewayConfig(host="localhost", port=0, certfile=certificate, keyfile=key),
+        )
+        relay = _ByteRelay(_port(server))
+        try:
+            context = ssl.create_default_context(cafile=certificate)
+            context.maximum_version = ssl.TLSVersion.TLSv1_2
+            with (
+                socket.create_connection(("localhost", relay.port), timeout=10) as raw,
+                context.wrap_socket(raw, server_hostname="localhost") as tls,
+            ):
+                tls.sendall(
+                    b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                response = b""
+                while True:
+                    chunk = tls.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+            head, _, body = response.partition(b"\r\n\r\n")
+            assert _head_status(head) == 200, response
+            assert json.loads(body) == {"status": "ok"}
+        finally:
+            relay.close()
+
+        assert _tls_record_types(bytes(relay.from_server))[-1] == _TLS_ALERT_RECORD
 
 
 def test_an_explicit_ssl_context_is_used_when_the_config_names_no_certificate(
