@@ -452,6 +452,20 @@ def test_streaming_settles_like_buffered_and_buffered_still_chunks(center: Cente
         assert center.service.balance("consumer-X") == 98_000
         assert center.service.balance("provider-A/pending") == 2_000
 
+        def _published(request_id: str) -> list[str]:
+            events, _ = _read_sse_events(center, request_id, 0)
+            return [event["event_type"] for event in events]
+
+        # The center publishes asynchronously: read again until the terminal
+        # event is visible, otherwise a slow runner asserts a mid-flight list.
+        _wait_until(
+            lambda: _published(streamed["request_id"])[-1:] == ["attempt.completed"],
+            what="the streamed attempt.completed to be published",
+        )
+        _wait_until(
+            lambda: _published(buffered["request_id"])[-1:] == ["attempt.completed"],
+            what="the buffered attempt.completed to be published",
+        )
         streamed_events, _ = _read_sse_events(center, streamed["request_id"], 0)
         buffered_events, _ = _read_sse_events(center, buffered["request_id"], 0)
         streamed_types = [event["event_type"] for event in streamed_events]
@@ -551,6 +565,14 @@ def test_a_stream_that_breaks_is_a_failure_not_a_short_answer(tmp_path: Path) ->
     record = store.get_execution("A1")
     assert record.state == "FAILED"
     assert record.upstream_calls == 0, "a broken stream is not a completed upstream call"
+    # finished_at flips before the spool writes land: wait for the failure
+    # event itself, then assert the full sequence.
+    _wait_until(
+        lambda: any(
+            event.event_type == "attempt.failed" for event in store.unacked_spool("A1")
+        ),
+        what="the attempt.failed to spool",
+    )
     spooled = store.unacked_spool("A1")
     assert [event.event_type for event in spooled] == ["output.delta", "attempt.failed"]
     assert [event.attempt_seq for event in spooled] == [1, 2]
