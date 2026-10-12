@@ -84,6 +84,7 @@ from aipotluck.errors import (
 # Explicit re-export: the shared record shape is defined once, in the client
 # package, and center code and tests import it from here as well as from there.
 from aipotluck.persistence import ReceiptRecord as ReceiptRecord
+from aipotluck.statemachine import TERMINAL_REQUEST_STATES
 
 #: Attempt states that mean "this attempt will never produce more work".
 TERMINAL_ATTEMPT_STATUSES: frozenset[str] = frozenset(
@@ -209,6 +210,11 @@ class RequestRecord:
     billing_note: str | None
     created_at: dt.datetime
     updated_at: dt.datetime
+    #: The API key that admitted this request, or `None` for one admitted on a
+    #: signature. Settlement reads it to count the charge against that key's
+    #: quota, so a key's spend is a fact about the request rather than a
+    #: connection the books have to reconstruct.
+    api_key_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -388,6 +394,82 @@ class IdentityRecord:
     tenant_scope: str = "auto"
 
 
+@dataclass(frozen=True)
+class ConsumerBinding:
+    """The tenant and account a consumer subject spends through.
+
+    Derived by the store from the rows it already holds — an invited identity's
+    own row first, then a credential an operator provisioned in ``center.json``
+    — so nothing has to be told twice and an API key can never be minted for a
+    subject the center has no account for.
+    """
+
+    subject_id: str
+    tenant_id: str
+    #: The account admission binds a payer to. For every consumer the center
+    #: mints today this is the subject's own account; the column is read rather
+    #: than assumed so a subject whose account is not its own name keeps working.
+    account_id: str
+
+
+@dataclass(frozen=True)
+class ApiKeyRecord:
+    """One operator-issued API key, and the quota it spends against.
+
+    Only the *digest* of the key is stored, exactly as for a credential token or
+    an invite code: the plaintext exists once, in the operator's terminal, so
+    neither this table nor a backup of it can leak a usable key.
+
+    A key authenticates a subject the center already knows; it does not create an
+    identity, and it never widens what that subject may spend. The subject's own
+    account balance stays the authority on money, while ``quota_milli_credits``
+    caps what this one key may draw from it — so a key handed to a tool can be
+    capped and revoked without touching the identity or any other key.
+    """
+
+    key_id: str
+    key_hash: str
+    #: The operator's own label for the key ("the IDE on the laptop"), so a
+    #: listing can be read without the plaintext anybody still holds.
+    name: str
+    subject_id: str
+    tenant_id: str
+    quota_milli_credits: int
+    #: Milli-credits actually settled against this key. Written by the same
+    #: transaction that writes a settlement, so it counts each request once.
+    used_milli_credits: int
+    status: Literal["active", "revoked"]
+    created_at: dt.datetime
+    expires_at: dt.datetime | None
+    revoked_at: dt.datetime | None
+    #: When the key last admitted a request. ``None`` until it does: a key that
+    #: has never been used is the one thing an operator can revoke without
+    #: wondering what it will break.
+    last_used_at: dt.datetime | None
+
+    @property
+    def remaining_milli_credits(self) -> int:
+        """How much of the quota is left, never negative."""
+        return max(0, self.quota_milli_credits - self.used_milli_credits)
+
+    def is_usable_at(self, moment: dt.datetime) -> bool:
+        """Report whether this key may authenticate a request at `moment`.
+
+        Revocation and expiry are both inclusive of their instant, matching how
+        the registry treats key revocation and how an invite treats its expiry.
+        The quota is deliberately *not* part of this answer: an exhausted key is
+        still a key the center knows, and admission has to be able to tell "this
+        is not yours" (401) from "you have spent it" (429) rather than collapsing
+        the two into one refusal.
+        """
+        if self.status != "active":
+            return False
+        moment_utc = _as_utc(moment)
+        revoked = self.revoked_at is not None and moment_utc >= _as_utc(self.revoked_at)
+        expired = self.expires_at is not None and moment_utc >= _as_utc(self.expires_at)
+        return not revoked and not expired
+
+
 def _as_utc(value: dt.datetime) -> dt.datetime:
     """Return `value` as UTC, refusing a naive instant.
 
@@ -528,13 +610,15 @@ CREATE TABLE IF NOT EXISTS ledger_events (
     created_at TEXT NOT NULL
 );
 
--- Dispatch inputs: the prompt to execute and the signed pre-authorization that
--- settlement is measured against. Both must survive a restart, or a request can
--- neither be re-offered nor settled.
+-- Dispatch inputs: the conversation to execute, the parameters the platform
+-- forwards with it, and the signed pre-authorization settlement is measured
+-- against. All three must survive a restart, or a request can neither be
+-- re-offered nor settled.
 CREATE TABLE IF NOT EXISTS request_inputs (
     request_id TEXT PRIMARY KEY,
-    prompt TEXT NOT NULL,
+    messages_json TEXT NOT NULL,
     model TEXT NOT NULL,
+    parameters_json TEXT NOT NULL DEFAULT '{}',
     authorization_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -575,6 +659,28 @@ CREATE TABLE IF NOT EXISTS identities (
     account_id TEXT,
     tenant_scope TEXT NOT NULL DEFAULT 'auto'
 );
+
+-- Operator-issued API keys for the OpenAI-compatible endpoint. Only the digest
+-- of the key is stored; the plaintext is printed once by
+-- `potluck-server admin api-key` and is never written here, so neither this
+-- table nor a backup of it holds a usable credential. `used_milli_credits` is
+-- written by the same transaction that writes a settlement, so a key's quota
+-- counts each request exactly once however often a node replays its report.
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_id TEXT PRIMARY KEY,
+    key_hash TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL DEFAULT '',
+    subject_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    quota_milli_credits INTEGER NOT NULL,
+    used_milli_credits INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    revoked_at TEXT,
+    last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_subject ON api_keys(subject_id);
 """
 
 #: Indexes are created after `_migrate` has added any column an older database
@@ -607,6 +713,23 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "credentials": (
         ("device_id", "TEXT"),
+    ),
+    # A request admitted through an API key records which one, so the settlement
+    # that bills it can also count it against that key's quota, and so an
+    # operator can see what a key paid for. Both stay NULL for a request admitted
+    # on a signature, which is every request a center written before this change
+    # holds.
+    "requests": (
+        ("api_key_id", "TEXT"),
+        ("api_key_charge_milli_credits", "INTEGER"),
+    ),
+    # `request_inputs` carried a flattened `prompt` before the request model
+    # became a conversation. The column is added rather than renamed: the two
+    # hold different shapes, and a row written by an older center is reported as
+    # undispatchable rather than silently re-read as a one-message conversation.
+    "request_inputs": (
+        ("messages_json", "TEXT"),
+        ("parameters_json", "TEXT NOT NULL DEFAULT '{}'"),
     ),
 }
 
@@ -1312,6 +1435,222 @@ class CenterStore(_Store):
         """
         conn = self._connection()
         return self._any_owner_revoked(conn, owner_id, None, at)
+
+    # -- API keys -----------------------------------------------------------
+
+    def find_consumer_binding(self, subject_id: str) -> ConsumerBinding | None:
+        """Return the tenant and account a consumer subject spends through.
+
+        The identity row an invite minted is authoritative, because it is the row
+        admission already binds a payer to; a credential an operator provisioned
+        in ``center.json`` predates per-identity accounts, so for those the
+        subject's own name is the account, exactly as `Credential.account_id`
+        being `None` means the same thing on the bearer path.
+
+        Returns `None` when the center holds neither row, which is what stops an
+        operator from minting an API key for a subject that does not exist — a
+        typo would otherwise produce a key that authenticates and then can never
+        settle, and the failure would surface only when somebody tried to use it.
+        """
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT tenant_id, account_id FROM identities WHERE owner_id = ?"
+            " AND role = 'consumer' ORDER BY registered_at LIMIT 1",
+            (subject_id,),
+        ).fetchone()
+        if row is not None:
+            return ConsumerBinding(
+                subject_id=subject_id,
+                tenant_id=str(row["tenant_id"]),
+                account_id=_opt_text(row["account_id"]) or subject_id,
+            )
+        row = conn.execute(
+            "SELECT tenant_id FROM credentials WHERE subject_id = ?"
+            " AND role = 'consumer' ORDER BY created_at LIMIT 1",
+            (subject_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ConsumerBinding(
+            subject_id=subject_id, tenant_id=str(row["tenant_id"]), account_id=subject_id
+        )
+
+    def add_api_key(
+        self,
+        key: str,
+        *,
+        key_id: str,
+        name: str,
+        subject_id: str,
+        tenant_id: str,
+        quota_milli_credits: int,
+        created_at: dt.datetime,
+        expires_at: dt.datetime | None = None,
+    ) -> ApiKeyRecord:
+        """Register an API key by the digest of its plaintext.
+
+        The plaintext is digested here and never stored, so the table carries no
+        value a reader could replay. Re-adding an identical digest is a no-op;
+        a different key cannot produce the same digest, so there is no conflict
+        case to resolve.
+
+        Args:
+            key: The plaintext key; only its digest is kept.
+            key_id: The operator-facing handle, used to list and revoke.
+            name: The operator's own label for the key.
+            subject_id: The consumer identity the key speaks for.
+            tenant_id: The tenant that identity belongs to.
+            quota_milli_credits: What this key may draw from the subject's
+                account, in total.
+            created_at: When the key was minted.
+            expires_at: Optional expiry; `None` never expires.
+
+        Returns:
+            The stored key.
+
+        Raises:
+            ValueError: If the quota is negative.
+        """
+        if quota_milli_credits < 0:
+            raise ValueError("quota_milli_credits must be >= 0")
+        conn = self._connection()
+        with self._immediate(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO api_keys (key_id, key_hash, name, subject_id,"
+                " tenant_id, quota_milli_credits, used_milli_credits, status,"
+                " created_at, expires_at, revoked_at, last_used_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, NULL, NULL)",
+                (
+                    key_id,
+                    canonical_digest(key),
+                    name,
+                    subject_id,
+                    tenant_id,
+                    quota_milli_credits,
+                    _to_text(created_at),
+                    None if expires_at is None else _to_text(expires_at),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM api_keys WHERE key_id = ?", (key_id,)
+            ).fetchone()
+        return _api_key_from_row(row)
+
+    def resolve_api_key(self, key: str, at: dt.datetime) -> ApiKeyRecord | None:
+        """Resolve a plaintext API key to its record, or `None`.
+
+        `None` covers every case that must be indistinguishable to a caller
+        presenting a bad key: the key is unknown, it was revoked, it has expired,
+        it is being used before it was minted, **or the identity it speaks for was
+        revoked**. The last one is what makes ``admin revoke-key`` withdraw a
+        subject's API keys as well as its signing key and link token, so revoking
+        an identity really does withdraw the identity.
+
+        An exhausted quota is *not* one of those cases: the record is returned
+        with ``remaining_milli_credits`` at zero, and admission reports that as a
+        spent quota rather than as an unknown key.
+        """
+        conn = self._connection()
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ?", (canonical_digest(key),)
+        ).fetchone()
+        if row is None:
+            return None
+        record = _api_key_from_row(row)
+        if not record.is_usable_at(at):
+            return None
+        if record.created_at > _as_utc(at):
+            return None
+        if self._any_owner_revoked(conn, record.subject_id, None, at):
+            return None
+        return record
+
+    def mark_api_key_used(self, key_id: str, at: dt.datetime) -> None:
+        """Record that a key admitted a request at `at`.
+
+        The latest instant wins, unlike a revocation: this column answers "when
+        did this key last do something", so an operator deciding whether to
+        revoke it sees the most recent use rather than the first.
+        """
+        conn = self._connection()
+        with self._immediate(conn):
+            conn.execute(
+                "UPDATE api_keys SET last_used_at = ? WHERE key_id = ?",
+                (_to_text(at), key_id),
+            )
+
+    def list_api_keys(self) -> list[ApiKeyRecord]:
+        """Return every API key, oldest first.
+
+        The records carry only the key *digest*, so an operator view built from
+        this can never render a usable key.
+        """
+        conn = self._connection()
+        rows = conn.execute(
+            "SELECT * FROM api_keys ORDER BY created_at, key_id"
+        ).fetchall()
+        return [_api_key_from_row(row) for row in rows]
+
+    def revoke_api_key(self, key_id: str, at: dt.datetime) -> bool:
+        """Revoke an API key. The first revocation instant is preserved.
+
+        The row is never deleted: what a key spent stays on the books, and the
+        digest stays on file so a later lookup of the same plaintext resolves to
+        a revoked record rather than to nothing at all.
+
+        Returns:
+            True when this call recorded the revocation, False when the key was
+            already revoked, so driving a recovery checklist twice gives a clear,
+            idempotent result.
+
+        Raises:
+            StateTransitionError: If no such key exists.
+        """
+        conn = self._connection()
+        with self._immediate(conn):
+            row = conn.execute(
+                "SELECT revoked_at FROM api_keys WHERE key_id = ?", (key_id,)
+            ).fetchone()
+            if row is None:
+                raise StateTransitionError(f"unknown API key {key_id}")
+            if row["revoked_at"] is not None:
+                return False
+            conn.execute(
+                "UPDATE api_keys SET status = 'revoked', revoked_at = ? WHERE key_id = ?",
+                (_to_text(at), key_id),
+            )
+            return True
+
+    def count_in_flight_api_key_requests(self, key_id: str) -> int:
+        """How many requests this key has admitted that are not terminal yet.
+
+        Counted from the durable request rows rather than from process state, so
+        a per-key concurrency ceiling means the same thing after a restart as it
+        did before one, and a request left running by an interrupted center still
+        occupies its slot until the center's own recovery ends it.
+        """
+        conn = self._connection()
+        placeholders = ", ".join("?" for _ in TERMINAL_REQUEST_STATES)
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM requests WHERE api_key_id = ?"
+            f" AND status NOT IN ({placeholders})",
+            (key_id, *sorted(TERMINAL_REQUEST_STATES)),
+        ).fetchone()
+        return int(row["n"])
+
+    def bind_request_api_key(self, request_id: str, key_id: str) -> None:
+        """Record that one request was admitted through one API key.
+
+        The first binding wins, so a replayed admission cannot move a request
+        onto another key's quota.
+        """
+        conn = self._connection()
+        with self._immediate(conn):
+            conn.execute(
+                "UPDATE requests SET api_key_id = COALESCE(api_key_id, ?)"
+                " WHERE request_id = ?",
+                (key_id, request_id),
+            )
 
     # -- requests -----------------------------------------------------------
 
@@ -2075,6 +2414,10 @@ class CenterStore(_Store):
         ``(service_unit_id, revision)``, or a leaf index that disagrees with the
         stored log, is refused.
 
+        A request admitted through an API key also has its charge counted
+        against that key's quota here, in the same transaction and once per
+        request; see `_bundle_charge_api_key`.
+
         Args:
             settlement: The settlement revision. Its ``service_unit_id`` and
                 ``log_index`` must agree with `receipt`.
@@ -2129,7 +2472,38 @@ class CenterStore(_Store):
                 "UPDATE requests SET status = 'SUCCEEDED', updated_at = ? WHERE request_id = ?",
                 (_to_text(at), receipt.request_id),
             )
+            self._bundle_charge_api_key(conn, receipt.request_id, usage_tokens)
             return index
+
+    @staticmethod
+    def _bundle_charge_api_key(
+        conn: sqlite3.Connection, request_id: str, milli_credits: int
+    ) -> None:
+        """Count a settled charge against the API key that admitted it, once.
+
+        Must be called inside the settlement transaction: a key's quota and the
+        credit it just spent are one fact, and committing them apart would leave
+        a window where a crash had moved the money but not the quota.
+
+        Idempotent by construction. The guarded update is the marker — a request
+        whose charge is already recorded writes nothing — so the replay a node
+        sends after a lost acknowledgement, which re-runs this bundle with the
+        same content, cannot spend the same tokens against the quota twice. A
+        request admitted on a signature carries no key and is skipped.
+        """
+        charged = conn.execute(
+            "UPDATE requests SET api_key_charge_milli_credits = ?"
+            " WHERE request_id = ? AND api_key_id IS NOT NULL"
+            " AND api_key_charge_milli_credits IS NULL",
+            (milli_credits, request_id),
+        )
+        if charged.rowcount == 0:
+            return
+        conn.execute(
+            "UPDATE api_keys SET used_milli_credits = used_milli_credits + ?"
+            " WHERE key_id = (SELECT api_key_id FROM requests WHERE request_id = ?)",
+            (milli_credits, request_id),
+        )
 
     def _bundle_write_leaf(
         self,
@@ -2393,16 +2767,28 @@ class CenterStore(_Store):
         self,
         request_id: str,
         *,
-        prompt: str,
+        messages: list[dict[str, Any]],
         model: str,
+        parameters: dict[str, Any],
         authorization: dict[str, Any],
         at: dt.datetime,
     ) -> None:
-        """Persist a request's dispatch inputs: prompt, model, and authorization.
+        """Persist a request's dispatch inputs: conversation, model, parameters,
+        and authorization.
 
         Written once. A second write is refused rather than overwritten, because
         the authorization is what settlement is measured against and silently
         replacing it would let a later caller move the goal posts.
+
+        Args:
+            request_id: The request these inputs belong to.
+            messages: The conversation to execute, in order, as the payload dicts
+                `wire.ChatMessage.to_payload` produces.
+            model: The model requested.
+            parameters: The forwarded parameters, in the canonical-safe encoding
+                `wire.encode_chat_parameters` produces.
+            authorization: The signed pre-authorization, serialized.
+            at: The instant the row records.
 
         Raises:
             ConflictError: If inputs are already stored for the request.
@@ -2411,9 +2797,17 @@ class CenterStore(_Store):
         with self._immediate(conn):
             try:
                 conn.execute(
-                    "INSERT INTO request_inputs (request_id, prompt, model,"
-                    " authorization_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (request_id, prompt, model, _dump_payload(authorization), _to_text(at)),
+                    "INSERT INTO request_inputs (request_id, messages_json, model,"
+                    " parameters_json, authorization_json, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        request_id,
+                        _dump_payload({"messages": list(messages)}),
+                        model,
+                        _dump_payload(dict(parameters)),
+                        _dump_payload(authorization),
+                        _to_text(at),
+                    ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise ConflictError(
@@ -2424,19 +2818,41 @@ class CenterStore(_Store):
         """Return a request's stored dispatch inputs, or `None`.
 
         Returns:
-            A dict with ``prompt``, ``model``, and ``authorization`` keys.
+            A dict with ``messages``, ``model``, ``parameters`` and
+            ``authorization`` keys.
+
+        Raises:
+            PotluckError: If the row was written by a center that stored a
+                flattened ``prompt`` instead of a conversation. Such a request
+                can neither be re-offered nor settled — its authorization's
+                request digest no longer has an input to be re-derived from — so
+                it is reported rather than quietly re-read as a one-message
+                conversation nobody signed for.
         """
         conn = self._connection()
         row = conn.execute(
-            "SELECT prompt, model, authorization_json FROM request_inputs"
-            " WHERE request_id = ?",
+            "SELECT messages_json, model, parameters_json, authorization_json"
+            " FROM request_inputs WHERE request_id = ?",
             (request_id,),
         ).fetchone()
         if row is None:
             return None
+        if row["messages_json"] is None:
+            raise PotluckError(
+                f"request {request_id} stores its dispatch input as a flattened "
+                "prompt from an earlier center version, which this build cannot "
+                "offer or settle; resubmit the request"
+            )
+        stored = _load_payload(str(row["messages_json"]))
+        messages = stored.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise PotluckError(
+                f"request {request_id} stores no conversation to dispatch"
+            )
         return {
-            "prompt": str(row["prompt"]),
+            "messages": cast("list[dict[str, Any]]", messages),
             "model": str(row["model"]),
+            "parameters": _load_payload(str(row["parameters_json"])),
             "authorization": _load_payload(str(row["authorization_json"])),
         }
 
@@ -2486,6 +2902,7 @@ def _request_from_row(row: Any) -> RequestRecord:
         billing_note=_opt_text(row["billing_note"]),
         created_at=_from_text(str(row["created_at"])),
         updated_at=_from_text(str(row["updated_at"])),
+        api_key_id=_opt_text(row["api_key_id"]),
     )
 
 
@@ -2589,6 +3006,23 @@ def _identity_from_row(row: Any) -> IdentityRecord:
         revoked_at=_opt_instant(row["revoked_at"]),
         account_id=_opt_text(row["account_id"]),
         tenant_scope=str(row["tenant_scope"]),
+    )
+
+
+def _api_key_from_row(row: Any) -> ApiKeyRecord:
+    return ApiKeyRecord(
+        key_id=str(row["key_id"]),
+        key_hash=str(row["key_hash"]),
+        name=str(row["name"]),
+        subject_id=str(row["subject_id"]),
+        tenant_id=str(row["tenant_id"]),
+        quota_milli_credits=int(row["quota_milli_credits"]),
+        used_milli_credits=int(row["used_milli_credits"]),
+        status=cast("Literal['active', 'revoked']", str(row["status"])),
+        created_at=_from_text(str(row["created_at"])),
+        expires_at=_opt_instant(row["expires_at"]),
+        revoked_at=_opt_instant(row["revoked_at"]),
+        last_used_at=_opt_instant(row["last_used_at"]),
     )
 
 

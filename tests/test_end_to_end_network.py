@@ -30,6 +30,7 @@ from aipotluck.connector import Connector, ConnectorConfig
 from aipotluck.identity import generate_key_pair
 from aipotluck.metering import NormalizedUsage
 from aipotluck.persistence import NodeStore
+from aipotluck.wire import user_message
 from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
@@ -68,14 +69,17 @@ def _assert_absent_for(condition: Any, *, duration: float, what: str) -> None:
 
 
 def _authorization_body(
-    keyring: Keyring, request_id: str, *, prompt: str = "write a haiku about sockets"
+    keyring: Keyring,
+    request_id: str,
+    *,
+    messages: tuple[Any, ...] = (user_message("write a haiku about sockets"),),
 ) -> dict[str, Any]:
     """Build the serialized authorization a real client would POST.
 
     The window is anchored to the wall clock on purpose: this suite exercises
     the real center, so a record the consumer just signed must be valid at the
-    instant the center settles it. The digest is bound to `prompt`, which must
-    equal the ``prompt`` in the POST body.
+    instant the center settles it. The digest is bound to `messages`, which must
+    equal the ``messages`` in the POST body.
     """
     moment = dt.datetime.now(dt.UTC)
     record = signed_authorization(
@@ -83,7 +87,7 @@ def _authorization_body(
         request_id=request_id,
         issued_at=moment - dt.timedelta(minutes=1),
         expires_at=moment + dt.timedelta(minutes=10),
-        prompt=prompt,
+        messages=messages,
         model=MODEL,
     )
     return {
@@ -191,8 +195,12 @@ class _PostCallGateAdapter:
     def model(self) -> str:
         return self._inner.model
 
-    def complete(self, prompt: str, *, request_digest: str) -> Any:
-        result = self._inner.complete(prompt, request_digest=request_digest)
+    def complete(
+        self, messages: Any, *, request_digest: str, parameters: Any
+    ) -> Any:
+        result = self._inner.complete(
+            messages, request_digest=request_digest, parameters=parameters
+        )
         self.gate.wait()
         return result
 
@@ -314,7 +322,7 @@ def _admit(
         "/v1/requests",
         {
             "idempotency_key": idempotency_key,
-            "prompt": "write a haiku about sockets",
+            "messages": [{"role": "user", "content": "write a haiku about sockets"}],
             "model": MODEL,
             "delivery_mode": "buffered_complete",
             "max_attempts": 2,
@@ -417,14 +425,14 @@ def test_idempotent_replay_creates_nothing_new(center: Center) -> None:
         )
         body = {
             "idempotency_key": "idem-e2e-2",
-            "prompt": "one prompt",
+            "messages": [{"role": "user", "content": "one prompt"}],
             "model": MODEL,
             "delivery_mode": "buffered_complete",
             "max_attempts": 2,
             "deadline_ms": 60000,
             "max_charge_milli_credits": 20_000,
             "authorization": _authorization_body(
-                center.keyring, "R-e2e-2", prompt="one prompt"
+                center.keyring, "R-e2e-2", messages=(user_message("one prompt"),)
             ),
         }
         status, first = center.post("/v1/requests", body)
@@ -439,14 +447,15 @@ def test_idempotent_replay_creates_nothing_new(center: Center) -> None:
         assert second["request_id"] == request_id
         time.sleep(0.3)
 
-        # A different prompt under the same key is a conflict. Its authorization
-        # is rebuilt for that prompt so the request digest matches; the refusal
-        # comes from the idempotency key, which is the point of the test.
+        # A different conversation under the same key is a conflict. Its
+        # authorization is rebuilt for that conversation so the request digest
+        # matches; the refusal comes from the idempotency key, which is the point
+        # of the test.
         conflict_body = {
             **body,
-            "prompt": "other",
+            "messages": [{"role": "user", "content": "other"}],
             "authorization": _authorization_body(
-                center.keyring, "R-e2e-2", prompt="other"
+                center.keyring, "R-e2e-2", messages=(user_message("other"),)
             ),
         }
         status, _conflict = center.post("/v1/requests", conflict_body)

@@ -11,6 +11,7 @@ from aipotluck.canonical import canonical_digest
 from aipotluck.identity import IdentityRegistry, generate_key_pair, load_private_key
 from aipotluck.ledger import Ledger
 from aipotluck.metering import Measurement, NormalizedUsage
+from aipotluck.wire import compute_request_digest, user_message
 
 CONSUMER_KEY = ("consumer-key-1", "consumer-X", "consumer")
 CONSUMER_KEY_Y = ("consumer-key-2", "consumer-Y", "consumer")
@@ -151,7 +152,7 @@ def signed_authorization(
     key_id: str = "consumer-key-1",
     issued_at: dt.datetime | None = None,
     expires_at: dt.datetime | None = None,
-    prompt: str = "write a haiku about ledgers",
+    messages: tuple[Any, ...] = (user_message("write a haiku about ledgers"),),
     model: str = "coding-pool",
     delivery_mode: str = "buffered_complete",
     max_attempts: int = 2,
@@ -159,11 +160,12 @@ def signed_authorization(
 ) -> Any:
     """Build and sign a consumer authorization for settlement tests.
 
-    The authorization's ``request_digest`` is computed from the exact
-    ``prompt``/``model``/``delivery_mode`` named here, because `admit_request`
-    now re-derives that digest from the submitted work and refuses a mismatch.
-    A caller that admits a different prompt must build the authorization with
-    that same prompt (or accept the refusal it is testing).
+    The authorization's ``request_digest`` is computed by `compute_request_digest`
+    from the exact ``messages``/``model``/``delivery_mode`` named here, because
+    `admit_request` re-derives that digest from the submitted work and refuses a
+    mismatch. A caller that admits a different conversation must build the
+    authorization with that same conversation (or accept the refusal it is
+    testing).
 
     Args:
         keyring: Provides the registry and the signing key.
@@ -178,7 +180,8 @@ def signed_authorization(
         key_id: Which registered key signs.
         issued_at: Window start; defaults to one minute before `SETTLEMENT_AT`.
         expires_at: Window end; defaults to five minutes after `SETTLEMENT_AT`.
-        prompt: The work the authorization is signed for; its digest is bound.
+        messages: The conversation the authorization is signed for; its digest is
+            bound.
         model: The model the authorization is signed for.
         delivery_mode: The delivery mode the authorization is signed for.
         max_attempts: The attempt cap the authorization permits.
@@ -191,8 +194,8 @@ def signed_authorization(
 
     start = issued_at or SETTLEMENT_AT - dt.timedelta(minutes=1)
     end = expires_at or SETTLEMENT_AT + dt.timedelta(minutes=5)
-    request_digest = canonical_digest(
-        {"prompt": prompt, "model": model, "delivery_mode": delivery_mode}
+    request_digest = compute_request_digest(
+        messages=messages, model=model, delivery_mode=delivery_mode
     )
     authorization = SpendAuthorization(
         authorization_id=f"auth-{request_id}",

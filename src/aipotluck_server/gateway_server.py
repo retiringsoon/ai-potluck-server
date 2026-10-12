@@ -73,6 +73,9 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import http.server
+import json
+import logging
+import secrets
 import select
 import socket
 import ssl
@@ -80,7 +83,7 @@ import threading
 import time
 import urllib.parse
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, Protocol, TypeVar, cast, runtime_checkable
 
@@ -117,9 +120,19 @@ from aipotluck.websocket import (
     WebSocketTimeout,
     handshake_server,
 )
-from aipotluck.wire import Envelope, NodeHello, error_envelope
+from aipotluck.wire import (
+    ChatMessage,
+    Envelope,
+    NodeHello,
+    encode_chat_parameters,
+    error_envelope,
+    parse_chat_messages,
+)
 
-from .persistence import CenterStore, Credential, NodeRecord, StoredEvent
+from .errors import ApiKeyRateLimited, ApiKeyUnavailable, ModelUnavailable
+from .persistence import ApiKeyRecord, CenterStore, Credential, NodeRecord, StoredEvent
+
+logger = logging.getLogger(__name__)
 
 #: How long an SSE connection waits between polls of the service.
 DEFAULT_SSE_POLL_INTERVAL_S = 0.25
@@ -245,16 +258,38 @@ class GatewayServiceProtocol(Protocol):
         *,
         credential: Credential,
         idempotency_key: str,
-        prompt: str,
+        messages: Sequence[ChatMessage],
         authorization: SignedRecord,
         model: str,
         max_charge_milli_credits: int,
+        parameters: Mapping[str, Any] | None = ...,
         delivery_mode: str,
         max_attempts: int,
         deadline_ms: int,
         now: dt.datetime | None = ...,
     ) -> AdmitResult:
         """Admit a new request, idempotently on ``(tenant, idempotency_key)``."""
+        ...
+
+    def admit_api_key_request(
+        self,
+        *,
+        api_key: ApiKeyRecord,
+        messages: Sequence[ChatMessage],
+        model: str,
+        parameters: Mapping[str, Any] | None = ...,
+        delivery_mode: str,
+        deadline_ms: int,
+        now: dt.datetime | None = ...,
+    ) -> AdmitResult:
+        """Admit a request authenticated by an operator-issued API key.
+
+        The second admission path: the spend is authorized by the platform's own
+        signature over the terms it is admitting, because the caller proved it
+        holds a key the center issued rather than a signature it produced. The
+        request it produces is otherwise indistinguishable from a signed one, and
+        runs the same dispatch, metering and settlement.
+        """
         ...
 
     def request_status(self, *, credential: Credential, request_id: str) -> dict[str, Any]:
@@ -394,6 +429,13 @@ _ROUTE_METHODS: dict[str, frozenset[str]] = {
     "account_history": frozenset({"GET"}),
     "node_attempts": frozenset({"GET"}),
     "node_link": frozenset({"GET"}),
+    # The OpenAI-compatible surface. `openai_unsupported` answers both verbs so
+    # an endpoint this platform does not implement reports that, rather than
+    # reporting only that the verb was wrong.
+    "openai_chat_completions": frozenset({"POST"}),
+    "openai_models": frozenset({"GET"}),
+    "openai_model": frozenset({"GET"}),
+    "openai_unsupported": frozenset({"GET", "POST"}),
 }
 
 #: The role each authenticated route demands. A route absent here is a consumer
@@ -405,6 +447,88 @@ _ROUTE_ROLES: dict[str, str] = {
     "node_link": "node",
     "node_attempts": "node",
 }
+
+#: How long an OpenAI-compatible request waits for a terminal state before it
+#: answers `504`. Deliberately longer than the request's own deadline, so the
+#: center's deadline — which ends the request and records why — fires first, and
+#: the answer names a request the caller can still verify instead of the
+#: transport giving up on work the center is still doing.
+OPENAI_WAIT_DEADLINE_S = 110.0
+
+#: The wall-clock budget an OpenAI-compatible request is admitted with.
+OPENAI_REQUEST_DEADLINE_MS = 100_000
+
+#: Events fetched per poll while an OpenAI-compatible answer is rendered.
+OPENAI_EVENT_BATCH = 256
+
+#: What ``GET /openai/v1/models`` reports as the owner of a model. The pool
+#: serves it and no single organisation does, so the platform names itself
+#: rather than inventing a provider.
+OPENAI_MODEL_OWNER = "ai-potluck"
+
+#: OpenAI's error ``type`` for each code this surface answers with, following the
+#: pairings OpenAI's own API reference documents: a condition the caller can act
+#: on is an ``invalid_request_error`` carrying a specific ``code`` (that is how
+#: OpenAI reports `invalid_api_key` and `model_not_found`), a spent quota is
+#: `insufficient_quota`, and a fault of the platform's is a `server_error`. A
+#: client reads the type to decide whether to re-authenticate, back off or give
+#: up, so the mapping is part of the contract rather than a presentation detail.
+#:
+#: Two values here are this platform's own, and `docs/openai-endpoint.md` says so:
+#: ``not_supported``, for an endpoint this center has decided not to implement —
+#: borrowing `invalid_request_error` would suggest a different request could
+#: succeed — and ``rate_limit_error`` for a per-key ceiling, where OpenAI's own
+#: rate-limit errors name the dimension exceeded (`requests`, `tokens`) rather
+#: than the condition, which does not describe a limit one key has hit.
+_OPENAI_ERROR_TYPE: dict[str, str] = {
+    "invalid_api_key": "invalid_request_error",
+    "insufficient_quota": "insufficient_quota",
+    "rate_limit_exceeded": "rate_limit_error",
+    "model_not_found": "invalid_request_error",
+    "not_supported": "not_supported",
+    "not_found": "invalid_request_error",
+    "method_not_allowed": "invalid_request_error",
+    "invalid_request": "invalid_request_error",
+    "upstream_failed": "server_error",
+    "deadline_passed": "server_error",
+    "internal_error": "server_error",
+}
+
+#: Domain exception to the status and code an OpenAI-compatible admission
+#: answers with, most specific first. The codes are OpenAI's own where OpenAI
+#: defines one: a spent quota is `insufficient_quota` at `429`, which is what an
+#: existing client already knows how to report, rather than the `402` the
+#: platform's own surface answers with.
+_OPENAI_ADMISSION_ERROR: tuple[tuple[type[PotluckError], int, str], ...] = (
+    (ApiKeyUnavailable, 401, "invalid_api_key"),
+    (ApiKeyRateLimited, 429, "rate_limit_exceeded"),
+    (InsufficientFundsError, 429, "insufficient_quota"),
+    (ModelUnavailable, 404, "model_not_found"),
+    (CanonicalizationError, 400, "invalid_request"),
+    (ProtocolError, 400, "invalid_request"),
+    (PotluckError, 502, "upstream_failed"),
+)
+
+#: The OpenAI-compatible endpoints this platform has decided not to implement.
+#: Answered with `404` and ``not_supported`` rather than left unrouted, so a
+#: client pointed at the wrong surface is told what is missing instead of
+#: reading a generic `404` as a misconfigured base URL.
+_OPENAI_UNSUPPORTED_ENDPOINTS: frozenset[str] = frozenset({"completions", "embeddings"})
+
+
+def _openai_admission_error(error: PotluckError) -> tuple[int, str]:
+    """Map a domain exception to ``(http_status, openai_error_code)``.
+
+    Args:
+        error: The exception the service raised.
+
+    Returns:
+        The status and code to answer with.
+    """
+    for error_type, status, code in _OPENAI_ADMISSION_ERROR:
+        if isinstance(error, error_type):
+            return status, code
+    return 502, "upstream_failed"
 
 
 def _status_for_error(error: PotluckError) -> tuple[int, str]:
@@ -480,6 +604,17 @@ def _match_route(path: str) -> tuple[str, str] | None:
             return "request_cancel", segments[2]
     if segments[:2] == ["v1", "receipts"] and len(segments) == 3:
         return "receipt", segments[2]
+    if segments[:2] == ["openai", "v1"]:
+        surface = segments[2:]
+        if surface == ["chat", "completions"]:
+            return "openai_chat_completions", ""
+        if surface == ["models"]:
+            return "openai_models", ""
+        if len(surface) == 2 and surface[0] == "models":
+            return "openai_model", surface[1]
+        if len(surface) == 1 and surface[0] in _OPENAI_UNSUPPORTED_ENDPOINTS:
+            return "openai_unsupported", surface[0]
+        return None
     return None
 
 
@@ -587,8 +722,9 @@ class _AdmissionRequest:
     """
 
     idempotency_key: str
-    prompt: str
+    messages: tuple[ChatMessage, ...]
     model: str
+    parameters: dict[str, Any]
     max_charge_milli_credits: int
     delivery_mode: str
     max_attempts: int
@@ -600,22 +736,327 @@ class _AdmissionRequest:
         """Parse an admission body.
 
         Raises:
-            ProtocolError: If the ``authorization`` object is missing or any
-                field is absent or of the wrong type.
+            ProtocolError: If the ``authorization`` object is missing, the
+                ``messages`` array is not a conversation this platform forwards,
+                or any field is absent or of the wrong type.
         """
         authorization = body.get("authorization")
         if not isinstance(authorization, dict):
             raise ProtocolError("the body must carry an authorization object")
         return cls(
             idempotency_key=_require_body_str(body, "idempotency_key"),
-            prompt=_require_body_str(body, "prompt"),
+            messages=parse_chat_messages(body.get("messages")),
             model=_require_body_str(body, "model"),
+            parameters=encode_chat_parameters(body.get("parameters")),
             max_charge_milli_credits=_require_body_int(body, "max_charge_milli_credits"),
             delivery_mode=_require_body_str(body, "delivery_mode"),
             max_attempts=_require_body_int(body, "max_attempts"),
             deadline_ms=_require_body_int(body, "deadline_ms"),
             authorization=_signed_record_from_json(authorization),
         )
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Object hook that refuses a repeated key instead of silently keeping one.
+
+    The OpenAI-compatible surface parses with the standard library, because a
+    client sends fractional parameters the platform's strict parser refuses by
+    design. Refusing duplicates here keeps the one guarantee of that parser this
+    surface still needs: two parsers must not be able to read one body differently.
+
+    Raises:
+        ValueError: If a key appears twice, which `json.loads` reports as-is.
+    """
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        document[key] = value
+    return document
+
+
+@dataclass(frozen=True)
+class _OpenAiChatRequest:
+    """The parts of an OpenAI chat-completions body this platform acts on.
+
+    ``messages`` is the caller's own conversation and reaches the upstream
+    unchanged; ``parameters`` is the subset of the body the platform has decided
+    to forward, in the canonical-safe encoding the wire carries. Every other
+    field is ignored rather than refused: a client that sends something this
+    center has no opinion about has not made a bad request, and a body it cannot
+    honour is not a body it should reject.
+    """
+
+    model: str
+    messages: tuple[ChatMessage, ...]
+    parameters: dict[str, Any]
+    stream: bool
+    #: Whether the caller asked for a terminal usage frame in the stream, which
+    #: is what ``stream_options.include_usage`` means upstream too.
+    include_usage: bool
+
+    @classmethod
+    def from_json(cls, body: dict[str, Any]) -> _OpenAiChatRequest:
+        """Parse an OpenAI chat-completions body.
+
+        Raises:
+            ProtocolError: If the model is missing, the messages are not a
+                conversation, a forwarded parameter has the wrong type, `stream`
+                or `stream_options.include_usage` is not a boolean, or the body
+                carries a value the canonical encoder cannot forward.
+        """
+        messages = parse_chat_messages(body.get("messages"))
+        parameters = encode_chat_parameters(body)
+        stream = body.get("stream", False)
+        if not isinstance(stream, bool):
+            raise ProtocolError("stream must be a boolean")
+        include_usage = False
+        options = body.get("stream_options")
+        if options is not None:
+            if not isinstance(options, dict):
+                raise ProtocolError("stream_options must be a JSON object")
+            include_usage = options.get("include_usage", False)
+            if not isinstance(include_usage, bool):
+                raise ProtocolError("stream_options.include_usage must be a boolean")
+        # The canonical encoder refuses a float, and a body may carry one inside
+        # a content part or a structured parameter. Refusing it here answers
+        # `400` and names the problem, instead of failing halfway through
+        # dispatch with an answer that says nothing about the body.
+        try:
+            canonicalize([message.to_payload() for message in messages])
+            canonicalize(parameters)
+        except CanonicalizationError as exc:
+            raise ProtocolError(
+                f"the request carries a value this center cannot forward: {exc}"
+            ) from exc
+        return cls(
+            model=_require_body_str(body, "model"),
+            messages=messages,
+            parameters=parameters,
+            stream=stream,
+            include_usage=include_usage,
+        )
+
+
+@dataclass(frozen=True)
+class _OpenAiCompletion:
+    """The identity of one rendered completion, fixed before its first frame.
+
+    Every frame of one answer carries the same id, model and creation instant,
+    which is what lets a client match a stream to the request that started it.
+    """
+
+    id: str
+    created: int
+    model: str
+
+    @classmethod
+    def new(cls, model: str) -> _OpenAiCompletion:
+        """Mint the identity for one completion."""
+        return cls(
+            id=f"chatcmpl-{secrets.token_hex(12)}",
+            created=int(time.time()),
+            model=model,
+        )
+
+
+@dataclass(frozen=True)
+class _OpenAiWaitResult:
+    """How one OpenAI-compatible wait for a terminal state ended.
+
+    The outcomes are kept apart because they answer differently: a request that
+    failed is a `502`, one the center is still running when the window closes is
+    a `504` naming the request to check later, a service that could not be read
+    at all is a `502` carrying its own detail, and a caller that hung up is
+    nobody's error and gets no answer at all.
+    """
+
+    #: The terminal request status, or `None` when the window closed first.
+    status: str | None
+    #: The settled token counts, or `None` when nothing was reported.
+    usage: dict[str, int] | None
+    #: The detail of a service failure that ended the wait, if any.
+    error: str | None
+    #: The answer rendered so far, complete only for a terminal success.
+    content: str = ""
+    #: The center's own reason for a terminal state, when it recorded one.
+    billing_note: str | None = None
+    #: Whether the caller hung up before the answer was rendered.
+    abandoned: bool = False
+
+
+def _openai_unfinished_message(
+    status: str | None, billing_note: str | None, request_id: str
+) -> str:
+    """Explain a request this connection stopped waiting for.
+
+    The request id is the point of the message: the work may still be running,
+    it is charged only if it settles, and the id is what the center's own books,
+    and an operator's `verify receipt`, answer against.
+    """
+    state = "did not reach a terminal state" if status is None else f"ended as {status}"
+    note = f" ({billing_note})" if billing_note else ""
+    return (
+        f"request {request_id} {state} within "
+        f"{int(OPENAI_WAIT_DEADLINE_S)}s{note}; it may still be running and is "
+        "charged only if it settles. Quote this request id to the center's "
+        "operator, who can verify what it cost with `potluck-server verify "
+        "receipt`."
+    )
+
+
+def _openai_failed_message(billing_note: str | None, request_id: str) -> str:
+    """Explain a request the center ended in failure.
+
+    The center's own `billing_note` is carried through rather than replaced by a
+    generic "upstream failure": the reason a request failed lives at the center,
+    and hiding it is what makes an exhausted upstream quota look like an outage.
+    """
+    note = f": {billing_note}" if billing_note else ""
+    return (
+        f"the center reported request {request_id} as FAILED{note}. Nothing was "
+        "charged for a request that produced no answer; the receipt for one that "
+        "did is verifiable by this request id."
+    )
+
+
+def _openai_chunk(
+    completion: _OpenAiCompletion,
+    *,
+    delta: dict[str, Any] | None,
+    finish_reason: str | None,
+    usage: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Render one ``chat.completion.chunk`` document.
+
+    A terminal usage frame carries no choices, which is how OpenAI marks it as
+    the totals rather than an empty increment.
+    """
+    choices: list[dict[str, Any]] = []
+    if delta is not None or finish_reason is not None:
+        choices.append(
+            {
+                "index": 0,
+                "delta": delta or {},
+                "finish_reason": finish_reason,
+                "logprobs": None,
+            }
+        )
+    document: dict[str, Any] = {
+        "id": completion.id,
+        "object": "chat.completion.chunk",
+        "created": completion.created,
+        "model": completion.model,
+        "choices": choices,
+    }
+    if usage is not None:
+        document["usage"] = usage
+    return document
+
+
+def _openai_completion_document(
+    completion: _OpenAiCompletion, content: str, usage: dict[str, int] | None
+) -> dict[str, Any]:
+    """Render one ``chat.completion`` document.
+
+    `finish_reason` is ``stop`` because this answer is complete: the center only
+    renders a completion for a request that reached its terminal success, and a
+    request that was cut short is an error rather than a short answer.
+    """
+    document: dict[str, Any] = {
+        "id": completion.id,
+        "object": "chat.completion",
+        "created": completion.created,
+        "model": completion.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content, "refusal": None},
+                "finish_reason": "stop",
+                "logprobs": None,
+            }
+        ],
+    }
+    if usage is not None:
+        document["usage"] = usage
+    return document
+
+
+def _measurement_split(payload: dict[str, Any]) -> dict[str, int] | None:
+    """Return the input/output token split of a stored ``usage.final`` payload.
+
+    Returns `None` when the event carries no readable split, so a caller can
+    leave the halves at zero rather than invent them from the billed total.
+    """
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    input_total = usage.get("input_total")
+    output_total = usage.get("output_total")
+    if not isinstance(input_total, int) or not isinstance(output_total, int):
+        return None
+    return {"prompt_tokens": input_total, "completion_tokens": output_total}
+
+
+def _settled_tokens(status: dict[str, Any]) -> int | None:
+    """Return the token total the center billed for the request's winning attempt."""
+    selected = status.get("selected_attempt_id")
+    attempts = status.get("attempts")
+    if not isinstance(attempts, list):
+        return None
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or attempt.get("attempt_id") != selected:
+            continue
+        tokens = attempt.get("usage_tokens")
+        return tokens if isinstance(tokens, int) else None
+    return None
+
+
+def _openai_usage(status: dict[str, Any], split: dict[str, int] | None) -> dict[str, int]:
+    """Render the settlement's token counts as an OpenAI ``usage`` block.
+
+    ``total_tokens`` is what the center actually billed — the settled total on
+    the winning attempt's own row — rather than a sum of the two halves, so the
+    number a caller reads is the number the receipt behind it names. The split
+    comes from the node's final measurement, and stays zero when it reported
+    none: guessing a proportion would be a fabricated number in a billing
+    document.
+    """
+    prompt_tokens = split["prompt_tokens"] if split else 0
+    completion_tokens = split["completion_tokens"] if split else 0
+    settled = _settled_tokens(status)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": settled if settled is not None else prompt_tokens + completion_tokens,
+    }
+
+
+def _openai_model_documents(records: list[NodeRecord]) -> dict[str, dict[str, Any]]:
+    """Aggregate the models the connected, sharing nodes advertise.
+
+    A model no node is sharing is left out rather than listed: the list is what
+    a client picks a model from, and advertising one nobody will run turns a
+    typo into a request that waits for its deadline.
+
+    ``created`` is the instant the pool last advertised the model. The center
+    holds no model registration date, and a real timestamp it does have is more
+    useful than a zero that only looks like one.
+    """
+    models: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not record.share_enabled:
+            continue
+        seen = int(record.last_seen_at.timestamp())
+        existing = models.get(record.model)
+        if existing is None or seen > int(existing["created"]):
+            models[record.model] = {
+                "id": record.model,
+                "object": "model",
+                "created": seen,
+                "owned_by": OPENAI_MODEL_OWNER,
+            }
+    return models
 
 
 def _node_to_json(record: NodeRecord) -> dict[str, Any]:
@@ -1271,6 +1712,15 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
     #: service, which receives the resolved `Credential` instead.
     _presented_token: str | None = None
 
+    #: Whether this request arrived on the OpenAI-compatible surface, which
+    #: authenticates with an API key and answers errors in OpenAI's shape rather
+    #: than the platform's.
+    _openai_surface: bool = False
+
+    #: The status and code of the refusal this request was answered with, so the
+    #: structured log line names the real outcome rather than a guess.
+    _openai_refusal: tuple[int, str] | None = None
+
     #: Whether a response status line has already left this handler.
     _answered: bool = False
 
@@ -1316,19 +1766,27 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _dispatch(self) -> None:
         """Resolve the route, authenticate, serve, and always answer."""
-        # A new request on a kept-alive connection must not see the previous
-        # request's buffered body, which a signed request reads before its
-        # handler does.
+        # This handler object outlives one request: a kept-alive connection is
+        # served by the same instance, so every piece of per-request state has to
+        # be reset here or the next request inherits it. A stale `_answered` would
+        # silence the refusal this request owes its caller, a stale buffered body
+        # would be read as this request's own, and a stale presented token would
+        # redact against the wrong material — which is how the credential *this*
+        # request presented would survive into an error message.
         self._cached_body = None
+        self._answered = False
+        self._presented_token = None
+        self._openai_refusal = None
         target = urllib.parse.urlsplit(self.path)
+        self._openai_surface = target.path.startswith("/openai/")
         matched = _match_route(target.path)
         if matched is None:
-            self._fail(404, "not_found", "no endpoint matches this path")
+            self._refuse(404, "not_found", "no endpoint matches this path")
             return
         route, parameter = matched
         allowed = _ROUTE_METHODS[route]
         if self.command not in allowed:
-            self._fail(
+            self._refuse(
                 405,
                 "method_not_allowed",
                 f"{self.command} is not allowed on this endpoint",
@@ -1343,6 +1801,13 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 # The invite code is its own credential: joining is the one
                 # endpoint that must work before any identity exists.
                 self._handle_join()
+                return
+            if self._openai_surface:
+                # The OpenAI-compatible surface authenticates with an
+                # operator-issued API key rather than with a credential or a
+                # per-request signature, so it is routed before `_authenticate`
+                # and owns its own error shape.
+                self._serve_openai_route(route, parameter)
                 return
             credential = self._authenticate(_ROUTE_ROLES.get(route, "consumer"))
             if credential is None:
@@ -1359,7 +1824,9 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             # Last resort: the gateway answers every request it accepted. The
             # detail is a constant, so an unexpected failure cannot echo a
             # credential or an internal path back to the caller.
-            self._fail(500, "internal_error", "the gateway failed to answer the request")
+            self._refuse(
+                500, "internal_error", "the gateway failed to answer the request"
+            )
 
     def _handle_join(self) -> None:
         """Serve ``POST /v1/join``: redeem an invite for an identity.
@@ -1452,9 +1919,10 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             lambda: self._gw.service.admit_request(
                 credential=credential,
                 idempotency_key=admission.idempotency_key,
-                prompt=admission.prompt,
+                messages=admission.messages,
                 authorization=admission.authorization,
                 model=admission.model,
+                parameters=admission.parameters,
                 max_charge_milli_credits=admission.max_charge_milli_credits,
                 delivery_mode=admission.delivery_mode,
                 max_attempts=admission.max_attempts,
@@ -1928,6 +2396,37 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         self._cached_body = body
         return body
 
+    def _drain_unread_body(self) -> None:
+        """Consume a request body no handler read, so keep-alive stays usable.
+
+        A refusal can happen before anything read the body — an unknown
+        credential, an unusable API key, a route that answers `405` — and those
+        bytes are then still in the socket when the next request line is read,
+        which parses as a malformed request rather than as the request it is.
+        HTTP/1.1 leaves two ways out: drain the body, or close. Draining is the
+        one that keeps a connection an SDK is reusing alive, so it is the default
+        whenever the length says it is bounded; anything else closes.
+
+        This never answers: a refusal has already been decided by the caller, and
+        a second response on one connection is a protocol violation of its own.
+        """
+        if self.command not in ("POST", "PUT", "PATCH") or self._cached_body is not None:
+            return
+        declared = self.headers.get("Content-Length")
+        if declared is None or not declared.strip().isdigit():
+            # No length means the body is delimited by the peer closing its write
+            # side, which is not something to wait for inside a response.
+            self.close_connection = True
+            return
+        length = int(declared.strip())
+        if length > MAX_HTTP_BODY_BYTES:
+            # The handler already refused this body; its bytes are never coming
+            # out of the socket in a bounded read, so the connection ends here.
+            self.close_connection = True
+            return
+        with contextlib.suppress(OSError):
+            self.rfile.read(length)
+
     def _respond(
         self, status: int, payload: Any, *, headers: dict[str, str] | None = None
     ) -> None:
@@ -1938,6 +2437,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             payload: The response body, which must survive canonicalization.
             headers: Extra response headers, such as ``Allow``.
         """
+        self._drain_unread_body()
         body = canonicalize(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1967,6 +2467,720 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             status,
             {"error": code, "detail": _redact(detail, self._presented_token)},
             headers=headers,
+        )
+
+    def _refuse(
+        self,
+        status: int,
+        code: str,
+        detail: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        """Answer a refusal in the shape the surface it arrived on expects.
+
+        One gateway serves two surfaces, and a client parses errors in the shape
+        its own library emits: an OpenAI-compatible caller gets OpenAI's error
+        object, a platform caller gets the platform's. The status and the reason
+        are the same either way, so this is a rendering choice and not a second
+        policy.
+        """
+        if self._openai_surface:
+            self._openai_fail(status, code, detail, headers=headers)
+        else:
+            self._fail(status, code, detail, headers=headers)
+
+    # -- the OpenAI-compatible surface ---------------------------------------
+
+    def _serve_openai_route(self, route: str, parameter: str) -> None:
+        """Serve one endpoint of the OpenAI-compatible surface.
+
+        Every route here is authenticated by `_openai_api_key` inside the
+        handler, because the material it presents is an API key rather than a
+        credential or a signature and resolves to a different record.
+        """
+        if route == "openai_chat_completions":
+            self._handle_openai_chat_completions()
+        elif route == "openai_models":
+            self._handle_openai_models(None)
+        elif route == "openai_model":
+            self._handle_openai_models(parameter)
+        else:
+            self._handle_openai_unsupported(parameter)
+
+    def _openai_fail(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        request_id: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        """Send an error in OpenAI's shape, or close if a response has started.
+
+        The `request_id` rides along in the body *and* in an ``x-request-id``
+        header whenever the center has one, because the two answers a caller
+        cannot act on are "it failed" and "it might still be running": a request
+        that outlived this connection is still on the books, still settleable,
+        and still verifiable by the id printed here.
+
+        Args:
+            status: The HTTP status to answer with.
+            code: The machine-readable code, mapped to OpenAI's `type`.
+            message: Explanation, redacted against the presented key.
+            request_id: The center's request id, when one exists.
+            headers: Extra response headers.
+        """
+        if self._answered:
+            self.close_connection = True
+            return
+        error: dict[str, Any] = {
+            "message": _redact(message, self._presented_token),
+            "type": _OPENAI_ERROR_TYPE.get(code, "api_error"),
+            "code": code,
+            "param": None,
+        }
+        if request_id is not None:
+            error["request_id"] = request_id
+            headers = {**(headers or {}), "x-request-id": request_id}
+        self._respond(status, {"error": error}, headers=headers)
+
+    def _openai_error_frame(
+        self, status: int, code: str, message: str, request_id: str | None
+    ) -> None:
+        """Write an error as the last frames of a stream that has already started.
+
+        Once the `200` and the SSE headers have gone out there is no status left
+        to answer with, so the failure is carried in the stream itself. `[DONE]`
+        still terminates it, as it does for every other OpenAI-compatible server:
+        the terminator says the stream is over, not that the completion succeeded,
+        and a client whose read loop waits for it would otherwise sit on a closed
+        socket wondering whether more was coming. The error frame before it is
+        what says the answer is not.
+        """
+        error: dict[str, Any] = {
+            "message": _redact(message, self._presented_token),
+            "type": _OPENAI_ERROR_TYPE.get(code, "api_error"),
+            "code": code,
+            "param": None,
+        }
+        if request_id is not None:
+            error["request_id"] = request_id
+        with contextlib.suppress(OSError):
+            self.wfile.write(b"data: " + canonicalize({"error": error}) + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+        self.close_connection = True
+
+    def _openai_api_key(self) -> ApiKeyRecord | None:
+        """Resolve the API key this request presented.
+
+        Returns:
+            The key record, or `None` after a `401` has been sent. One answer
+            covers a missing header, another scheme, an unknown key, a revoked
+            key, an expired one and one whose subject was revoked: the response
+            cannot be used to probe which keys the center has issued.
+        """
+        token = _bearer_token(self.headers.get("Authorization"))
+        if token is None:
+            self._openai_fail(
+                401,
+                "invalid_api_key",
+                "an Authorization: Bearer <api key> header is required; mint one "
+                "with `potluck-server admin api-key`",
+            )
+            return None
+        # Held only so a detail rendered back can be redacted against it. The
+        # plaintext never reaches the service, which is handed the record.
+        self._presented_token = token
+        key = self._gw.service.store.resolve_api_key(token, dt.datetime.now(dt.UTC))
+        if key is None:
+            self._openai_fail(401, "invalid_api_key", "the presented API key is not usable")
+            return None
+        return key
+
+    def _openai_body(self) -> dict[str, Any] | None:
+        """Read and parse an OpenAI-shaped request body.
+
+        Parsed with the standard library rather than `canonical.loads_strict`.
+        The strict parser refuses every fractional number, which is right for a
+        payload somebody signs — an amount that can be encoded two ways is not an
+        amount — and wrong for this surface, where `"temperature": 0.7` is what
+        every OpenAI client sends. Duplicate keys are still refused, the body is
+        still capped by `_read_body`, and anything the platform goes on to store,
+        digest or forward is canonicalized at the boundary and refused there.
+
+        Returns:
+            The parsed object, or `None` after a `400` has been sent.
+        """
+        raw = self._read_body()
+        if raw is None:
+            return None
+        try:
+            parsed = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._openai_fail(400, "invalid_request", f"the body is not valid JSON: {exc}")
+            return None
+        if not isinstance(parsed, dict):
+            self._openai_fail(400, "invalid_request", "the body must be a JSON object")
+            return None
+        return cast("dict[str, Any]", parsed)
+
+    def _handle_openai_unsupported(self, endpoint: str) -> None:
+        """Answer `404` for an OpenAI endpoint this platform does not implement.
+
+        Named rather than left unrouted: a tool pointed at this center and asking
+        for embeddings is told that the platform serves chat completions and the
+        model list, instead of reading a generic `404` as a wrong base URL and
+        retrying every path it can think of.
+        """
+        started = time.monotonic()
+        key = self._openai_api_key()
+        if key is None:
+            self._log_openai_request(
+                endpoint=f"openai_{endpoint}",
+                key=None,
+                model=None,
+                outcome="refused:invalid_api_key",
+                status=401,
+                started_at=started,
+            )
+            return
+        self._openai_fail(
+            404,
+            "not_supported",
+            f"this center does not implement /openai/v1/{endpoint}; it serves "
+            "POST /openai/v1/chat/completions and GET /openai/v1/models",
+        )
+        self._log_openai_request(
+            endpoint=f"openai_{endpoint}",
+            key=key,
+            model=None,
+            outcome="not_supported",
+            status=404,
+            started_at=started,
+        )
+
+    def _handle_openai_models(self, model_id: str | None) -> None:
+        """Serve ``GET /openai/v1/models`` and ``GET /openai/v1/models/{id}``.
+
+        The list is aggregated from the registrations the center actually holds,
+        so it names what the pool can run right now rather than a catalogue
+        somebody maintained. That is also why an unknown id is a `404` naming the
+        models that do exist: a client that picks from this list and a client that
+        guesses a name get the same truthful answer.
+        """
+        started = time.monotonic()
+        key = self._openai_api_key()
+        if key is None:
+            self._log_openai_request(
+                endpoint="openai_models",
+                key=None,
+                model=model_id,
+                outcome="refused:invalid_api_key",
+                status=401,
+                started_at=started,
+            )
+            return
+        records = self._call_openai_service(
+            lambda: self._gw.service.store.connected_nodes()
+        )
+        if records is None:
+            return
+        models = _openai_model_documents(records)
+        if model_id is not None:
+            document = models.get(model_id)
+            if document is None:
+                self._openai_fail(
+                    404,
+                    "model_not_found",
+                    f"no connected contribution node runs model {model_id!r}; the "
+                    f"models this center can serve are {sorted(models)}",
+                )
+                self._log_openai_request(
+                    endpoint="openai_models",
+                    key=key,
+                    model=model_id,
+                    outcome="model_not_found",
+                    status=404,
+                    started_at=started,
+                )
+                return
+            self._respond(200, document)
+            self._log_openai_request(
+                endpoint="openai_models",
+                key=key,
+                model=model_id,
+                outcome="ok",
+                status=200,
+                started_at=started,
+            )
+            return
+        self._respond(
+            200, {"object": "list", "data": [models[name] for name in sorted(models)]}
+        )
+        self._log_openai_request(
+            endpoint="openai_models",
+            key=key,
+            model=None,
+            outcome="ok",
+            status=200,
+            started_at=started,
+        )
+
+    def _handle_openai_chat_completions(self) -> None:
+        """Serve ``POST /openai/v1/chat/completions``.
+
+        One admitted request, rendered either as a single ``chat.completion`` or
+        as an SSE stream of ``chat.completion.chunk`` frames. The two differ only
+        in how the same stored events are handed back: both wait for the center's
+        own terminal state inside `OPENAI_WAIT_DEADLINE_S`, and both report the
+        settled token counts, so a caller cannot get a different bill for asking
+        for a stream.
+        """
+        started = time.monotonic()
+        key = self._openai_api_key()
+        if key is None:
+            self._log_openai_request(
+                endpoint="openai_chat_completions",
+                key=None,
+                model=None,
+                outcome="refused:invalid_api_key",
+                status=401,
+                started_at=started,
+            )
+            return
+        body = self._openai_body()
+        if body is None:
+            self._log_openai_request(
+                endpoint="openai_chat_completions",
+                key=key,
+                model=None,
+                outcome="refused:invalid_request",
+                status=400,
+                started_at=started,
+            )
+            return
+        try:
+            request = _OpenAiChatRequest.from_json(body)
+        except ProtocolError as exc:
+            self._openai_fail(400, "invalid_request", str(exc))
+            self._log_openai_request(
+                endpoint="openai_chat_completions",
+                key=key,
+                model=None,
+                outcome="refused:invalid_request",
+                status=400,
+                started_at=started,
+            )
+            return
+        admitted = self._call_openai_service(
+            lambda: self._gw.service.admit_api_key_request(
+                api_key=key,
+                messages=request.messages,
+                model=request.model,
+                parameters=request.parameters,
+                delivery_mode="stream_strict" if request.stream else "buffered_complete",
+                deadline_ms=OPENAI_REQUEST_DEADLINE_MS,
+            )
+        )
+        if admitted is None:
+            status, code = self._openai_refusal or (502, "upstream_failed")
+            self._log_openai_request(
+                endpoint="openai_chat_completions",
+                key=key,
+                model=request.model,
+                outcome=f"refused:{code}",
+                status=status,
+                started_at=started,
+            )
+            return
+        credential = Credential(
+            tenant_id=key.tenant_id, subject_id=key.subject_id, role="consumer"
+        )
+        completion = _OpenAiCompletion.new(request.model)
+        if request.stream:
+            self._stream_openai_completion(
+                credential=credential,
+                completion=completion,
+                request_id=admitted.request_id,
+                include_usage=request.include_usage,
+                key=key,
+                started_at=started,
+            )
+        else:
+            self._buffer_openai_completion(
+                credential=credential,
+                completion=completion,
+                request_id=admitted.request_id,
+                key=key,
+                started_at=started,
+            )
+
+
+    def _call_openai_service(self, call: Callable[[], _T]) -> _T | None:
+        """Run one service call for the OpenAI surface, mapping a failure to it.
+
+        The platform's own surface maps a domain exception through
+        `_status_for_error`; this one maps it through `_openai_admission_error`,
+        because the codes a client reads here are OpenAI's. The status and code
+        are recorded on the handler so the request's log line names the outcome it
+        actually got rather than a guess.
+
+        Returns:
+            The service's result, or `None` after a response has been sent.
+        """
+        try:
+            return call()
+        except PotluckError as exc:
+            status, code = _openai_admission_error(exc)
+            self._openai_refusal = (status, code)
+            self._openai_fail(status, code, str(exc))
+            return None
+
+    def _log_openai_request(
+        self,
+        *,
+        endpoint: str,
+        key: ApiKeyRecord | None,
+        model: str | None,
+        outcome: str,
+        status: int,
+        request_id: str | None = None,
+        usage: dict[str, int] | None = None,
+        started_at: float,
+    ) -> None:
+        """Emit the one structured line this request is represented by.
+
+        A single canonical JSON document per request, so an operator can grep a
+        center's log for one key, one subject or one model and read the token
+        counts and the outcome without reconstructing them from the books. The
+        key is named by its id and never by its value: the plaintext is
+        credential material, and a log is exactly where such material must not
+        accumulate. `latency_ms` is this connection's own view, from the first
+        byte of the request to the moment the answer was decided.
+        """
+        counts = usage or {}
+        document: dict[str, Any] = {
+            "endpoint": endpoint,
+            "request_id": request_id,
+            "key_id": key.key_id if key is not None else None,
+            "subject_id": key.subject_id if key is not None else None,
+            "model": model,
+            "prompt_tokens": counts.get("prompt_tokens"),
+            "completion_tokens": counts.get("completion_tokens"),
+            "total_tokens": counts.get("total_tokens"),
+            "latency_ms": round((time.monotonic() - started_at) * 1000),
+            "outcome": outcome,
+            "status": status,
+        }
+        logger.info("%s", canonicalize(document).decode("utf-8"))
+
+    def _openai_write_frame(self, document: dict[str, Any]) -> bool:
+        """Write one SSE data frame.
+
+        Returns:
+            True when the frame went out, False when the peer is gone — which
+            ends the wait rather than rendering an answer nobody is reading.
+        """
+        try:
+            self.wfile.write(b"data: " + canonicalize(document) + b"\n\n")
+            return True
+        except OSError:
+            return False
+
+    def _openai_wait(
+        self,
+        credential: Credential,
+        request_id: str,
+        *,
+        on_delta: Callable[[str], bool] | None,
+    ) -> _OpenAiWaitResult:
+        """Poll one request to a terminal state, rendering increments as they commit.
+
+        The center's event store is the source of truth and the cursor is tracked
+        here, so an increment is rendered exactly once however many polls it takes
+        to notice it, and a request that produced its whole answer before the
+        first poll is rendered exactly once too. Only events the center committed
+        as this request's output are read: a superseded attempt's deltas are
+        refused at commit time, so nothing here can splice two answers.
+
+        Args:
+            credential: The key's subject, which scopes the reads to its tenant.
+            request_id: The admitted request.
+            on_delta: Called with each committed increment; a `False` return
+                means the peer is gone and the wait ends.
+
+        Returns:
+            How the wait ended.
+        """
+        deadline = time.monotonic() + OPENAI_WAIT_DEADLINE_S
+        cursor = 0
+        split: dict[str, int] | None = None
+        parts: list[str] = []
+
+        def drain() -> bool:
+            """Render every committed event after the cursor.
+
+            Returns:
+                False when the peer has gone and the wait must end.
+            """
+            nonlocal cursor, split
+            while True:
+                events = self._gw.service.request_events(
+                    credential=credential,
+                    request_id=request_id,
+                    cursor=cursor,
+                    limit=OPENAI_EVENT_BATCH,
+                )
+                if not events:
+                    return True
+                for event in events:
+                    cursor = event.cursor
+                    if event.event_type == "output.delta":
+                        text = str(event.payload.get("text", ""))
+                        if not text:
+                            continue
+                        parts.append(text)
+                        if on_delta is not None and not on_delta(text):
+                            return False
+                    elif event.event_type == "usage.final":
+                        split = _measurement_split(event.payload) or split
+
+        def ended(
+            status: str | None = None,
+            usage: dict[str, int] | None = None,
+            error: str | None = None,
+            billing_note: str | None = None,
+            abandoned: bool = False,
+        ) -> _OpenAiWaitResult:
+            """Build the result, carrying the answer rendered so far."""
+            return _OpenAiWaitResult(
+                status=status,
+                usage=usage,
+                error=error,
+                content="".join(parts),
+                billing_note=billing_note,
+                abandoned=abandoned,
+            )
+
+        while True:
+            try:
+                if not drain():
+                    return ended(abandoned=True)
+                status = self._gw.service.request_status(
+                    credential=credential, request_id=request_id
+                )
+                value = status.get("status")
+                if isinstance(value, str) and value in TERMINAL_REQUEST_STATES:
+                    # The events committed together with the terminal state — a
+                    # final delta, the usage report — are still ahead of the
+                    # cursor, and an answer missing its last increment is a wrong
+                    # answer rather than a short one.
+                    if not drain():
+                        return ended(abandoned=True)
+                    note = status.get("billing_note")
+                    return ended(
+                        status=value,
+                        usage=_openai_usage(status, split),
+                        billing_note=note if isinstance(note, str) else None,
+                    )
+            except PotluckError as exc:
+                return ended(
+                    error=_redact(str(exc), self._presented_token),
+                )
+            if time.monotonic() >= deadline:
+                return ended()
+            if _peer_closed(self.connection):
+                return ended(abandoned=True)
+            time.sleep(DEFAULT_SSE_POLL_INTERVAL_S)
+
+    def _buffer_openai_completion(
+        self,
+        *,
+        credential: Credential,
+        completion: _OpenAiCompletion,
+        request_id: str,
+        key: ApiKeyRecord,
+        started_at: float,
+    ) -> None:
+        """Answer with one ``chat.completion`` once the request is terminal.
+
+        The whole answer is held until the center reports it complete, which is
+        what `stream: false` promises: calling this streaming would be a lie
+        about how the answer was delivered.
+
+        The log line is written before the response, so a caller that has an
+        answer in hand is guaranteed the line describing it is already in the
+        log. `latency_ms` therefore measures the work rather than the flush.
+        """
+        result = self._openai_wait(credential, request_id, on_delta=None)
+        if result.abandoned:
+            self.close_connection = True
+            self._log_openai_request(
+                endpoint="openai_chat_completions",
+                key=key,
+                model=completion.model,
+                outcome="client_gone",
+                status=0,
+                request_id=request_id,
+                started_at=started_at,
+            )
+            return
+        if result.error is not None:
+            status, code = 502, "upstream_failed"
+            message, outcome = result.error, "refused:upstream_failed"
+        elif result.status == "SUCCEEDED":
+            status, code = 200, ""
+            message, outcome = "", "SUCCEEDED"
+        elif result.status == "FAILED":
+            status, code = 502, "upstream_failed"
+            message = _openai_failed_message(result.billing_note, request_id)
+            outcome = "FAILED"
+        else:
+            status, code = 504, "deadline_passed"
+            message = _openai_unfinished_message(
+                result.status, result.billing_note, request_id
+            )
+            outcome = result.status or "deadline_passed"
+        self._log_openai_request(
+            endpoint="openai_chat_completions",
+            key=key,
+            model=completion.model,
+            outcome=outcome,
+            status=status,
+            request_id=request_id,
+            usage=result.usage,
+            started_at=started_at,
+        )
+        if status == 200:
+            self._respond(
+                200,
+                _openai_completion_document(completion, result.content, result.usage),
+                headers={"x-request-id": request_id},
+            )
+        else:
+            self._openai_fail(status, code, message, request_id=request_id)
+
+    def _stream_openai_completion(
+        self,
+        *,
+        credential: Credential,
+        completion: _OpenAiCompletion,
+        request_id: str,
+        include_usage: bool,
+        key: ApiKeyRecord,
+        started_at: float,
+    ) -> None:
+        """Render the answer as an SSE stream of ``chat.completion.chunk`` frames.
+
+        The `200` and the SSE headers are held until the first increment exists
+        or the request is terminal, so a request that fails before producing
+        anything is answered with the status it deserves — `502`, `504` — rather
+        than a `200` carrying an error inside a stream. Once a frame has gone out
+        there is no status left to change, and a later failure travels as an error
+        frame followed by the stream's terminator.
+
+        The frames are OpenAI's own order: the role, the content increments, the
+        finish reason, and — only when the caller asked with
+        `stream_options.include_usage` — a terminal frame carrying the settled
+        counts.
+        """
+        started = False
+
+        def begin() -> None:
+            """Send the SSE headers and the role frame, once."""
+            nonlocal started
+            if started:
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.send_header("x-request-id", request_id)
+            self.end_headers()
+            self.close_connection = True
+            self._answered = True
+            started = True
+            self._openai_write_frame(
+                _openai_chunk(
+                    completion,
+                    delta={"role": "assistant", "content": ""},
+                    finish_reason=None,
+                )
+            )
+
+        def render(text: str) -> bool:
+            """Write one content increment; False when the peer is gone."""
+            begin()
+            return self._openai_write_frame(
+                _openai_chunk(completion, delta={"content": text}, finish_reason=None)
+            )
+
+        result = self._openai_wait(credential, request_id, on_delta=render)
+        if result.abandoned:
+            self.close_connection = True
+            self._log_openai_request(
+                endpoint="openai_chat_completions",
+                key=key,
+                model=completion.model,
+                outcome="client_gone",
+                status=200 if started else 0,
+                request_id=request_id,
+                started_at=started_at,
+            )
+            return
+        if result.error is None and result.status == "SUCCEEDED":
+            # Logged before the terminator is written, so a client that saw
+            # `[DONE]` is reading a stream whose line is already in the log.
+            self._log_openai_request(
+                endpoint="openai_chat_completions",
+                key=key,
+                model=completion.model,
+                outcome="SUCCEEDED",
+                status=200,
+                request_id=request_id,
+                usage=result.usage,
+                started_at=started_at,
+            )
+            begin()
+            self._openai_write_frame(
+                _openai_chunk(completion, delta={}, finish_reason="stop")
+            )
+            if include_usage and result.usage is not None:
+                self._openai_write_frame(
+                    _openai_chunk(
+                        completion, delta=None, finish_reason=None, usage=result.usage
+                    )
+                )
+            with contextlib.suppress(OSError):
+                self.wfile.write(b"data: [DONE]\n\n")
+            return
+        if result.error is not None:
+            status, code, message = 502, "upstream_failed", result.error
+        elif result.status == "FAILED":
+            status = 502
+            code = "upstream_failed"
+            message = _openai_failed_message(result.billing_note, request_id)
+        else:
+            status = 504
+            code = "deadline_passed"
+            message = _openai_unfinished_message(
+                result.status, result.billing_note, request_id
+            )
+        if started:
+            self._openai_error_frame(status, code, message, request_id)
+        else:
+            self._openai_fail(status, code, message, request_id=request_id)
+        self._log_openai_request(
+            endpoint="openai_chat_completions",
+            key=key,
+            model=completion.model,
+            outcome=result.status or code,
+            status=status,
+            request_id=request_id,
+            usage=result.usage,
+            started_at=started_at,
         )
 
 

@@ -349,10 +349,14 @@ class _SlowBufferedAdapter(FakeUpstreamAdapter):
         super().__init__(upstream=upstream, model=model)
         self._delay_s = delay_s
 
-    def complete(self, prompt: str, *, request_digest: str) -> Any:
+    def complete(
+        self, messages: Any, *, request_digest: str, parameters: Any
+    ) -> Any:
         """Pause, then return the scripted response like the base adapter."""
         time.sleep(self._delay_s)
-        return super().complete(prompt, request_digest=request_digest)
+        return super().complete(
+            messages, request_digest=request_digest, parameters=parameters
+        )
 
 
 # --------------------------------------------------------------------------

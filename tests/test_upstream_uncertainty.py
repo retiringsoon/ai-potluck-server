@@ -64,7 +64,7 @@ from typing import Any
 
 import pytest
 from aipotluck.adapters import AdapterOutcomeUnknown, AdapterResult
-from aipotluck.canonical import canonical_digest, sign_payload
+from aipotluck.canonical import sign_payload
 from aipotluck.connector import Connector, ConnectorConfig
 from aipotluck.identity import generate_key_pair, load_private_key
 from aipotluck.metering import Measurement, NormalizedUsage
@@ -86,6 +86,8 @@ from aipotluck.wire import (
     NodeHello,
     NodePolicy,
     compute_acceptance_hash,
+    compute_request_digest,
+    user_message,
 )
 from conftest import Keyring
 
@@ -116,9 +118,11 @@ class _TimingOutAdapter:
     calls: int = 0
     detail: str = "upstream read timed out after the request was sent"
 
-    def complete(self, prompt: str, *, request_digest: str) -> AdapterResult:
+    def complete(
+        self, messages: Any, *, request_digest: str, parameters: Any
+    ) -> AdapterResult:
         """Record the call, then fail as a lost response does."""
-        del prompt, request_digest
+        del messages, request_digest, parameters
         self.calls += 1
         raise AdapterOutcomeUnknown(self.detail)
 
@@ -132,9 +136,11 @@ class _UsageLessAdapter:
     supports_streaming: bool = False
     calls: int = 0
 
-    def complete(self, prompt: str, *, request_digest: str) -> AdapterResult:
+    def complete(
+        self, messages: Any, *, request_digest: str, parameters: Any
+    ) -> AdapterResult:
         """Return a completion with no usage, as a provider that omits it does."""
-        del prompt, request_digest
+        del messages, request_digest, parameters
         self.calls += 1
         return AdapterResult(
             chunks=("an answer",), usage=None, provider_style="openai", upstream_calls=self.calls
@@ -231,7 +237,8 @@ def _wire_offer(
         max_milli_credits=max_milli_credits,
         deadline_ms=60_000,
         delivery_mode="buffered_complete",
-        prompt="hi",
+        messages=(user_message("hi"),),
+        parameters={},
         authorization_hash="auth-1",
         permit_hash=permit_hash,
     )
@@ -421,7 +428,7 @@ class _Center:
 
     # -- driving ------------------------------------------------------------
 
-    def admit(self, *, request_id: str, prompt: str) -> AttemptOffer:
+    def admit(self, *, request_id: str, messages: tuple[Any, ...]) -> AttemptOffer:
         """Admit one request and return the offer it produced.
 
         Every offer the center sends is accumulated in `received`, so a test can
@@ -431,12 +438,12 @@ class _Center:
         self.service.admit_request(
             credential=self.credential,
             idempotency_key=f"idem-{request_id}",
-            prompt=prompt,
+            messages=messages,
             authorization=_authorization(
                 self.joined_private,
                 self.key_id,
                 request_id=request_id,
-                prompt=prompt,
+                messages=messages,
             ),
             model=MODEL,
             max_charge_milli_credits=20_000,
@@ -623,7 +630,7 @@ def test_a_failed_upstream_call_leaves_usage_unknown_and_never_zero(center: _Cen
     attempt's usage to `UNKNOWN` with a `NULL` total, settle nothing and mint no
     receipt — the opposite of writing a 0 that would later read as "free".
     """
-    offer = center.admit(request_id="req-to", prompt="timed out")
+    offer = center.admit(request_id="req-to", messages=(user_message("timed out"),))
     center.accept(offer)
     replies = center.node_failed(offer, seq=1, detail="upstream read timed out")
     assert [reply.type for reply in replies] == ["event.ack"]
@@ -655,7 +662,7 @@ def test_a_not_submitted_report_opens_one_replacement_and_respects_the_cap(
     time a branch is opened the previous one is demoted, so only one branch can
     ever be output-eligible.
     """
-    first = center.admit(request_id="req-cap", prompt="retry me")
+    first = center.admit(request_id="req-cap", messages=(user_message("retry me"),))
     center.accept(first)
     center.node_state(
         first, state="FAILED", certainty="not_submitted", upstream_calls=0
@@ -693,7 +700,7 @@ def test_an_unknown_report_is_not_retried_and_keeps_usage_unknown(center: _Cente
     offer: a retry could double-consume the upstream. The request converges as
     `OUTCOME_UNKNOWN`, usage stays `NULL`, and no receipt is issued.
     """
-    offer = center.admit(request_id="req-unknown", prompt="maybe ran")
+    offer = center.admit(request_id="req-unknown", messages=(user_message("maybe ran"),))
     center.accept(offer)
     center.node_state(offer, state="FAILED", certainty="unknown", upstream_calls=0)
 
@@ -722,8 +729,8 @@ def test_of_two_requests_only_the_timed_out_one_is_retried(center: _Center) -> N
     A late delta from the demoted first branch is refused with a `superseded`
     cancel, so the two branches can never both publish output.
     """
-    timed_out = center.admit(request_id="req-1", prompt="will time out")
-    healthy = center.admit(request_id="req-2", prompt="will succeed")
+    timed_out = center.admit(request_id="req-1", messages=(user_message("will time out"),))
+    healthy = center.admit(request_id="req-2", messages=(user_message("will succeed"),))
     center.accept(timed_out)
     healthy_acceptance = center.accept(healthy)
 
@@ -770,14 +777,14 @@ def test_the_center_retries_because_the_node_claimed_not_submitted(center: _Cent
     the exact path by which the node's misclassification spends the upstream
     quota twice.
     """
-    offer = center.admit(request_id="req-couple", prompt="one upstream call")
+    offer = center.admit(request_id="req-couple", messages=(user_message("one upstream call"),))
     center.accept(offer)
     center.node_state(offer, state="FAILED", certainty="not_submitted", upstream_calls=0)
 
     offered = center.offers("req-couple")
     assert len(offered) == 2, (
         "a not_submitted report authorises one replacement attempt, so the same "
-        "prompt would be sent upstream a second time"
+        "conversation would be sent upstream a second time"
     )
     assert center.store.get_attempt("req-couple-a2") is not None
     assert center.store.get_attempt("req-couple-a1").status == "FAILED"  # type: ignore[union-attr]
@@ -808,15 +815,17 @@ def _auth_kwargs(private_key: Any, key_id: str) -> dict[str, Any]:
     }
 
 
-def _authorization(private_key: Any, key_id: str, *, request_id: str, prompt: str) -> Any:
-    """Sign a consumer spend authorization bound to `prompt`/`MODEL`/`DELIVERY`."""
+def _authorization(
+    private_key: Any, key_id: str, *, request_id: str, messages: tuple[Any, ...]
+) -> Any:
+    """Sign a consumer spend authorization bound to `messages`/`MODEL`/`DELIVERY`."""
     return SpendAuthorization(
         authorization_id=f"auth-{request_id}",
         payer_account_id=key_id,
         consumer_id=key_id,
         request_id=request_id,
-        request_digest=canonical_digest(
-            {"prompt": prompt, "model": MODEL, "delivery_mode": DELIVERY}
+        request_digest=compute_request_digest(
+            messages=messages, model=MODEL, delivery_mode=DELIVERY
         ),
         max_charge_milli_credits=20_000,
         pricing_version="flat-v1",

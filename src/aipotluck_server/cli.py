@@ -12,6 +12,10 @@ presentation and signal helpers from there rather than growing second copies.
 * ``admin invite`` mints a single-use-or-capped invite code, printing the
   plaintext once; ``admin invite-list`` and ``admin revoke-key`` are the
   operator views, and neither ever renders a code or a private key.
+* ``admin api-key`` mints a revocable, quota-bearing API key for the
+  OpenAI-compatible endpoint and prints the plaintext once; ``admin
+  api-key-list`` shows every key with what it has spent, and ``admin
+  api-key-revoke`` withdraws one.
 * ``admin reconcile`` cross-checks the center's own tables — attempts,
   settlements, receipts, transparency-log leaves and the ledger replay log —
   in both directions, and names every record an invariant fails on.
@@ -23,7 +27,8 @@ presentation and signal helpers from there rather than growing second copies.
 Every error path prints an actionable message on stderr and returns a non-zero
 exit status. The console script's generated wrapper calls ``sys.exit(main())``,
 so the integer returned here becomes the process exit code. No command prints
-a token, an invite code, or a private key.
+a token, an invite code, an API key, or a private key more than once, and the
+listing commands print none at all.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import importlib.metadata
+import logging
 import secrets
 import sys
 import threading
@@ -50,6 +56,7 @@ from aipotluck.errors import PotluckError
 from aipotluck.reconcile import ReceiptVerification
 
 from .deploy import CenterInspection, load_center, load_center_for_inspection
+from .gateway_service import API_KEY_BYTES, API_KEY_PREFIX
 from .persistence import CenterStore
 from .reconcile import reconcile_center, verify_receipt_at_center
 
@@ -146,11 +153,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     admin = subparsers.add_parser(
         "admin",
-        help="Operator actions on a center's store (invites, key revocation).",
+        help="Operator actions on a center's store (invites, keys, revocation).",
         description=(
             "Offline operator actions that open the center's store directly. "
-            "None of them prints a secret: `invite` prints a fresh code exactly "
-            "once, and the listing and revocation views are redacted."
+            "None of them prints a secret twice: `invite` and `api-key` each "
+            "print a fresh plaintext exactly once, and the listing and "
+            "revocation views are redacted."
         ),
     )
     admin_sub = admin.add_subparsers(dest="admin_command", required=True)
@@ -221,6 +229,90 @@ def _build_parser() -> argparse.ArgumentParser:
     revoke.add_argument("--key-id", required=True, dest="key_id")
     revoke.set_defaults(handler=_cmd_admin_revoke_key)
 
+    api_key = admin_sub.add_parser(
+        "api-key",
+        help="Mint an API key for the OpenAI-compatible endpoint, printed once.",
+        description=(
+            "Generate a high-entropy API key for one existing consumer subject, "
+            "store only its digest, and print the plaintext to stdout exactly "
+            "once. The key authenticates POST /openai/v1/chat/completions and "
+            "GET /openai/v1/models; it spends the subject's own account, up to "
+            "the quota named here, and can be revoked without touching the "
+            "identity or any other key."
+        ),
+    )
+    _add_config_argument(api_key)
+    api_key.add_argument(
+        "--subject",
+        required=True,
+        dest="subject_id",
+        metavar="SUBJECT_ID",
+        help=(
+            "The consumer this key speaks for: an identity an invite minted, or "
+            "a consumer credential provisioned in center.json. Its account is "
+            "what the key spends."
+        ),
+    )
+    api_key.add_argument(
+        "--quota",
+        required=True,
+        type=int,
+        metavar="MILLI_CREDITS",
+        help=(
+            "Total milli-credits this key may spend. A key that has spent it "
+            "answers 429 insufficient_quota until it is replaced."
+        ),
+    )
+    api_key.add_argument(
+        "--name",
+        default="",
+        help="A label for the key, so a listing says which tool holds it.",
+    )
+    api_key.add_argument(
+        "--expires-in",
+        default=None,
+        dest="expires_in",
+        metavar="DURATION",
+        help=(
+            "Lifetime such as 30m, 12h or 90d. Omit for a key that does not "
+            "expire, which stays revocable either way."
+        ),
+    )
+    api_key.set_defaults(handler=_cmd_admin_api_key)
+
+    api_key_list = admin_sub.add_parser(
+        "api-key-list",
+        help="List API keys with what each has spent, redacted.",
+        description=(
+            "List every API key by its id, subject, quota, spend and status. "
+            "The plaintext is never printed: only its digest was stored, so no "
+            "command can read one back."
+        ),
+    )
+    _add_config_argument(api_key_list)
+    api_key_list.set_defaults(handler=_cmd_admin_api_key_list)
+
+    api_key_revoke = admin_sub.add_parser(
+        "api-key-revoke",
+        help="Revoke an API key.",
+        description=(
+            "Revoke an API key so it authenticates nothing, immediately and "
+            "without a restart: every request on the OpenAI-compatible surface "
+            "re-reads the key's row. What the key already spent stays on the "
+            "books, and the subject's own identity and signing key are "
+            "untouched — revoke those with `admin revoke-key`."
+        ),
+    )
+    _add_config_argument(api_key_revoke)
+    api_key_revoke.add_argument(
+        "--key-id",
+        required=True,
+        dest="key_id",
+        metavar="KEY_ID",
+        help="The key to revoke, as `admin api-key-list` names it.",
+    )
+    api_key_revoke.set_defaults(handler=_cmd_admin_api_key_revoke)
+
     admin_reconcile = admin_sub.add_parser(
         "reconcile",
         help="Cross-check the center's own tables and list every difference.",
@@ -270,6 +362,31 @@ def _add_config_argument(parser: argparse.ArgumentParser) -> None:
 
 
 
+def _configure_gateway_logging() -> None:
+    """Send the gateway's per-request log lines to stderr.
+
+    `serve` is a long-running process whose only other output is its startup
+    lines, and the structured line the gateway emits per OpenAI-compatible
+    request is operator-facing evidence: which key admitted which model, how many
+    tokens it settled, how long it took, and how it ended. Python's own default
+    handler prints warnings and above, so without this the lines would be
+    written and dropped.
+
+    The gateway's HTTP access log stays silenced: a request line carries no
+    credential, but the headers do, and the structured line names a key by its id
+    and never by its value.
+    """
+    logger = logging.getLogger("aipotluck_server")
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     """Run the ``serve`` subcommand: a center until SIGINT/SIGTERM.
 
@@ -278,6 +395,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     as digests, and the settlement private key never leaves the process.
     """
     config: Path = args.config
+    _configure_gateway_logging()
     deployment = load_center(config, start=True)
     server = deployment.server
     print(
@@ -442,6 +560,114 @@ def _cmd_admin_revoke_key(args: argparse.Namespace) -> int:
         print(f"{PROG}: revoked key {args.key_id}")
     else:
         print(f"{PROG}: key {args.key_id} was already revoked")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# admin: API keys for the OpenAI-compatible endpoint
+# --------------------------------------------------------------------------
+
+
+def _cmd_admin_api_key(args: argparse.Namespace) -> int:
+    """Run ``admin api-key``: mint a key, print it once, store only its digest.
+
+    The subject has to exist. A key minted for a name this center holds no
+    consumer for would authenticate happily and then fail at settlement, after a
+    node had spent real tokens on the request, so the typo is reported here
+    instead — where the only thing wasted is a command.
+
+    Raises:
+        PotluckError: If the quota would admit nothing, or the subject is not a
+            consumer this center knows.
+    """
+    if args.quota < 1:
+        raise PotluckError(
+            f"--quota must be >= 1 milli-credit, got {args.quota}: a key with no "
+            "quota admits nothing, and minting one is a mistake worth reporting "
+            "rather than a key worth holding"
+        )
+    now = dt.datetime.now(dt.UTC)
+    expires_at = None if args.expires_in is None else now + _parse_duration(args.expires_in)
+    store = _load_center_store(args.config)
+    try:
+        binding = store.find_consumer_binding(args.subject_id)
+        if binding is None:
+            raise PotluckError(
+                f"no consumer {args.subject_id!r} in this center: an API key "
+                "speaks for a consumer that already exists, so join one with an "
+                "invite first (`potluck-server admin invite --role consumer`, "
+                "then `potluck join`) or name a consumer credential from "
+                "center.json"
+            )
+        key_id = f"apikey-{secrets.token_hex(6)}"
+        plaintext = API_KEY_PREFIX + secrets.token_urlsafe(API_KEY_BYTES)
+        record = store.add_api_key(
+            plaintext,
+            key_id=key_id,
+            name=str(args.name),
+            subject_id=binding.subject_id,
+            tenant_id=binding.tenant_id,
+            quota_milli_credits=int(args.quota),
+            created_at=now,
+            expires_at=expires_at,
+        )
+    finally:
+        store.close()
+    # The plaintext goes to stdout exactly once; only its digest was stored, so
+    # no command can read it back and a lost key is replaced rather than
+    # recovered.
+    print(plaintext)
+    expires = "never" if record.expires_at is None else record.expires_at.isoformat()
+    print(
+        f"{PROG}: API key {record.key_id} minted for {record.subject_id} "
+        f"(tenant {record.tenant_id}, quota {record.quota_milli_credits} "
+        f"milli-credits, expires {expires}); shown once. Point a client at "
+        "base_url <center-url>/openai/v1 with this key as its API key.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_admin_api_key_list(args: argparse.Namespace) -> int:
+    """Run ``admin api-key-list``: every key, with what it has spent."""
+    store = _load_center_store(args.config)
+    try:
+        keys = store.list_api_keys()
+    finally:
+        store.close()
+    for record in keys:
+        expires = "never" if record.expires_at is None else record.expires_at.isoformat()
+        last_used = "never" if record.last_used_at is None else record.last_used_at.isoformat()
+        name = f' name="{record.name}"' if record.name else ""
+        print(
+            f"{record.key_id}{name} subject={record.subject_id} "
+            f"tenant={record.tenant_id} "
+            f"quota={record.used_milli_credits}/{record.quota_milli_credits} "
+            f"remaining={record.remaining_milli_credits} "
+            f"expires={expires} last_used={last_used} {record.status}"
+        )
+    return 0
+
+
+def _cmd_admin_api_key_revoke(args: argparse.Namespace) -> int:
+    """Run ``admin api-key-revoke``: withdraw one key, immediately.
+
+    Revocation is written to the store, and the OpenAI-compatible surface
+    re-reads the key's row on every request, so a revoked key stops working on a
+    center that is already running rather than at its next restart. What it
+    spent stays on the books: revoking a key withdraws access, not history.
+
+    Repeating the command is a safe no-op, and says so.
+    """
+    store = _load_center_store(args.config)
+    try:
+        newly_revoked = store.revoke_api_key(args.key_id, dt.datetime.now(dt.UTC))
+    finally:
+        store.close()
+    if newly_revoked:
+        print(f"{PROG}: revoked API key {args.key_id}")
+    else:
+        print(f"{PROG}: API key {args.key_id} was already revoked")
     return 0
 
 

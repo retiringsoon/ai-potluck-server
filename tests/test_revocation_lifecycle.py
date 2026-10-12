@@ -44,6 +44,7 @@ from aipotluck.wire import (
     NodeHello,
     NodePolicy,
     compute_acceptance_hash,
+    user_message,
 )
 from conftest import Keyring, signed_authorization
 
@@ -59,6 +60,8 @@ BASE = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
 MODEL = "coding-pool"
 TENANT = "tenant-a"
 PROMPT = "write a haiku about ledgers"
+#: The conversation every admission here signs and submits, as one user turn.
+MESSAGES = (user_message(PROMPT),)
 SETTLEMENT_KEY_ID = "settlement-key-1"
 ADAPTER = "mock-adapter"
 
@@ -212,9 +215,9 @@ def _admit(center: _Center, request_id: str, idempotency_key: str) -> None:
     center.service.admit_request(
         credential=CONSUMER,
         idempotency_key=idempotency_key,
-        prompt=PROMPT,
+        messages=MESSAGES,
         authorization=signed_authorization(
-            center.keyring, request_id=request_id, prompt=PROMPT, model=MODEL
+            center.keyring, request_id=request_id, messages=MESSAGES, model=MODEL
         ),
         model=MODEL,
         max_charge_milli_credits=20_000,

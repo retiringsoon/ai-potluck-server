@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from aipotluck.canonical import canonical_digest, sign_payload
+from aipotluck.canonical import sign_payload
 from aipotluck.errors import GatewayError, PotluckError
 from aipotluck.identity import generate_key_pair, load_private_key
 from aipotluck.metering import Measurement, NormalizedUsage
@@ -82,6 +82,8 @@ from aipotluck.wire import (
     NodeHello,
     NodePolicy,
     compute_acceptance_hash,
+    compute_request_digest,
+    user_message,
 )
 from conftest import Keyring
 
@@ -239,16 +241,16 @@ def _authorization(
     *,
     request_id: str,
     consumer_id: str,
-    prompt: str,
+    messages: tuple[Any, ...],
 ) -> Any:
-    """Sign a consumer spend authorization bound to `prompt`/`MODEL`/`DELIVERY`."""
+    """Sign a consumer spend authorization bound to `messages`/`MODEL`/`DELIVERY`."""
     record = SpendAuthorization(
         authorization_id=f"auth-{request_id}",
         payer_account_id=consumer_id,
         consumer_id=consumer_id,
         request_id=request_id,
-        request_digest=canonical_digest(
-            {"prompt": prompt, "model": MODEL, "delivery_mode": DELIVERY}
+        request_digest=compute_request_digest(
+            messages=messages, model=MODEL, delivery_mode=DELIVERY
         ),
         max_charge_milli_credits=20_000,
         pricing_version="flat-v1",
@@ -356,20 +358,20 @@ class Center:
         credential: Credential,
         *,
         request_id: str,
-        prompt: str,
+        messages: tuple[Any, ...],
     ) -> AttemptOffer:
         """Admit one request and return the offer it produced."""
         self.received.clear()
         service.admit_request(
             credential=credential,
             idempotency_key=f"idem-{request_id}",
-            prompt=prompt,
+            messages=messages,
             authorization=_authorization(
                 self.joined_private,
                 credential.subject_id,
                 request_id=request_id,
                 consumer_id=credential.subject_id,
-                prompt=prompt,
+                messages=messages,
             ),
             model=MODEL,
             max_charge_milli_credits=20_000,
@@ -393,11 +395,11 @@ class Center:
         credential: Credential,
         *,
         request_id: str,
-        prompt: str,
+        messages: tuple[Any, ...],
         measured: tuple[int, int] = (800, 200),
     ) -> tuple[AttemptOffer, str, dict[str, Any]]:
         """Drive one request to full settlement; return `(offer, acceptance, status)`."""
-        offer = self.admit(service, credential, request_id=request_id, prompt=prompt)
+        offer = self.admit(service, credential, request_id=request_id, messages=messages)
         acceptance = self.acceptance_hash(offer)
         self.accept(service, offer, acceptance)
         service.handle_node_message(
@@ -506,7 +508,10 @@ def test_a_rebuilt_ledger_replays_the_log_entry_for_entry(center: Center) -> Non
     joined = center.join("code-a")
     credential = center.authenticate(center.service, joined.key_id)
     _offer, _acceptance, document = center.settle(
-        center.service, credential, request_id="req-1", prompt="first answer"
+        center.service,
+        credential,
+        request_id="req-1",
+        messages=(user_message("first answer"),),
     )
     assert document["status"] == "SUCCEEDED"
 
@@ -593,7 +598,10 @@ def test_receipt_ids_are_unique_across_a_restart(center: Center) -> None:
     joined = center.join("code-b")
     credential = center.authenticate(center.service, joined.key_id)
     offer, acceptance, document = center.settle(
-        center.service, credential, request_id="req-1", prompt="first answer"
+        center.service,
+        credential,
+        request_id="req-1",
+        messages=(user_message("first answer"),),
     )
     first = document["settlement"]
     assert first["log_index"] == 0
@@ -638,7 +646,10 @@ def test_receipt_ids_are_unique_across_a_restart(center: Center) -> None:
         # A new request settles on the NEXT leaf, with a new receipt id and a
         # receipt-hash chain link that names the previous receipt.
         _offer2, _acceptance2, document2 = center.settle(
-            rebuilt, rebuilt_credential, request_id="req-2", prompt="second answer"
+            rebuilt,
+            rebuilt_credential,
+            request_id="req-2",
+            messages=(user_message("second answer"),),
         )
         assert document2["status"] == "SUCCEEDED"
         second = document2["settlement"]
@@ -665,7 +676,10 @@ def test_the_old_receipt_is_served_with_a_verifiable_inclusion_proof(
     joined = center.join("code-proof")
     credential = center.authenticate(center.service, joined.key_id)
     _offer, _acceptance, document = center.settle(
-        center.service, credential, request_id="req-1", prompt="first answer"
+        center.service,
+        credential,
+        request_id="req-1",
+        messages=(user_message("first answer"),),
     )
     receipt_id = document["settlement"]["receipt_id"]
     receipt_hash = document["settlement"]["receipt_hash"]
@@ -753,10 +767,20 @@ def test_an_in_flight_request_survives_and_is_reconciled_as_unknown(
     credential = center.authenticate(center.service, joined.key_id)
     # Drive req-1 to a full settlement, so the log, the provider account and a
     # receipt all exist before the restart.
-    center.settle(center.service, credential, request_id="req-1", prompt="first answer")
+    center.settle(
+        center.service,
+        credential,
+        request_id="req-1",
+        messages=(user_message("first answer"),),
+    )
 
     # Admit req-2 and stop after the output commit: no usage.final ever arrives.
-    offer = center.admit(center.service, credential, request_id="req-2", prompt="in flight")
+    offer = center.admit(
+        center.service,
+        credential,
+        request_id="req-2",
+        messages=(user_message("in flight"),),
+    )
     acceptance = center.acceptance_hash(offer)
     center.accept(center.service, offer, acceptance)
     center.service.handle_node_message(

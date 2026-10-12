@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from aipotluck.canonical import canonical_digest, sign_payload
+from aipotluck.canonical import sign_payload
 from aipotluck.errors import (
     ConflictError,
     IdentityBindingError,
@@ -54,6 +54,8 @@ from aipotluck.wire import (
     NodeHello,
     NodePolicy,
     compute_acceptance_hash,
+    compute_request_digest,
+    user_message,
 )
 from conftest import Keyring
 
@@ -122,15 +124,16 @@ def center(tmp_path: Path) -> _Center:
 
 
 def _authorization(private_key: Any, key_id: str, *, request_id: str, consumer_id: str,
-                   payer_account_id: str, prompt: str, max_charge: int = 20_000) -> Any:
+                   payer_account_id: str, messages: tuple[Any, ...],
+                   max_charge: int = 20_000) -> Any:
     """Sign a consumer authorization bound to the given identity and account."""
     record = SpendAuthorization(
         authorization_id=f"auth-{request_id}",
         payer_account_id=payer_account_id,
         consumer_id=consumer_id,
         request_id=request_id,
-        request_digest=canonical_digest(
-            {"prompt": prompt, "model": MODEL, "delivery_mode": DELIVERY}
+        request_digest=compute_request_digest(
+            messages=messages, model=MODEL, delivery_mode=DELIVERY
         ),
         max_charge_milli_credits=max_charge,
         pricing_version="flat-v1",
@@ -187,10 +190,12 @@ def test_two_joiners_claiming_the_same_subject_stay_isolated(center: _Center) ->
     )
     first_authorization = _authorization(
         load_private_key(first_private), first.key_id, request_id="R-a",
-        consumer_id=first.subject_id, payer_account_id=first.subject_id, prompt="hi",
+        consumer_id=first.subject_id, payer_account_id=first.subject_id,
+        messages=(user_message("hi"),),
     )
     center.service.admit_request(
-        credential=first_credential, idempotency_key="idem-a", prompt="hi",
+        credential=first_credential, idempotency_key="idem-a",
+        messages=(user_message("hi"),),
         authorization=first_authorization, model=MODEL, max_charge_milli_credits=20_000,
         delivery_mode=DELIVERY, max_attempts=2, now=BASE,
     )
@@ -200,11 +205,12 @@ def test_two_joiners_claiming_the_same_subject_stay_isolated(center: _Center) ->
     # B cannot sign a charge against alice's funded account either.
     forged = _authorization(
         load_private_key(second_private), second.key_id, request_id="R-b",
-        consumer_id="alice", payer_account_id="alice", prompt="steal",
+        consumer_id="alice", payer_account_id="alice", messages=(user_message("steal"),),
     )
     with pytest.raises(IdentityBindingError):
         center.service.admit_request(
-            credential=second_credential, idempotency_key="idem-b", prompt="steal",
+            credential=second_credential, idempotency_key="idem-b",
+            messages=(user_message("steal"),),
             authorization=forged, model=MODEL, max_charge_milli_credits=20_000,
             delivery_mode=DELIVERY, max_attempts=2, now=BASE,
         )
@@ -352,10 +358,11 @@ def _drive_to_usage_final(
         enqueue=received.append, now=BASE,
     )
     center.service.admit_request(
-        credential=consumer, idempotency_key="idem-1", prompt="hi",
+        credential=consumer, idempotency_key="idem-1", messages=(user_message("hi"),),
         authorization=_authorization(
             private_key, consumer_key_id, request_id="R-1",
-            consumer_id=consumer.subject_id, payer_account_id=consumer.subject_id, prompt="hi",
+            consumer_id=consumer.subject_id, payer_account_id=consumer.subject_id,
+            messages=(user_message("hi"),),
         ),
         model=MODEL, max_charge_milli_credits=20_000, delivery_mode=DELIVERY,
         max_attempts=2, now=BASE,
@@ -762,11 +769,11 @@ def test_the_provisioned_token_opens_a_node_link_and_receives_an_offer(
             role="consumer", account_id=consumer.subject_id,
         ),
         idempotency_key="idem-invited",
-        prompt="hi",
+        messages=(user_message("hi"),),
         authorization=_authorization(
             load_private_key(consumer_private), consumer.key_id,
             request_id="R-invited", consumer_id=consumer.subject_id,
-            payer_account_id=consumer.subject_id, prompt="hi",
+            payer_account_id=consumer.subject_id, messages=(user_message("hi"),),
         ),
         model=MODEL, max_charge_milli_credits=20_000, delivery_mode=DELIVERY,
         max_attempts=2, now=BASE,

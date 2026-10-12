@@ -30,7 +30,6 @@ from typing import Any
 
 import pytest
 from aipotluck.adapters import FakeResponse, FakeUpstream, FakeUpstreamAdapter
-from aipotluck.canonical import canonical_digest
 from aipotluck.cli import main
 from aipotluck.connector import Connector, ConnectorConfig
 from aipotluck.errors import IdentityBindingError, ProtocolError, StateTransitionError
@@ -38,6 +37,7 @@ from aipotluck.identity import generate_key_pair, load_private_key
 from aipotluck.metering import NormalizedUsage
 from aipotluck.persistence import NodeStore
 from aipotluck.records import SpendAuthorization, new_nonce
+from aipotluck.wire import compute_request_digest, user_message
 from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
@@ -91,15 +91,15 @@ class _Center:
         self.store.close()
 
     def admit(self, authorization: Any, *, credential: Credential = CONSUMER,
-              prompt: str = "write a haiku about ledgers", idempotency_key: str = "idem-1",
-              **overrides: Any) -> Any:
+              messages: tuple[Any, ...] = (user_message("write a haiku about ledgers"),),
+              idempotency_key: str = "idem-1", **overrides: Any) -> Any:
         """Admit one request with test-friendly defaults."""
         arguments: dict[str, Any] = {"model": MODEL, "max_charge_milli_credits": 20_000}
         arguments.update(overrides)
         return self.service.admit_request(
             credential=credential,
             idempotency_key=idempotency_key,
-            prompt=prompt,
+            messages=messages,
             authorization=authorization,
             now=BASE,
             **arguments,
@@ -134,11 +134,13 @@ def test_admission_accepts_a_request_matching_its_authorization(center: _Center)
 
 
 def test_admission_refuses_work_the_authorization_did_not_sign(center: _Center) -> None:
-    """A valid signature for one prompt cannot be re-pointed at another."""
-    authorization = _authorize(center.keyring, request_id="R-1", prompt="signed prompt")
+    """A valid signature for one conversation cannot be re-pointed at another."""
+    authorization = _authorize(
+        center.keyring, request_id="R-1", messages=(user_message("signed prompt"),)
+    )
 
     with pytest.raises(ProtocolError, match="request_digest"):
-        center.admit(authorization, prompt="a different prompt")
+        center.admit(authorization, messages=(user_message("a different prompt"),))
 
 
 def test_admission_refuses_a_model_outside_the_signed_allowlist(center: _Center) -> None:
@@ -266,8 +268,8 @@ def test_auto_invites_are_mutually_invisible_even_with_the_same_claimed_name(
         payer_account_id=first.subject_id,
         consumer_id=first.subject_id,
         request_id="R-a",
-        request_digest=canonical_digest(
-            {"prompt": "hi", "model": MODEL, "delivery_mode": DELIVERY}
+        request_digest=compute_request_digest(
+            messages=(user_message("hi"),), model=MODEL, delivery_mode=DELIVERY
         ),
         max_charge_milli_credits=20_000,
         pricing_version="flat-v1",
@@ -288,7 +290,8 @@ def test_auto_invites_are_mutually_invisible_even_with_the_same_claimed_name(
         account_id=first.subject_id,
     )
     center.service.admit_request(
-        credential=credential_a, idempotency_key="idem-a", prompt="hi",
+        credential=credential_a, idempotency_key="idem-a",
+        messages=(user_message("hi"),),
         authorization=record, model=MODEL, max_charge_milli_credits=20_000,
         delivery_mode=DELIVERY, max_attempts=2, now=BASE,
     )

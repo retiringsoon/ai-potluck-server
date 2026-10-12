@@ -48,6 +48,7 @@ from aipotluck.wire import (
     NodeHello,
     NodePolicy,
     compute_acceptance_hash,
+    user_message,
 )
 from conftest import Keyring, signed_authorization
 
@@ -309,7 +310,7 @@ class Harness:
         authorization: SignedRecord,
         *,
         idempotency_key: str = "idem-1",
-        prompt: str = "write a haiku about ledgers",
+        messages: tuple[Any, ...] = (user_message("write a haiku about ledgers"),),
         now: dt.datetime = BASE,
         **overrides: Any,
     ) -> Any:
@@ -322,7 +323,7 @@ class Harness:
         return self.service.admit_request(
             credential=CONSUMER,
             idempotency_key=idempotency_key,
-            prompt=prompt,
+            messages=messages,
             authorization=authorization,
             now=now,
             **arguments,
@@ -439,17 +440,25 @@ def test_admission_refuses_a_reused_key_with_a_different_payload(
 ) -> None:
     """Reusing an idempotency key for other content is a conflict, not a merge.
 
-    Each authorization is built for the prompt it is admitted with: the
-    admission now re-derives the request digest from the submitted work, so a
-    single authorization cannot cover two different prompts.
+    Each authorization is built for the conversation it is admitted with: the
+    admission re-derives the request digest from the submitted work, so a single
+    authorization cannot cover two different conversations.
     """
     harness.connect()
-    first_authorization = harness.authorization(request_id="R-1", prompt="first")
-    harness.admit(first_authorization, idempotency_key="key-1", prompt="first")
+    first_authorization = harness.authorization(
+        request_id="R-1", messages=(user_message("first"),)
+    )
+    harness.admit(
+        first_authorization, idempotency_key="key-1", messages=(user_message("first"),)
+    )
 
-    second_authorization = harness.authorization(request_id="R-1", prompt="second")
+    second_authorization = harness.authorization(
+        request_id="R-1", messages=(user_message("second"),)
+    )
     with pytest.raises(ConflictError, match="idempotency key"):
-        harness.admit(second_authorization, idempotency_key="key-1", prompt="second")
+        harness.admit(
+            second_authorization, idempotency_key="key-1", messages=(user_message("second"),)
+        )
 
 
 def test_admission_refuses_a_ceiling_above_the_signed_cap(harness: Harness) -> None:

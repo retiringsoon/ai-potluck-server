@@ -55,6 +55,8 @@ from aipotluck.wire import (
     NodeHello,
     NodePolicy,
     compute_acceptance_hash,
+    compute_request_digest,
+    user_message,
 )
 from conftest import Keyring
 
@@ -220,15 +222,15 @@ def _auth_kwargs(private_key: Any, key_id: str, *, issued_at: dt.datetime,
 
 
 def _authorization(private_key: Any, key_id: str, *, request_id: str, consumer_id: str,
-                   prompt: str, max_charge: int = 20_000) -> Any:
-    """Sign a consumer spend authorization bound to `prompt`/`MODEL`/`DELIVERY`."""
+                   messages: tuple[Any, ...], max_charge: int = 20_000) -> Any:
+    """Sign a consumer spend authorization bound to `messages`/`MODEL`/`DELIVERY`."""
     record = SpendAuthorization(
         authorization_id=f"auth-{request_id}",
         payer_account_id=consumer_id,
         consumer_id=consumer_id,
         request_id=request_id,
-        request_digest=canonical_digest(
-            {"prompt": prompt, "model": MODEL, "delivery_mode": DELIVERY}
+        request_digest=compute_request_digest(
+            messages=messages, model=MODEL, delivery_mode=DELIVERY
         ),
         max_charge_milli_credits=max_charge,
         pricing_version="flat-v1",
@@ -335,7 +337,7 @@ def _usage_event(keyring: Keyring, offer: AttemptOffer, acceptance_hash: str) ->
 
 def _drive_to_settlement(
     service: GatewayService, keyring: Keyring, credential: Credential, *, request_id: str,
-    prompt: str, private_key: Any, key_id: str, received: list[Envelope],
+    messages: tuple[Any, ...], private_key: Any, key_id: str, received: list[Envelope],
 ) -> dict[str, Any]:
     """Connect a node, admit one request, and settle it; return the status doc."""
     service.register_node(
@@ -347,9 +349,9 @@ def _drive_to_settlement(
     service.admit_request(
         credential=credential,
         idempotency_key=f"idem-{request_id}",
-        prompt=prompt,
+        messages=messages,
         authorization=_authorization(private_key, key_id, request_id=request_id,
-                                     consumer_id=credential.subject_id, prompt=prompt),
+                                     consumer_id=credential.subject_id, messages=messages),
         model=MODEL,
         max_charge_milli_credits=20_000,
         delivery_mode=DELIVERY,
@@ -1080,7 +1082,8 @@ def test_a_joined_identity_survives_a_restart_and_can_settle_again(
     )
     received: list[Envelope] = []
     document = _drive_to_settlement(
-        setup.service, setup.keyring, credential, request_id="R-1", prompt="first answer",
+        setup.service, setup.keyring, credential, request_id="R-1",
+        messages=(user_message("first answer"),),
         private_key=private_key, key_id=key_id, received=received,
     )
     assert document["status"] == "SUCCEEDED"
@@ -1139,7 +1142,8 @@ def test_a_joined_identity_survives_a_restart_and_can_settle_again(
         # And a brand-new request still settles with the same identity.
         received2: list[Envelope] = []
         document2 = _drive_to_settlement(
-            rebuilt, setup.keyring, credential, request_id="R-2", prompt="second answer",
+            rebuilt, setup.keyring, credential, request_id="R-2",
+            messages=(user_message("second answer"),),
             private_key=private_key, key_id=key_id, received=received2,
         )
         assert document2["status"] == "SUCCEEDED"
