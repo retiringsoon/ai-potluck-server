@@ -30,6 +30,7 @@ import datetime as dt
 import http.client
 import json
 import logging
+import socket
 import sqlite3
 import threading
 import time
@@ -988,6 +989,81 @@ def test_a_stream_request_that_never_produced_an_increment_is_a_plain_502(
         assert status == 502
         assert json.loads(raw)["error"]["code"] == "upstream_failed"
         assert frames == []
+    finally:
+        node.stop()
+
+
+def _raw_chat(center: Center, key: str, body: dict[str, Any]) -> tuple[bytes, bool]:
+    """Send one chat completion over a bare socket and return every byte back.
+
+    Nothing in between parses, reframes or retries, so this is exactly what a proxy
+    in front of the center sees: the status line, the headers, the body, and the
+    way the stream ends. The second value reports whether the connection was reset
+    rather than closed.
+    """
+    payload = json.dumps(body).encode("utf-8")
+    reset = False
+    with socket.create_connection(("127.0.0.1", center.port), timeout=130) as sock:
+        sock.sendall(
+            b"POST /openai/v1/chat/completions HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Authorization: Bearer " + key.encode("utf-8") + b"\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(payload)).encode("utf-8") + b"\r\n"
+            b"Connection: close\r\n\r\n" + payload
+        )
+        chunks: list[bytes] = []
+        while True:
+            try:
+                data = sock.recv(65536)
+            except ConnectionResetError:
+                reset = True
+                break
+            if not data:
+                break
+            chunks.append(data)
+    return b"".join(chunks), reset
+
+
+def _raw_header(head: bytes, name: str) -> str:
+    """Return one header from a raw response head, case-insensitively as HTTP is."""
+    for line in head.split(b"\r\n")[1:]:
+        field, _, value = line.partition(b":")
+        if field.strip().lower() == name.encode("ascii"):
+            return value.strip().decode("ascii")
+    raise AssertionError(f"no {name} header in {head!r}")
+
+
+def test_a_502_is_written_whole_for_both_delivery_modes(
+    center: Center, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal is one complete response on the wire, in both delivery modes.
+
+    The bytes are the whole answer a proxy judges: a status line, headers that end
+    where they say they do, a `Content-Length` the body matches exactly, and a
+    stream that ends rather than being cut. A center that closes the connection
+    before those bytes are on their way is reported to an operator as an invalid
+    response from the origin — which reads as an outage, not as the refusal it was.
+    """
+    upstream = FakeUpstream()
+    upstream.fault = "error_before_output"
+    node = Node(center, adapter=FakeUpstreamAdapter(upstream=upstream, model=MODEL))
+    try:
+        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        key = _mint_key(center, capsys)
+
+        for body in (_chat_body(), _chat_body(stream=True)):
+            raw, reset = _raw_chat(center, key, body)
+            head, separator, rest = raw.partition(b"\r\n\r\n")
+            assert separator, f"the head never ended: {raw[:200]!r}"
+            lines = head.split(b"\r\n")
+            assert lines[0] == b"HTTP/1.1 502 Bad Gateway", lines[0]
+            assert all(b": " in line for line in lines[1:]), lines
+            # The body is exactly as long as the head declares: not truncated, and
+            # not padded with the next response's first bytes.
+            assert len(rest) == int(_raw_header(head, "content-length")), rest
+            assert json.loads(rest)["error"]["code"] == "upstream_failed"
+            assert reset is False, "the connection was reset, which is how an answer gets lost"
     finally:
         node.stop()
 
