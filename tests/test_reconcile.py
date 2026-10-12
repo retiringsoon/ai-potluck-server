@@ -275,10 +275,10 @@ class Platform:
         Fetched through the shipped `SignedClient`, so the ``AIPotluck-Sig`` path
         and the new endpoints are exercised as a consumer really reaches them.
         """
-        from aipotluck.cli import _load_joined_identity, _signed_client_for
+        from aipotluck.cli import load_joined_identity, signed_client_for
 
-        config_document, key_document = _load_joined_identity(self.consumer_dir)
-        client = _signed_client_for(config_document, key_document)
+        config_document, key_document = load_joined_identity(self.consumer_dir)
+        client = signed_client_for(config_document, key_document)
         return {
             "receipt": client.get(f"/v1/receipts/{receipt_id}"),
             "checkpoint": client.get("/v1/checkpoint"),
