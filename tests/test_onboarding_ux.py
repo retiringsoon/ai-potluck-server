@@ -44,7 +44,11 @@ from aipotluck.connector import Connector, ConnectorConfig
 from aipotluck.deploy import DeploymentError, SignedClient
 from aipotluck.metering import NormalizedUsage
 from aipotluck.persistence import NodeStore
-from aipotluck.statemachine import AttemptStatus, RequestStatus, UsageStatus
+from aipotluck.statemachine import (
+    AttemptStatus,
+    RequestStatus,
+    UsageStatus,
+)
 from conftest import Keyring
 
 from aipotluck_server.gateway_server import GatewayServer
@@ -174,7 +178,14 @@ class _Node:
 class _Center:
     """A real gateway over a real store, with an invite ready to redeem."""
 
-    def __init__(self, tmp_path: Path, keyring: Keyring, *, quota: int = 100_000) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        keyring: Keyring,
+        *,
+        quota: int = 100_000,
+        queue_enabled: bool = True,
+    ) -> None:
         self.tmp_path = tmp_path
         self.keyring = keyring
         self.store = CenterStore.open(tmp_path / "center.db")
@@ -185,6 +196,7 @@ class _Center:
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
+            queue_enabled=queue_enabled,
         )
         self.service = GatewayService(
             config=self.config, store=self.store, registry=keyring.registry
@@ -246,6 +258,23 @@ def harness(tmp_path: Path) -> Any:
     """Provide a center, a node and a joined consumer, torn down afterwards."""
     keyring = Keyring()
     center = _Center(tmp_path, keyring)
+    nodes: list[_Node] = []
+    yield center, keyring, nodes, tmp_path
+    for node in nodes:
+        node.stop()
+    center.stop()
+
+
+@pytest.fixture
+def shedding_harness(tmp_path: Path) -> Any:
+    """The same center configured to shed load instead of holding it.
+
+    ``queue_enabled=false`` is the operator's other choice, and a test about what
+    a *refusal* looks like has to be able to ask for one: with the shipped default
+    a request nothing can dispatch waits out its deadline instead.
+    """
+    keyring = Keyring()
+    center = _Center(tmp_path, keyring, queue_enabled=False)
     nodes: list[_Node] = []
     yield center, keyring, nodes, tmp_path
     for node in nodes:
@@ -686,7 +715,7 @@ def test_ask_reports_a_revoked_credential_with_a_next_step(
 
 
 def test_ask_surfaces_the_centers_billing_note_when_a_request_fails(
-    harness: Any, monkeypatch: pytest.MonkeyPatch
+    shedding_harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A FAILED request must carry the center's own reason, not just "did not finish".
 
@@ -696,11 +725,16 @@ def test_ask_surfaces_the_centers_billing_note_when_a_request_fails(
     phrase and the user was left guessing. The note is the center's wording, so
     it is printed verbatim — a client that paraphrased a reason it did not
     produce would be a second source of truth about why a request failed.
+
+    Run against a center that sheds load rather than queues it, because that is
+    the configuration in which a decline ends a request: with the shipped default
+    the same request waits for a node that will free up, and what it ends as is a
+    deadline rather than a refusal.
     """
-    center, _keyring, _nodes, tmp_path = harness
+    center, _keyring, _nodes, tmp_path = shedding_harness
     # A ceiling of zero refuses every offer, which is the cheapest way to reach
     # a terminal FAILED with a real note attached.
-    _start_node(harness, _streaming_upstream(("never used",)), local_reserved=0)
+    _start_node(shedding_harness, _streaming_upstream(("never used",)), local_reserved=0)
     identity = tmp_path / "identity"
     center.join_consumer(identity)
 
@@ -725,6 +759,113 @@ def test_ask_surfaces_the_centers_billing_note_when_a_request_fails(
     assert "no node left to take the work" in note
     assert "local budget would be exceeded" in note
     assert note in err.text(), "ask must print the center's note verbatim"
+
+
+def test_ask_prints_the_centers_reason_when_a_wait_ends_on_a_queued_request(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wait that ends unfinished still says why the center could not place it.
+
+    The same P0-2 defect in its queued shape. With the shipped default a request
+    every node declined is *held* rather than ended, so the status `ask` reads back
+    is not a failure state at all — it is a request still waiting, whose reason sits
+    on the center's own note. Printing that note only for FAILED and EXPIRED would
+    swallow exactly the explanation a wait ends without, and leave the user with
+    "did not finish" and nothing to act on.
+
+    The status read is scripted rather than raced: the center's own deadline and
+    the client's wait window are the same number of seconds, so which of the two
+    fires first is a timing question, and the rule under test is not about timing —
+    it is that a request which did not succeed gets its note printed.
+    """
+    center, _keyring, _nodes, tmp_path = harness
+    _start_node(harness, _streaming_upstream(("never used",)), local_reserved=0)
+    identity = tmp_path / "identity"
+    center.join_consumer(identity)
+
+    note = "waiting for a node: node-A declined: local budget would be exceeded"
+    queued = {"request_id": "req-queued", "status": "ROUTING", "billing_note": note}
+    real_get = SignedClient.get
+
+    def queued_get(self: SignedClient, path: str) -> dict[str, Any]:
+        document = real_get(self, path)
+        if path.startswith("/v1/requests/") and "status" in document:
+            return {**document, **queued}
+        return document
+
+    monkeypatch.setattr(SignedClient, "get", queued_get)
+    out = _Recorder()
+    err = _Recorder()
+    monkeypatch.setattr("sys.stdout", out)
+    monkeypatch.setattr("sys.stderr", err)
+    code = main(
+        [
+            "ask",
+            "hi",
+            "--config-dir",
+            str(identity),
+            "--model",
+            MODEL,
+            "--timeout",
+            "1",
+            "--no-node-grace",
+            "30",
+        ]
+    )
+
+    assert code == 1
+    assert f"center note: {note}" in err.text()
+    assert ux.describe_request("FAILED") not in out.text(), (
+        "a request the center is still holding must not be reported as failed"
+    )
+
+
+def test_ask_prints_the_centers_reason_for_a_request_it_cancelled(
+    harness: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancellation carries a note too, and the note is the center's wording.
+
+    The rule is "did not succeed", not "is in one of two terminal states": a
+    request the user stopped has a reason recorded against it exactly as a failed
+    one does, and withholding it leaves the user reading a status phrase where the
+    center had already written a sentence.
+    """
+    center, _keyring, _nodes, tmp_path = harness
+    identity = tmp_path / "identity"
+    center.join_consumer(identity)
+
+    note = "cancelled by consumer_cancel"
+    real_get = SignedClient.get
+
+    def cancelled_get(self: SignedClient, path: str) -> dict[str, Any]:
+        document = real_get(self, path)
+        if path.startswith("/v1/requests/") and "status" in document:
+            return {**document, "status": "CANCELLED", "billing_note": note}
+        return document
+
+    monkeypatch.setattr(SignedClient, "get", cancelled_get)
+    monkeypatch.setattr("sys.stdout", _Recorder())
+    err = _Recorder()
+    monkeypatch.setattr("sys.stderr", err)
+    _start_node(harness, _streaming_upstream(("never used",)), local_reserved=0)
+
+    code = main(
+        [
+            "ask",
+            "hi",
+            "--config-dir",
+            str(identity),
+            "--model",
+            MODEL,
+            "--timeout",
+            "2",
+            "--no-node-grace",
+            "30",
+        ]
+    )
+
+    assert code == 1
+    assert f"center note: {note}" in err.text()
 
 
 def test_ask_without_a_model_requests_what_the_majority_of_nodes_serve(

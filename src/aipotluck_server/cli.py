@@ -16,6 +16,10 @@ presentation and signal helpers from there rather than growing second copies.
   OpenAI-compatible endpoint and prints the plaintext once; ``admin
   api-key-list`` shows every key with what it has spent, and ``admin
   api-key-revoke`` withdraws one.
+* ``admin session-list`` and ``admin session-show`` read the aggregate the center
+  keeps per agent session — turns, tokens, milli-credits, the node that last
+  served it — and ``session-show`` lists the receipts behind those totals so a
+  summary can be checked against the records that back it.
 * ``admin reconcile`` cross-checks the center's own tables — attempts,
   settlements, receipts, transparency-log leaves and the ledger replay log —
   in both directions, and names every record an invariant fails on.
@@ -54,6 +58,7 @@ from aipotluck.cli import (
 )
 from aipotluck.errors import PotluckError
 from aipotluck.reconcile import ReceiptVerification
+from aipotluck.wire import SESSION_HEADER
 
 from .deploy import CenterInspection, load_center, load_center_for_inspection
 from .gateway_service import API_KEY_BYTES, API_KEY_PREFIX
@@ -278,6 +283,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "expire, which stays revocable either way."
         ),
     )
+    api_key.add_argument(
+        "--deadline-ms",
+        default=None,
+        type=int,
+        dest="deadline_ms",
+        metavar="MILLISECONDS",
+        help=(
+            "Wall-clock budget every request on this key is given, in "
+            "milliseconds. Omit for the endpoint's own default. Set it longer "
+            "for a key an agent loop holds: a long turn needs a long window, and "
+            "a request that outlives its budget ends EXPIRED whether or not an "
+            "answer was on its way."
+        ),
+    )
     api_key.set_defaults(handler=_cmd_admin_api_key)
 
     api_key_list = admin_sub.add_parser(
@@ -312,6 +331,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help="The key to revoke, as `admin api-key-list` names it.",
     )
     api_key_revoke.set_defaults(handler=_cmd_admin_api_key_revoke)
+
+    session_list = admin_sub.add_parser(
+        "session-list",
+        help="List agent sessions with what each has cost.",
+        description=(
+            "List every agent session the center has aggregated, most recently "
+            "active first: the subject it belongs to, how many requests it made, "
+            "the tokens and milli-credits its settled turns added up to, the node "
+            "that served its last one, and when it was last seen. The totals count "
+            "settled turns only, so they agree with the books rather than with what "
+            "was asked for. A request that named no session appears nowhere here."
+        ),
+    )
+    _add_config_argument(session_list)
+    session_list.add_argument(
+        "--subject",
+        default=None,
+        dest="subject_id",
+        metavar="SUBJECT_ID",
+        help="Only this consumer's sessions, instead of every session in the center.",
+    )
+    session_list.set_defaults(handler=_cmd_admin_session_list)
+
+    session_show = admin_sub.add_parser(
+        "session-show",
+        help="Show one agent session, with the receipts behind its totals.",
+        description=(
+            "Show one agent session's aggregate and list every receipt its "
+            "requests produced. The receipts are the point: the totals a listing "
+            "prints are the aggregate's, and each receipt named here is a durable "
+            "record an operator can verify on its own with "
+            "`potluck-server verify receipt --receipt-id`.\n\n"
+            "A session identifier is chosen by the caller, so two subjects may both "
+            "have named one 'default'. This command reports every aggregate the "
+            "identifier matches, each under its own subject, rather than picking "
+            "one; pass --subject to narrow it."
+        ),
+    )
+    _add_config_argument(session_show)
+    session_show.add_argument(
+        "--session",
+        required=True,
+        dest="session_id",
+        metavar="SESSION_ID",
+        help="The session to show, as `admin session-list` or a client names it.",
+    )
+    session_show.add_argument(
+        "--subject",
+        default=None,
+        dest="subject_id",
+        metavar="SUBJECT_ID",
+        help="Only this consumer's aggregate for the session.",
+    )
+    session_show.set_defaults(handler=_cmd_admin_session_show)
 
     admin_reconcile = admin_sub.add_parser(
         "reconcile",
@@ -577,14 +650,22 @@ def _cmd_admin_api_key(args: argparse.Namespace) -> int:
     instead — where the only thing wasted is a command.
 
     Raises:
-        PotluckError: If the quota would admit nothing, or the subject is not a
-            consumer this center knows.
+        PotluckError: If the quota would admit nothing, the deadline would admit
+            nothing either, or the subject is not a consumer this center knows.
     """
     if args.quota < 1:
         raise PotluckError(
             f"--quota must be >= 1 milli-credit, got {args.quota}: a key with no "
             "quota admits nothing, and minting one is a mistake worth reporting "
             "rather than a key worth holding"
+        )
+    deadline_ms: int | None = args.deadline_ms
+    if deadline_ms is not None and deadline_ms < 1:
+        raise PotluckError(
+            f"--deadline-ms must be >= 1 millisecond, got {deadline_ms}: a request "
+            "with no budget expires before it can run, and a key that admits only "
+            "expired requests is a mistake worth reporting rather than a key worth "
+            "holding"
         )
     now = dt.datetime.now(dt.UTC)
     expires_at = None if args.expires_in is None else now + _parse_duration(args.expires_in)
@@ -610,6 +691,7 @@ def _cmd_admin_api_key(args: argparse.Namespace) -> int:
             quota_milli_credits=int(args.quota),
             created_at=now,
             expires_at=expires_at,
+            deadline_ms=deadline_ms,
         )
     finally:
         store.close()
@@ -618,13 +700,96 @@ def _cmd_admin_api_key(args: argparse.Namespace) -> int:
     # recovered.
     print(plaintext)
     expires = "never" if record.expires_at is None else record.expires_at.isoformat()
+    deadline = (
+        "the endpoint's default" if record.deadline_ms is None else f"{record.deadline_ms}ms"
+    )
     print(
         f"{PROG}: API key {record.key_id} minted for {record.subject_id} "
         f"(tenant {record.tenant_id}, quota {record.quota_milli_credits} "
-        f"milli-credits, expires {expires}); shown once. Point a client at "
+        f"milli-credits, expires {expires}, per-request deadline {deadline}); "
+        "shown once. Point a client at "
         "base_url <center-url>/openai/v1 with this key as its API key.",
         file=sys.stderr,
     )
+    return 0
+
+
+def _cmd_admin_session_list(args: argparse.Namespace) -> int:
+    """Run ``admin session-list``: every session aggregate, most recent first.
+
+    The listing is an operator view of the center's own books, so it prints what
+    the aggregate holds and nothing it would have to invent: a session whose
+    turns have not settled yet shows zero tokens and zero credit, which is the
+    truth about what has been billed rather than an estimate of what will be.
+    """
+    store = _load_center_store(args.config)
+    try:
+        sessions = store.sessions(subject_id=args.subject_id)
+    finally:
+        store.close()
+    for record in sessions:
+        print(
+            f"{record.session_id} subject={record.subject_id} "
+            f"tenant={record.tenant_id} requests={record.request_count} "
+            f"tokens={record.total_tokens} "
+            f"milli_credits={record.total_milli_credits} "
+            f"last_node={record.last_node_id or 'none'} "
+            f"last_seen={record.last_seen_at.isoformat()}"
+        )
+    if not sessions:
+        scope = f"for subject {args.subject_id}" if args.subject_id else "in this center"
+        print(
+            f"{PROG}: no agent session {scope}; a session exists once a request "
+            "names one, which an OpenAI-compatible caller does with the "
+            f"{SESSION_HEADER} header and a signed caller with the body's "
+            "session_id field",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_admin_session_show(args: argparse.Namespace) -> int:
+    """Run ``admin session-show``: one session's aggregate and its receipts.
+
+    The receipts are listed rather than summarized away, because a total an
+    operator cannot check against the records behind it is a claim rather than an
+    account. Each id printed here verifies on its own with ``verify receipt``.
+
+    Raises:
+        PotluckError: If no session aggregate carries that identifier.
+    """
+    store = _load_center_store(args.config)
+    try:
+        sessions = store.sessions(subject_id=args.subject_id, session_id=args.session_id)
+        receipts = store.receipts_for_session(args.session_id)
+    finally:
+        store.close()
+    if not sessions:
+        raise PotluckError(
+            f"no agent session {args.session_id!r} in this center"
+            + (
+                f" for subject {args.subject_id!r}"
+                if args.subject_id
+                else "; a session exists once a request names one"
+            )
+        )
+    for record in sessions:
+        print(
+            f"session={record.session_id} subject={record.subject_id} "
+            f"tenant={record.tenant_id}"
+        )
+        print(f"  requests={record.request_count}")
+        print(f"  tokens={record.total_tokens}")
+        print(f"  milli_credits={record.total_milli_credits}")
+        print(f"  last_node={record.last_node_id or 'none'}")
+        print(f"  created_at={record.created_at.isoformat()}")
+        print(f"  last_seen={record.last_seen_at.isoformat()}")
+    print(f"  receipts={len(receipts)}")
+    for receipt in receipts:
+        print(
+            f"    {receipt.receipt_id} request={receipt.request_id}"
+            f" log_index={receipt.log_index}"
+        )
     return 0
 
 
@@ -639,11 +804,13 @@ def _cmd_admin_api_key_list(args: argparse.Namespace) -> int:
         expires = "never" if record.expires_at is None else record.expires_at.isoformat()
         last_used = "never" if record.last_used_at is None else record.last_used_at.isoformat()
         name = f' name="{record.name}"' if record.name else ""
+        deadline = "default" if record.deadline_ms is None else f"{record.deadline_ms}ms"
         print(
             f"{record.key_id}{name} subject={record.subject_id} "
             f"tenant={record.tenant_id} "
             f"quota={record.used_milli_credits}/{record.quota_milli_credits} "
             f"remaining={record.remaining_milli_credits} "
+            f"deadline={deadline} "
             f"expires={expires} last_used={last_used} {record.status}"
         )
     return 0

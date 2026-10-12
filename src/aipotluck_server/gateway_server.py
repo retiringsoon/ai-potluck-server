@@ -121,15 +121,17 @@ from aipotluck.websocket import (
     handshake_server,
 )
 from aipotluck.wire import (
+    SESSION_HEADER,
     ChatMessage,
     Envelope,
     NodeHello,
+    check_session_id,
     encode_chat_parameters,
     error_envelope,
     parse_chat_messages,
 )
 
-from .errors import ApiKeyRateLimited, ApiKeyUnavailable, ModelUnavailable
+from .errors import ApiKeyRateLimited, ApiKeyUnavailable, ModelUnavailable, QueueFull
 from .persistence import ApiKeyRecord, CenterStore, Credential, NodeRecord, StoredEvent
 
 logger = logging.getLogger(__name__)
@@ -277,6 +279,7 @@ class GatewayServiceProtocol(Protocol):
         delivery_mode: str,
         max_attempts: int,
         deadline_ms: int,
+        session_id: str | None = ...,
         now: dt.datetime | None = ...,
     ) -> AdmitResult:
         """Admit a new request, idempotently on ``(tenant, idempotency_key)``."""
@@ -291,6 +294,7 @@ class GatewayServiceProtocol(Protocol):
         parameters: Mapping[str, Any] | None = ...,
         delivery_mode: str,
         deadline_ms: int,
+        session_id: str | None = ...,
         now: dt.datetime | None = ...,
     ) -> AdmitResult:
         """Admit a request authenticated by an operator-issued API key.
@@ -412,6 +416,11 @@ _STATUS_BY_ERROR: tuple[tuple[type[PotluckError], int, str], ...] = (
     (StateTransitionError, 409, "conflict"),
     (SettlementError, 409, "conflict"),
     (InsufficientFundsError, 402, "insufficient_funds"),
+    # `no_nodes` is the code the platform's own consumer client already maps to a
+    # "nothing can run this" refusal, so the center names the condition the way
+    # its client reads it rather than as a generic bad request.
+    (ModelUnavailable, 404, "no_nodes"),
+    (QueueFull, 503, "queue_full"),
     (CanonicalizationError, 400, "bad_request"),
     (ProtocolError, 400, "bad_request"),
     (MeteringError, 400, "bad_request"),
@@ -513,6 +522,12 @@ _OPENAI_ERROR_TYPE: dict[str, str] = {
 _OPENAI_ADMISSION_ERROR: tuple[tuple[type[PotluckError], int, str], ...] = (
     (ApiKeyUnavailable, 401, "invalid_api_key"),
     (ApiKeyRateLimited, 429, "rate_limit_exceeded"),
+    # A full dispatch queue and a per-key ceiling are different facts with the
+    # same remedy, and the remedy is what an OpenAI client acts on: back off and
+    # retry. `429` with this code is what makes an existing client's own retry
+    # logic do the right thing without learning a new code, and the message still
+    # says which of the two it hit.
+    (QueueFull, 429, "rate_limit_exceeded"),
     (InsufficientFundsError, 429, "insufficient_quota"),
     (ModelUnavailable, 404, "model_not_found"),
     (CanonicalizationError, 400, "invalid_request"),
@@ -525,6 +540,18 @@ _OPENAI_ADMISSION_ERROR: tuple[tuple[type[PotluckError], int, str], ...] = (
 #: client pointed at the wrong surface is told what is missing instead of
 #: reading a generic `404` as a misconfigured base URL.
 _OPENAI_UNSUPPORTED_ENDPOINTS: frozenset[str] = frozenset({"completions", "embeddings"})
+
+
+class _SessionRefused:
+    """The marker a session read returns once it has already answered `400`.
+
+    A distinct type rather than `None`, because `None` already means "this
+    request named no session" and the two have opposite outcomes: one admits the
+    request and one does not.
+    """
+
+
+_SESSION_REFUSED = _SessionRefused()
 
 
 def _openai_admission_error(error: PotluckError) -> tuple[int, str]:
@@ -741,6 +768,12 @@ class _AdmissionRequest:
     max_attempts: int
     deadline_ms: int
     authorization: SignedRecord
+    #: The agent session this turn belongs to, or `None`. Read from the body
+    #: rather than from a header on this surface, because a signed request is one
+    #: canonical document: the fields that describe the request travel together in
+    #: it, and the signature over the rest of the body is what makes tampering
+    #: with any of them visible.
+    session_id: str | None
 
     @classmethod
     def from_json(cls, body: dict[str, Any]) -> _AdmissionRequest:
@@ -754,6 +787,9 @@ class _AdmissionRequest:
         authorization = body.get("authorization")
         if not isinstance(authorization, dict):
             raise ProtocolError("the body must carry an authorization object")
+        raw_session = body.get("session_id")
+        if raw_session is not None and not isinstance(raw_session, str):
+            raise ProtocolError("session_id must be a string")
         return cls(
             idempotency_key=_require_body_str(body, "idempotency_key"),
             messages=parse_chat_messages(body.get("messages")),
@@ -764,6 +800,7 @@ class _AdmissionRequest:
             max_attempts=_require_body_int(body, "max_attempts"),
             deadline_ms=_require_body_int(body, "deadline_ms"),
             authorization=_signed_record_from_json(authorization),
+            session_id=raw_session,
         )
 
 
@@ -2026,6 +2063,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 delivery_mode=admission.delivery_mode,
                 max_attempts=admission.max_attempts,
                 deadline_ms=admission.deadline_ms,
+                session_id=admission.session_id,
             )
         )
         if result is None:
@@ -2707,6 +2745,37 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             return None
         return key
 
+    def _openai_session(self) -> str | _SessionRefused | None:
+        """Read the agent session this request named, from its own header.
+
+        A header rather than a body field, because this surface is OpenAI's and an
+        agent framework driving it through the OpenAI SDK can add
+        ``default_headers`` without touching anything else it sends. The
+        identifier itself is the client package's: one spelling of the header name
+        and one rule for what an identifier may contain, in the module both sides
+        already share.
+
+        The value is stripped before it is checked, and that is this transport's
+        rule rather than leniency: RFC 9110 says whitespace around a field value
+        is not part of it, while in the JSON body the signed surface reads the same
+        identifier from, spaces inside a string are. Each door applies its own
+        transport's parsing and then the one shared check, so an identifier that
+        survives both is the same identifier whichever came in.
+
+        Returns:
+            The session identifier, `None` when the request named no session, or
+            `_SESSION_REFUSED` after a `400` has been sent for one this platform
+            cannot store.
+        """
+        raw = self.headers.get(SESSION_HEADER)
+        if raw is None:
+            return None
+        try:
+            return check_session_id(raw.strip())
+        except ProtocolError as exc:
+            self._openai_fail(400, "invalid_request", str(exc))
+            return _SESSION_REFUSED
+
     def _openai_body(self) -> dict[str, Any] | None:
         """Read and parse an OpenAI-shaped request body.
 
@@ -2882,6 +2951,17 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 started_at=started,
             )
             return
+        session = self._openai_session()
+        if isinstance(session, _SessionRefused):
+            self._log_openai_request(
+                endpoint="openai_chat_completions",
+                key=key,
+                model=request.model,
+                outcome="refused:invalid_request",
+                status=400,
+                started_at=started,
+            )
+            return
         admitted = self._call_openai_service(
             lambda: self._gw.service.admit_api_key_request(
                 api_key=key,
@@ -2890,6 +2970,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 parameters=request.parameters,
                 delivery_mode="stream_strict" if request.stream else "buffered_complete",
                 deadline_ms=OPENAI_REQUEST_DEADLINE_MS,
+                session_id=session,
             )
         )
         if admitted is None:

@@ -14,6 +14,7 @@ because a config that only mostly parses is a config an operator cannot audit.
       "settlement_key_id": "settlement-key-1",
       "settlement_private_key_b64": "<base64 Ed25519 private key>",
       "certfile": null, "keyfile": null,
+      "queue_enabled": true, "max_queue_depth": 100,
       "credentials": [
         {"token": "...", "tenant_id": "tenant-a", "subject_id": "consumer-X",
          "role": "consumer"}
@@ -25,6 +26,15 @@ because a config that only mostly parses is a config an operator cannot audit.
       ],
       "consumer_floats": [{"account_id": "consumer-X", "amount": 100000}]
     }
+
+``queue_enabled`` and ``max_queue_depth`` are optional and govern the dispatch
+queue: whether a request nothing can dispatch this instant waits for a node
+instead of being refused, and how many such requests the center holds at once.
+See `GatewayService`'s configuration for why the default is on. A request that
+waits still carries its own deadline, and the sweep that ends an overdue request
+is the same one that always ran, so a queued request nothing ever took still ends
+``EXPIRED`` with the center's own reason recorded — waiting changes when a
+request is answered, never whether it is billed honestly.
 
 The node and consumer loaders, the consumer HTTP client, and the shared
 config-parsing helpers live in :mod:`aipotluck.deploy` (the client package
@@ -60,6 +70,8 @@ from aipotluck.deploy import (
     PROVISIONED_AT,
     DeploymentError,
     load_document,
+    optional_bool,
+    optional_int,
     require_int,
     require_object_list,
     require_str,
@@ -69,7 +81,7 @@ from aipotluck.errors import PotluckError, UnknownKeyError
 from aipotluck.identity import IdentityRegistry, KeyPurpose, load_private_key
 
 from .gateway_server import GatewayServer
-from .gateway_service import GatewayConfig, GatewayService
+from .gateway_service import DEFAULT_MAX_QUEUE_DEPTH, GatewayConfig, GatewayService
 from .persistence import CenterStore
 
 if TYPE_CHECKING:
@@ -485,6 +497,14 @@ def _center_parts(
             f"{context}: certfile and keyfile must be configured together, "
             "or both null for cleartext HTTP"
         )
+    queue_enabled = optional_bool(document, "queue_enabled", context, True)
+    max_queue_depth = optional_int(
+        document, "max_queue_depth", context, DEFAULT_MAX_QUEUE_DEPTH
+    )
+    if max_queue_depth < 0:
+        raise DeploymentError(
+            f"{context}: field 'max_queue_depth' must be >= 0, got {max_queue_depth}"
+        )
     config = GatewayConfig(
         host=host,
         port=port,
@@ -494,6 +514,8 @@ def _center_parts(
         settlement_private_key_b64=settlement_private_key_b64,
         certfile=certfile,
         keyfile=keyfile,
+        queue_enabled=queue_enabled,
+        max_queue_depth=max_queue_depth,
     )
     return (
         config,

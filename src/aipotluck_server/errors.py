@@ -48,4 +48,25 @@ class ModelUnavailable(PotluckError):
     caller nothing about the one thing that was actually wrong. The platform's
     own consumer client refuses the same way, before it creates a request it
     knows cannot start.
+
+    This is the *model* refusal and not the *capacity* one. A center that serves
+    the model but has nothing free this instant does not raise it: that request
+    waits in the dispatch queue, because a busy pool is a condition that ends and
+    an unserved model is not.
+    """
+
+
+class QueueFull(PotluckError):
+    """Raised when the center's dispatch queue is already at its bound.
+
+    The queue exists so a request that nothing can dispatch this instant waits
+    instead of being refused; the bound exists so waiting cannot grow without
+    limit. This is the answer when the two meet: the center is holding as much
+    unfinished work as its operator agreed it would hold, so the honest response
+    is "retry later" rather than a promise it cannot keep.
+
+    Distinct from `ApiKeyRateLimited`, which is about one key's own share, and
+    from `ModelUnavailable`, which is about work nothing can ever run. A caller
+    backs off for this one and re-authenticates or re-checks its model for the
+    others.
     """

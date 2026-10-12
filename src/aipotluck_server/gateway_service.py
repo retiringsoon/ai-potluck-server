@@ -59,6 +59,7 @@ from aipotluck.canonical import (
     verify_payload,
 )
 from aipotluck.errors import (
+    ConflictError,
     GatewayError,
     IdentityBindingError,
     InsufficientFundsError,
@@ -98,12 +99,13 @@ from aipotluck.wire import (
     NodeHeartbeat,
     NodeHello,
     ResumeDirective,
+    check_session_id,
     compute_permit_hash,
     compute_request_digest,
     parse_chat_messages,
 )
 
-from .errors import ApiKeyRateLimited, ApiKeyUnavailable, ModelUnavailable
+from .errors import ApiKeyRateLimited, ApiKeyUnavailable, ModelUnavailable, QueueFull
 from .persistence import (
     ApiKeyRecord,
     AttemptRecord,
@@ -123,6 +125,31 @@ DEFAULT_OFFER_ACCEPT_TIMEOUT_S = 10.0
 DEFAULT_DEADLINE_MS = 60_000
 DEFAULT_MAX_ATTEMPTS = 1
 DEFAULT_CONSUMER_QUEUE_SIZE = 256
+
+#: How many requests the center holds in its dispatch queue by default. A bound
+#: rather than a policy: a queue with no bound is a promise to hold every request
+#: that arrives until its deadline, which on a center with no nodes connected is
+#: a promise to accept work it cannot do and to answer all of it with a timeout.
+#: One hundred is comfortably above the per-key in-flight ceiling times any
+#: plausible number of keys a small center has issued, and comfortably below the
+#: point where the deadline sweep's own batch bound would stop covering the
+#: queue in one pass.
+DEFAULT_MAX_QUEUE_DEPTH = 100
+
+#: How long a request that every candidate node declined waits before the center
+#: asks them again, in seconds. Without it a waiting request would be re-offered
+#: on every tick — four times a second — and each offer is a round trip to a node
+#: that just said no. With it, a node that frees up takes the work within this
+#: window, which is short against a deadline measured in tens of seconds.
+QUEUE_REOFFER_BACKOFF_S = 2.0
+
+#: The event types the center appends to a request's own stream for the dispatch
+#: decisions it makes by itself. They ride the same ordered, replayable, never
+#: rewritten stream a node's `output.delta` and `usage.final` do, so a consumer
+#: reading ``GET /v1/requests/{id}/events`` sees the request wait and then get
+#: dispatched rather than inferring it from a status change.
+QUEUED_EVENT_TYPE = "request.queued"
+DISPATCHED_EVENT_TYPE = "request.dispatched"
 
 #: How many requests one deadline sweep examines per non-terminal status.
 #: Bounded because the sweep runs both on the ticker's interval and at every
@@ -216,6 +243,23 @@ def _aware(moment: dt.datetime) -> dt.datetime:
         raise ValueError("timestamps must be timezone-aware")
     return moment.astimezone(dt.UTC)
 
+
+def _dispatch_stream_id(request_id: str) -> str:
+    """Return the event-stream identity for the center's own dispatch events.
+
+    The event store orders every event by a per-request cursor but deduplicates
+    replays by ``(attempt_id, attempt_seq)``, and a queue transition happens
+    before any attempt exists. Rather than weaken that key, the center's own
+    dispatch events are appended under one synthetic stream identity per request.
+
+    The identity is deliberately not a row in the ``attempts`` table: no resume
+    directive, no node read and no reconciliation pass can mistake it for an
+    attempt a node owes work on, and its own sequences stay contiguous and
+    replay-safe exactly like a real attempt's.
+    """
+    return f"{request_id}-dispatch"
+
+
 _CANCEL_ORIGINS = frozenset(
     {
         "consumer_cancel",
@@ -266,6 +310,39 @@ class GatewayConfig:
     consumer_queue_size: int = DEFAULT_CONSUMER_QUEUE_SIZE
     certfile: str | None = None
     keyfile: str | None = None
+    #: Whether a request nothing can dispatch this instant waits instead of being
+    #: refused. **On by default**, for three reasons.
+    #:
+    #: One: the two admission doors already disagreed. A request admitted on a
+    #: signature has always waited — it is stored `ROUTING` and re-offered on
+    #: every tick until a node takes it or its deadline passes — while one
+    #: admitted on an API key was refused at the door. Same dispatch, same books,
+    #: two different answers to the same fact about the pool. Defaulting this on
+    #: is what makes the second door behave like the first rather than the
+    #: reverse.
+    #:
+    #: Two: waiting is bounded by facts the center already keeps honest. The
+    #: queue has a depth bound (`max_queue_depth`), each request still carries its
+    #: own deadline, and the deadline sweep that ends an overdue request is the
+    #: same sweep that has always run — so a queued request that nothing ever
+    #: took still ends `EXPIRED` with the center's own reason on its billing
+    #: note, and is neither billed nor reported as served.
+    #:
+    #: Three: contention is the condition an operator can fix, by running another
+    #: node. Refusing at the door turns a two-second capacity dip into an error
+    #: the caller has to notice, classify and retry, which is strictly more work
+    #: for everybody and loses the requests that a short wait would have saved.
+    #:
+    #: Turning it off is the right answer for a center whose operator would rather
+    #: shed load than hold it — a public one, where every waiting request is an
+    #: open connection and a client's own backoff is a better place to decide than
+    #: the center's memory. With it off, a request nothing can dispatch is refused
+    #: immediately and nothing waits.
+    queue_enabled: bool = True
+    #: The most requests the center holds waiting for a node at once. Read at
+    #: every admission gate; a request that would exceed it is refused with
+    #: `QueueFull` rather than admitted to wait past any useful deadline.
+    max_queue_depth: int = DEFAULT_MAX_QUEUE_DEPTH
 
 
 @dataclass(frozen=True)
@@ -1004,6 +1081,7 @@ class GatewayService:
         delivery_mode: str = "buffered_complete",
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         deadline_ms: int = DEFAULT_DEADLINE_MS,
+        session_id: str | None = None,
         now: dt.datetime | None = None,
     ) -> AdmitResult:
         """Admit one request, enforcing the authority chain before any dispatch.
@@ -1023,6 +1101,11 @@ class GatewayService:
             delivery_mode: `buffered_complete` or `stream_strict`.
             max_attempts: Hard attempt cap.
             deadline_ms: Wall-clock budget from admission.
+            session_id: The agent session this turn belongs to, or `None`. A
+                label rather than a credential, and deliberately outside the
+                signed `request_digest`: the aggregate it feeds is keyed by the
+                tenant and subject this credential authenticated, so naming
+                somebody else's session attributes nothing to them.
 
         Returns:
             The admission result. `created=False` means an idempotent replay,
@@ -1035,8 +1118,11 @@ class GatewayService:
                 ``delivery_mode``/``parameters`` do not reproduce the
                 authorization's ``request_digest``, if `max_attempts` or
                 `max_charge_milli_credits` exceeds the signed cap, if `model` is
-                outside the signed allowlist, or if the attempt budget and
-                deadline are not positive.
+                outside the signed allowlist, if the attempt budget and deadline
+                are not positive, or if `session_id` is not an identifier the
+                wire accepts.
+            QueueFull: If the center's dispatch queue is at its bound and this
+                idempotency key names no request the center already admitted.
             ConflictError: On a reused idempotency key with different content.
         """
         moment = now or self._moment()
@@ -1044,6 +1130,7 @@ class GatewayService:
             raise ProtocolError(f"max_attempts must be >= 1, got {max_attempts}")
         if deadline_ms < 1:
             raise ProtocolError(f"deadline_ms must be >= 1, got {deadline_ms}")
+        session = None if session_id is None else check_session_id(session_id)
         self._sweep_before_admission(moment)
         record = _coerce_record(authorization)
         if record.schema != SCHEMA_AUTHORIZATION:
@@ -1144,6 +1231,7 @@ class GatewayService:
             deadline_ms=deadline_ms,
             authorization=record,
             moment=moment,
+            session_id=session,
         )
 
     def admit_api_key_request(
@@ -1157,6 +1245,7 @@ class GatewayService:
         max_charge_milli_credits: int = API_KEY_DEFAULT_MAX_CHARGE_MILLI_CREDITS,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         deadline_ms: int = DEFAULT_DEADLINE_MS,
+        session_id: str | None = None,
         now: dt.datetime | None = None,
     ) -> AdmitResult:
         """Admit one request authenticated by an operator-issued API key.
@@ -1192,7 +1281,14 @@ class GatewayService:
             max_charge_milli_credits: The ceiling the caller asked for, capped
                 here by the key's remaining quota.
             max_attempts: Hard attempt cap.
-            deadline_ms: Wall-clock budget from admission.
+            deadline_ms: The wall-clock budget the surface asks for. A key minted
+                with ``admin api-key --deadline-ms`` carries its own, and that one
+                wins: it is the operator's statement about the work this key is
+                for, which the surface cannot know.
+            session_id: The agent session this turn belongs to, or `None`. On the
+                OpenAI-compatible surface it arrives as the `wire.SESSION_HEADER`
+                header, which an OpenAI SDK client can send through
+                ``default_headers`` without any other change.
             now: The center's clock; defaults to the wall clock.
 
         Returns:
@@ -1204,14 +1300,19 @@ class GatewayService:
             ApiKeyRateLimited: If the key is at its concurrency ceiling or its
                 request rate.
             InsufficientFundsError: If the key has spent its quota.
-            ModelUnavailable: If no connected node can run `model`.
-            ProtocolError: If the conversation is empty or the ceiling is not
-                positive.
+            ModelUnavailable: If no connected node runs `model` at all. A center
+                that runs it but has nothing free this instant does not refuse
+                here: the request is admitted and waits in the dispatch queue,
+                unless the queue is at its bound.
+            QueueFull: If the center's dispatch queue is at its bound.
+            ProtocolError: If the conversation is empty, the ceiling is not
+                positive, or `session_id` is not an identifier the wire accepts.
         """
         moment = now or self._moment()
         conversation = tuple(messages)
         if not conversation:
             raise ProtocolError("a request must carry at least one message")
+        session = None if session_id is None else check_session_id(session_id)
         # The sweep runs before this key's own limits are read, because the slots
         # an overdue request still holds are counted against them: without it a
         # key whose slots nothing ever swept is refused at its ceiling forever.
@@ -1240,18 +1341,30 @@ class GatewayService:
                 f"API key {key.key_id} speaks for {key.subject_id!r}, which this "
                 "center holds no consumer identity or credential for"
             )
-        if self._pick_node(model, set(), moment) is None:
-            available = sorted(
-                {
-                    record.model
-                    for record in self._store.connected_nodes()
-                    if record.share_enabled
-                }
-            )
+        # A model this center has no node for is refused here rather than queued,
+        # and the two refusals it could make are different facts. "No node of this
+        # center runs that model" is a statement about the request: waiting cannot
+        # make it true, so holding the request would only turn a typo into a
+        # timeout that names nothing. "Nothing can take it right now" is a
+        # statement about load, which ends, and that one `_admit_and_offer` decides
+        # about below.
+        #
+        # The catalogue is read across every willing node rather than only the
+        # connected ones, because a pool whose nodes are all mid-restart still
+        # serves the models they advertise: answering `model_not_found` then would
+        # be a false statement about the center, and would refuse the requests a
+        # queue exists to hold.
+        catalogue = sorted(self._store.catalogued_models())
+        if model not in catalogue:
             raise ModelUnavailable(
-                f"no connected contribution node runs model {model!r}; the models "
-                f"this center can serve right now are {available}"
+                f"no contribution node of this center runs model {model!r}; the "
+                f"models it has nodes for are {catalogue}"
             )
+        # The key's own deadline wins over the surface default, because it is the
+        # one fact an operator recorded about *this* key: a key minted for an
+        # agent loop gets a window long enough for a long turn, and a key minted
+        # for a one-shot question keeps the surface's own.
+        budget_ms = key.deadline_ms if key.deadline_ms is not None else deadline_ms
         credential = Credential(
             tenant_id=key.tenant_id,
             subject_id=key.subject_id,
@@ -1276,7 +1389,7 @@ class GatewayService:
             delivery_mode=delivery_mode,
             max_charge_milli_credits=ceiling,
             max_attempts=max_attempts,
-            deadline_ms=deadline_ms,
+            deadline_ms=budget_ms,
             moment=moment,
         )
         result = self._admit_and_offer(
@@ -1294,10 +1407,11 @@ class GatewayService:
             model=model,
             delivery_mode=delivery_mode,
             max_attempts=max_attempts,
-            deadline_ms=deadline_ms,
+            deadline_ms=budget_ms,
             authorization=authorization,
             moment=moment,
             api_key_id=key.key_id,
+            session_id=session,
         )
         self._store.mark_api_key_used(key.key_id, moment)
         return result
@@ -1434,6 +1548,7 @@ class GatewayService:
         authorization: SignedRecord,
         moment: dt.datetime,
         api_key_id: str | None = None,
+        session_id: str | None = None,
     ) -> AdmitResult:
         """Store one admitted request, and offer its first attempt.
 
@@ -1441,15 +1556,36 @@ class GatewayService:
         was authorized and not in what an admitted request does next: one row,
         one stored conversation, one attempt cap, one dispatch. Every authority
         check has already run by the time this is called, so nothing here decides
-        whether the request may run.
+        whether the request *may* run — only whether it may run now or wait.
 
         The API key is bound to the request row before the offer goes out, inside
         the same lock: settlement reads that binding to count the charge against
         the key's quota, and a center interrupted between dispatch and settlement
-        must still find it.
+        must still find it. The queue bound is read under that same lock, so two
+        concurrent admissions cannot each see room for one request.
+
+        Raises:
+            ModelUnavailable: If nothing can dispatch this request and the center
+                is configured not to hold it.
+            QueueFull: If nothing can dispatch it and the queue is at its bound.
+            ConflictError: If the idempotency key names a request the center
+                already admitted under a *different* request id. The replay is
+                only idempotent when it replays the same request; a fresh
+                signature over the same work is a second request wearing the
+                first one's key, and answering it with the first one's id would
+                report a dispatch the caller never asked for.
         """
         deliveries: list[tuple[str, Envelope]] = []
         with self._lock:
+            # Decided before the row exists, so an admission this refuses creates
+            # nothing to sweep, nothing to bill and nothing for a caller to poll.
+            if self._pick_node(model, set(), moment) is None:
+                self._refuse_or_make_room(
+                    credential=credential,
+                    idempotency_key=idempotency_key,
+                    model=model,
+                    moment=moment,
+                )
             stored, created = self._store.create_request(
                 request_id=request_id,
                 tenant_id=credential.tenant_id,
@@ -1461,10 +1597,27 @@ class GatewayService:
                 service_unit_id=request_id,
                 deadline_at=moment + dt.timedelta(milliseconds=deadline_ms),
                 created_at=moment,
+                session_id=session_id,
             )
+            if not created and stored.request_id != request_id:
+                raise ConflictError(
+                    f"idempotency key {idempotency_key} already admitted request "
+                    f"{stored.request_id}, which is not {request_id}; one key replays "
+                    "one request, so either resubmit with the request id the center "
+                    "returned or mint a fresh idempotency key for new work"
+                )
             if created:
                 if api_key_id is not None:
                     self._store.bind_request_api_key(request_id, api_key_id)
+                if session_id is not None:
+                    # Counted at admission rather than at settlement, so a turn
+                    # that failed or expired is still a turn this session made.
+                    self._store.touch_session(
+                        tenant_id=credential.tenant_id,
+                        subject_id=credential.subject_id,
+                        session_id=session_id,
+                        at=moment,
+                    )
                 # Only a request this admission created reaches here, so its
                 # inputs are written once by construction: an idempotent replay
                 # returns `created=False` and never touches what the first write
@@ -1494,7 +1647,19 @@ class GatewayService:
                         request_id, "FAILED", f"first attempt not offered: {exc}", moment
                     )
                     raise
-            current = self._store.get_request(request_id)
+                if not deliveries:
+                    # Nothing took the work, so the request is now waiting. The
+                    # wait is recorded on the request's own event stream rather
+                    # than left for a caller to infer from a status that has not
+                    # changed: a consumer reading the stream sees the request
+                    # queue, and later sees it dispatched.
+                    self._append_dispatch_event(
+                        request_id,
+                        QUEUED_EVENT_TYPE,
+                        {"reason": "no node can take the work right now"},
+                        moment,
+                    )
+            current = self._store.get_request(stored.request_id)
             assert current is not None
             result = AdmitResult(
                 request_id=current.request_id,
@@ -1504,6 +1669,95 @@ class GatewayService:
             )
         self._deliver(deliveries)
         return result
+
+    def _refuse_or_make_room(
+        self,
+        *,
+        credential: Credential,
+        idempotency_key: str,
+        model: str,
+        moment: dt.datetime,
+    ) -> None:
+        """Decide whether a request nothing can dispatch yet may wait for one.
+
+        Called only when `_pick_node` found nothing, so the question is not
+        whether this request can run now — it cannot — but whether the center
+        holds it or refuses it. Both answers are honest; which one an operator
+        wants is `GatewayConfig.queue_enabled`.
+
+        A retry of a request the center already admitted is let through even at
+        the bound, because the idempotency key's whole promise is that a retry is
+        a no-op: refusing it would make the key stop meaning what it says exactly
+        when a caller is retrying under load, and the request it would refuse is
+        one the center is already holding.
+
+        Raises:
+            ModelUnavailable: If the center is configured not to hold work.
+            QueueFull: If it is, and is already holding as much as it agreed to.
+        """
+        if not self._config.queue_enabled:
+            raise ModelUnavailable(
+                f"no connected contribution node can run model {model!r} right now, "
+                "and this center is configured not to hold a request that nothing "
+                "can dispatch (queue_enabled is false); retry, or run a node that "
+                "serves it"
+            )
+        if self._queue_is_full():
+            replay = self._store.request_by_idempotency_key(
+                credential.tenant_id, idempotency_key
+            )
+            if replay is None:
+                raise QueueFull(
+                    f"this center is already holding {self._queue_depth()} request(s) "
+                    f"waiting for a contribution node, at its queue bound of "
+                    f"{max(0, self._config.max_queue_depth)}; nothing can run model "
+                    f"{model!r} right now, so retry later or ask the operator to run "
+                    "another node"
+                )
+
+    def _queue_depth(self) -> int:
+        """How many requests are waiting for a node.
+
+        The queue *is* this count: a request in `ROUTING` is one the center has
+        admitted and has not yet placed with a node, so there is no separate queue
+        structure to disagree with the request rows, and nothing to rebuild after a
+        restart.
+        """
+        return self._store.count_requests_by_status("ROUTING")
+
+    def _queue_is_full(self) -> bool:
+        """Whether the center is holding as many waiting requests as it agreed to.
+
+        Callers hold the service lock, so the depth read and the decision made from
+        it see one consistent moment: two admissions cannot each find room for one
+        request.
+        """
+        return self._queue_depth() >= max(0, self._config.max_queue_depth)
+
+    def _append_dispatch_event(
+        self,
+        request_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        moment: dt.datetime,
+    ) -> None:
+        """Append one of the center's own dispatch events to a request's stream.
+
+        The stream is the same ordered, replayable, never-rewritten one a node's
+        `output.delta` and `usage.final` ride, so a queue transition is as
+        durable and as auditable as anything else that happened to the request —
+        which is the standard the transparency log sets and the reason these are
+        stored events rather than log lines.
+        """
+        stream = _dispatch_stream_id(request_id)
+        self._store.append_event(
+            request_id=request_id,
+            attempt_id=stream,
+            attempt_seq=self._store.last_attempt_seq(stream) + 1,
+            event_type=event_type,
+            payload=payload,
+            at=moment,
+        )
 
     def _terminate_undispatchable(
         self, request_id: str, status: str, reason: str, moment: dt.datetime
@@ -1570,7 +1824,7 @@ class GatewayService:
         self._deliver(deliveries)
 
     def _offer_isolated(
-        self, record: RequestRecord, moment: dt.datetime
+        self, record: RequestRecord, moment: dt.datetime, *, leaving_queue: bool = False
     ) -> list[tuple[str, Envelope]]:
         """Offer one request, reporting a failure instead of ending the round.
 
@@ -1582,7 +1836,7 @@ class GatewayService:
         ever being ended.
         """
         try:
-            return self._offer_new_attempt(record, moment)
+            return self._offer_new_attempt(record, moment, leaving_queue=leaving_queue)
         except Exception:
             logger.exception(
                 "request %s could not be offered; the rest of the round continues",
@@ -2163,8 +2417,22 @@ class GatewayService:
         """Advance timers and return the messages to deliver.
 
         Three jobs, in order: expire requests past their deadline, offer requests
-        that were admitted while no node was connected, and retire offers that
-        waited past the accept timeout before offering again.
+        that are waiting in the dispatch queue, and retire offers that waited past
+        the accept timeout before offering again.
+
+        The middle job *is* the queue: `requests_by_status` returns the waiting
+        requests oldest-first, so the order they are offered in is the order they
+        arrived in. That ordering is first-come-first-served on a best-effort
+        basis and is not a promise about position — a request's own deadline, not
+        its place in line, is what bounds its wait, and the center reports a wait
+        it could not end as EXPIRED rather than pretending the queue guarantees
+        anything.
+
+        A request every candidate declined is re-offered to those same nodes once
+        `QUEUE_REOFFER_BACKOFF_S` has passed, by dropping the declined set. That
+        is how a node which freed up takes work it had already refused: the
+        refusal was true when it was given and is not true forever. The backoff is
+        what keeps it from being asked four times a second in the meantime.
 
         Expiry runs first and each offer is isolated, so one request that cannot
         be offered neither gets offered work it is already too late to run nor
@@ -2174,8 +2442,17 @@ class GatewayService:
         pairs: list[tuple[str, Envelope]] = []
         with self._lock:
             pairs.extend(self._expire_overdue_requests(moment))
-            for record in self._store.requests_by_status("ROUTING"):
-                pairs.extend(self._offer_isolated(record, moment))
+            waiting = self._store.requests_by_status(
+                "ROUTING", limit=max(1, self._config.max_queue_depth)
+            )
+            for record in waiting:
+                if self._declined.get(record.request_id):
+                    if moment - record.updated_at < dt.timedelta(
+                        seconds=QUEUE_REOFFER_BACKOFF_S
+                    ):
+                        continue
+                    self._declined.pop(record.request_id, None)
+                pairs.extend(self._offer_isolated(record, moment, leaving_queue=True))
             for attempt in self._stuck_attempts(moment):
                 ref = AttemptRef(
                     request_id=attempt.request_id,
@@ -2210,9 +2487,19 @@ class GatewayService:
     # -- dispatch -----------------------------------------------------------
 
     def _offer_new_attempt(
-        self, record: RequestRecord, moment: dt.datetime
+        self, record: RequestRecord, moment: dt.datetime, *, leaving_queue: bool = False
     ) -> list[tuple[str, Envelope]]:
         """Open one attempt on the best available node and offer it.
+
+        Args:
+            record: The request to dispatch.
+            moment: The center's clock.
+            leaving_queue: Whether this request was waiting for a node when the
+                offer went out. It decides whether the offer is recorded on the
+                request's event stream as a queue exit: a request dispatched
+                straight from its own admission never joined the queue, and an
+                event saying it left one would be a frame about a transition that
+                did not happen.
 
         Returns:
             `(node_id, offer)` pairs to deliver. An empty list means either that
@@ -2228,7 +2515,10 @@ class GatewayService:
         ):
             return []
         attempts = self._store.attempts_for_request(record.request_id)
-        if len(attempts) >= record.max_attempts:
+        # The budget counts executions, not offers. An offer a node refused
+        # consumed no tokens, so it occupies no slot; see
+        # `CenterStore.count_budget_attempts`.
+        if self._store.count_budget_attempts(record.request_id) >= record.max_attempts:
             if record.status not in ("FAILED", "CANCELLED", "EXPIRED", "SUCCEEDED"):
                 self._store.set_request_status(
                     record.request_id,
@@ -2259,7 +2549,14 @@ class GatewayService:
             )
             return []
         node = self._pick_node(
-            inputs["model"], self._declined.get(record.request_id, set()), moment
+            inputs["model"],
+            self._declined.get(record.request_id, set()),
+            moment,
+            # A session's next turn goes back to the node that served its last
+            # one when that node is still a candidate, and anywhere else when it
+            # is not. Read per dispatch rather than cached, so a node that has
+            # since disconnected or been revoked is not preferred.
+            prefer=self._store.session_preference_for(record.request_id),
         )
         if node is None:
             return []
@@ -2287,6 +2584,16 @@ class GatewayService:
             selected_attempt_id=attempt_id,
             at=moment,
         )
+        # Leaving the queue is as much a fact about the request as joining it, so
+        # it lands on the same stream: a consumer reading the events sees which
+        # attempt the wait ended in without polling the status for it.
+        if leaving_queue:
+            self._append_dispatch_event(
+                record.request_id,
+                DISPATCHED_EVENT_TYPE,
+                {"attempt_id": attempt_id, "node_id": node.node_id},
+                moment,
+            )
         attempt = self._store.get_attempt(attempt_id)
         assert attempt is not None
         return [(node.node_id, self._offer_envelope(attempt, moment))]
@@ -2344,13 +2651,32 @@ class GatewayService:
         return Envelope(type="attempt.offer", payload=offer.to_payload())
 
     def _pick_node(
-        self, model: str, exclude: set[str], moment: dt.datetime
+        self,
+        model: str,
+        exclude: set[str],
+        moment: dt.datetime,
+        prefer: str | None = None,
     ) -> NodeRecord | None:
-        """Return the lowest connected node able to run `model`, or None.
+        """Return the connected node to run `model` on, or None.
+
+        The rule is one candidate set and two ways of choosing inside it. A node
+        is a candidate when it is connected, still shares, runs `model`, has not
+        declined this request, and its device key is not revoked. Among the
+        candidates, `prefer` wins when it is one of them; otherwise the lowest
+        node id does.
+
+        `prefer` is the node that served this session's last settled turn, and it
+        is a *preference and never a constraint*. One session's turns are one
+        conversation, and the node that already ran its earlier turns is the one
+        whose upstream is most likely to still hold that context — so the
+        preference is a cost saving, not a routing policy. The moment it is not
+        also a candidate the ordinary rule applies: a node that disconnected, was
+        revoked, paused sharing or declined this request is skipped rather than
+        waited for, because a session that sticks to an unavailable node is a
+        session that stops working.
 
         Deterministic on purpose: a test can predict the choice, and an operator
-        reading a trace sees the same rule the code applies. Nodes in `exclude`
-        have declined this request and are skipped while any alternative exists.
+        reading a trace sees the same rule the code applies.
 
         A node whose device key ``admin revoke-key`` revoked is skipped too, so
         an already-connected session that has since been revoked is offered no
@@ -2366,7 +2692,13 @@ class GatewayService:
             and record.node_id not in exclude
             and not self._store.identity_revoked(record.device_id, moment)
         ]
-        return min(candidates, key=lambda record: record.node_id) if candidates else None
+        if not candidates:
+            return None
+        if prefer is not None:
+            for record in candidates:
+                if record.node_id == prefer:
+                    return record
+        return min(candidates, key=lambda record: record.node_id)
 
     # -- node message handlers ---------------------------------------------
 
@@ -2450,10 +2782,20 @@ class GatewayService:
         moment: dt.datetime,
         deliveries: list[tuple[str, Envelope]],
     ) -> list[Envelope]:
-        """Handle a local-policy refusal by re-offering elsewhere.
+        """Handle a local-policy refusal by re-offering elsewhere, or by waiting.
 
         The refusal is a real fact about the node, so it is recorded on the
-        request's billing note where the consumer can read it.
+        request's billing note where the consumer can read it, and on the attempt
+        row where the dispatch budget reads it: this offer consumed no tokens, so
+        it occupies no slot in a budget that exists to bound executions.
+
+        When nothing else can take the work the request goes back into the
+        dispatch queue instead of being ended, provided the center holds a queue
+        at all. That is the difference between a pool that is momentarily full and
+        a request that can never run: the first ends when a node frees up, which
+        `tick` discovers by asking the nodes that declined again, and the second
+        is what `ModelUnavailable` at admission is for. A center configured not to
+        hold work keeps the old answer and fails the request here.
         """
         decision = AttemptDecision.from_payload(envelope.payload, accepted=False)
         attempt = self._ref_attempt(node_id, decision.ref)
@@ -2462,6 +2804,7 @@ class GatewayService:
         self._store.set_attempt_status(
             attempt.attempt_id, "FAILED", at=moment, execution_state="FAILED"
         )
+        self._store.mark_attempt_refused(attempt.attempt_id, at=moment)
         record = self._store.get_request(attempt.request_id)
         if record is None:
             return []
@@ -2471,14 +2814,40 @@ class GatewayService:
             billing_note=f"node {node_id} declined: {reason}",
             at=moment,
         )
-        deliveries.extend(self._offer_new_attempt(record, moment))
-        if not deliveries:
+        offered = self._offer_new_attempt(record, moment)
+        deliveries.extend(offered)
+        if offered:
+            return []
+        # The bound is checked here too, and not only at admission: a request
+        # admitted while a node looked available joins the queue when that node
+        # declines, so this is the door most queued requests actually come through.
+        # A caller cannot be refused any more — it was told the request was
+        # admitted — so a full queue ends the request with the reason on its books
+        # instead of holding it past what the center agreed to hold.
+        if not self._config.queue_enabled or self._queue_is_full():
             self._store.set_request_status(
                 record.request_id,
                 "FAILED",
                 billing_note=f"no node left to take the work: {reason}",
                 at=moment,
             )
+            return []
+        # Back in the queue, with the reason on both the books and the request's
+        # own event stream. The status goes back to ROUTING because that is the
+        # status `tick` offers from: leaving it RUNNING would hide a waiting
+        # request from the very loop that is supposed to find it a node.
+        self._store.set_request_status(
+            record.request_id,
+            "ROUTING",
+            billing_note=f"waiting for a node: {node_id} declined: {reason}",
+            at=moment,
+        )
+        self._append_dispatch_event(
+            record.request_id,
+            QUEUED_EVENT_TYPE,
+            {"reason": f"node {node_id} declined: {reason}"},
+            moment,
+        )
         return []
 
     def _on_event(
@@ -2802,13 +3171,20 @@ class GatewayService:
                 winner_attempt_id=attempt.attempt_id,
                 settled_at=moment,
             )
-            self._record_settlement(attempt, result, moment)
+            self._record_settlement(
+                attempt, result, moment, settled_tokens=event.usage.total_tokens
+            )
         except BaseException:
             self._resync_books()
             raise
 
     def _record_settlement(
-        self, attempt: AttemptRecord, result: SettlementResult, moment: dt.datetime
+        self,
+        attempt: AttemptRecord,
+        result: SettlementResult,
+        moment: dt.datetime,
+        *,
+        settled_tokens: int,
     ) -> None:
         """Persist a settlement and everything backing it, in one transaction.
 
@@ -2817,6 +3193,12 @@ class GatewayService:
         durable receipt with no journal behind the payment, nor a log leaf with
         no settlement. A retry with the same content writes nothing new, which is
         what makes the resend after a lost acknowledgement idempotent.
+
+        `settled_tokens` is the node's own measured native total, carried beside
+        the charge so the session aggregate can keep the two apart: what the
+        upstream consumed and what the consumer was billed for it are different
+        numbers and reporting one as the other would make a session's totals
+        unreadable.
         """
         receipt = result.receipt
         receipt_text = _canonical_text(_signed_record_to_dict(receipt))
@@ -2856,6 +3238,7 @@ class GatewayService:
             attempt_id=attempt.attempt_id,
             usage_tokens=sum(result.allocations.values()),
             at=moment,
+            settled_tokens=settled_tokens,
         )
 
     def _ensure_provider_account(self, provider_id: str, moment: dt.datetime) -> None:
