@@ -6,9 +6,9 @@ labels: ""
 assignees: ""
 ---
 
-**What happened** *(the failure as you saw it — the CLI's error line and next-step hint are exactly what we need)*
+**What happened** *(the failure as you saw it — the CLI's or gateway's error line and next-step hint are exactly what we need)*
 
-**Steps to reproduce** *(commands you ran, in order; include the invite role and flags)*
+**Steps to reproduce** *(commands you ran, in order — `serve`, `admin invite`, `admin reconcile`, `verify receipt`, … — with flags and the relevant `center.json` fragment, redacted)*
 
 ```text
 (paste commands here)
@@ -16,7 +16,7 @@ assignees: ""
 
 **Expected vs actual**
 
-**Environment** *(attach the redacted output of `potluck doctor` — it contains no tokens or keys; state OS + Python version)*
+**Environment** *(OS, Python version, `potluck-server version`, ai-potluck client version if the flow spans both; attach redacted center logs)*
 
 **Evidence** *(request id / receipt id if you have one — this is what makes reconciliation reports actionable)*
 
@@ -24,6 +24,6 @@ assignees: ""
 
 Checklist:
 
-- [ ] No API keys, tokens, private keys, or prompt content are pasted above
-- [ ] I attached (or can provide) `potluck doctor` output
+- [ ] No API keys, invite tokens, private keys, or prompt content are pasted above
+- [ ] I attached (or can provide) redacted center log output
 - [ ] I searched existing issues for this failure
