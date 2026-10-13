@@ -36,6 +36,12 @@ is the same one that always ran, so a queued request nothing ever took still end
 ``EXPIRED`` with the server's own reason recorded — waiting changes when a
 request is answered, never whether it is billed honestly.
 
+An unknown top-level field is refused rather than ignored: a misspelled
+``certfile``/``keyfile`` pair would otherwise read as "no TLS configured" and
+start a cleartext listener on whatever ``host`` names, and a misspelled
+``max_queue_depth`` would silently take the default. The refusal names the
+unknown fields and the accepted set.
+
 The node and consumer loaders, the consumer HTTP client, and the shared
 config-parsing helpers live in :mod:`aipotluck.deploy` (the client package
 this one depends on); ``PROVISIONED_AT`` and `DeploymentError` come from there
@@ -63,7 +69,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from aipotluck.canonical import base64_encode
 from aipotluck.deploy import (
@@ -72,6 +78,7 @@ from aipotluck.deploy import (
     load_document,
     optional_bool,
     optional_int,
+    reject_unknown_keys,
     require_int,
     require_object_list,
     require_str,
@@ -89,6 +96,27 @@ if TYPE_CHECKING:
     from .gateway_server import GatewayServiceProtocol as _ServerServiceProtocol
 
 _ROLES = frozenset({"consumer", "node"})
+
+#: Top-level keys a ``server.json`` document may carry. The three provisioned
+#: lists keep their own entry schemas; this set governs the document itself,
+#: where a misspelled key would otherwise read as an absent one.
+SERVER_CONFIG_KEYS: Final = frozenset(
+    {
+        "host",
+        "port",
+        "database_path",
+        "platform_id",
+        "settlement_key_id",
+        "settlement_private_key_b64",
+        "certfile",
+        "keyfile",
+        "queue_enabled",
+        "max_queue_depth",
+        "credentials",
+        "providers",
+        "consumer_floats",
+    }
+)
 
 @dataclass(frozen=True)
 class ServerDeployment:
@@ -479,9 +507,10 @@ def _server_parts(
         ``(config, credentials, provider_entries, consumer_floats)``.
 
     Raises:
-        DeploymentError: On any missing or malformed field, or a half-configured
-            TLS pair.
+        DeploymentError: On any missing or malformed field, a key outside
+            ``SERVER_CONFIG_KEYS``, or a half-configured TLS pair.
     """
+    reject_unknown_keys(document, SERVER_CONFIG_KEYS, context)
     host = require_str(document, "host", context)
     port = require_int(document, "port", context)
     database_path = require_str(document, "database_path", context)

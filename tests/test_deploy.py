@@ -247,6 +247,37 @@ def test_load_server_refuses_float_and_duplicate_key_json(tmp_path: Path) -> Non
     assert "duplicate JSON key" in str(duplicate_exc.value)
 
 
+def test_an_unknown_server_field_is_refused_with_the_accepted_set_named(
+    tmp_path: Path,
+) -> None:
+    """A misspelled top-level key refuses the server instead of defaulting.
+
+    The dangerous shape is a TLS pair spelled two different wrong ways at once
+    (``cert_file``/``key_file``): the half-pair check would pass, both fields
+    would read as absent, and the server would serve cleartext on whatever
+    ``host`` names while believing it is configured for TLS. Naming the
+    unknown fields and the accepted set is what makes that typo visible.
+    """
+    document = _server_document(tmp_path)
+    document["max_queue_dept"] = 100
+    path = _write_json(tmp_path / "server.json", document)
+    with pytest.raises(PotluckError) as excinfo:
+        load_server(path, start=False)
+    message = str(excinfo.value)
+    assert "max_queue_dept" in message
+    assert "max_queue_depth" in message, "the accepted set is named"
+
+    tls_typo = _server_document(tmp_path)
+    tls_typo["cert_file"] = "server.crt"
+    tls_typo["key_file"] = "server.key"
+    path = _write_json(tmp_path / "tls-typo.json", tls_typo)
+    with pytest.raises(PotluckError) as tls_exc:
+        load_server(path, start=False)
+    message = str(tls_exc.value)
+    assert "cert_file" in message and "key_file" in message
+    assert "cleartext" not in message
+
+
 
 
 def test_a_server_that_names_no_queue_field_gets_the_documented_default(
