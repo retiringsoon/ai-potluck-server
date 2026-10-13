@@ -1,6 +1,6 @@
-"""End-to-end acceptance over real sockets: center, connector, and consumer.
+"""End-to-end acceptance over real sockets: server, connector, and consumer.
 
-Nothing here mocks the transport. The center runs `GatewayServer` on a real
+Nothing here mocks the transport. The server runs `GatewayServer` on a real
 loopback TCP port, the connector dials it out with `ClientConnection`, and the
 consumer speaks plain HTTP. What is proven is the wiring the unit tests cannot
 see: that an admitted request becomes exactly one upstream call, that a receipt
@@ -35,7 +35,7 @@ from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore
+from aipotluck_server.persistence import ServerStore
 
 BASE = dt.datetime(2026, 10, 6, 12, 0, tzinfo=dt.UTC)
 REGISTERED_AT = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
@@ -59,7 +59,7 @@ def _wait_until(condition: Any, *, timeout: float = 10.0, what: str = "condition
 def _assert_absent_for(condition: Any, *, duration: float, what: str) -> None:
     """Assert `condition()` stays falsy for `duration` seconds.
 
-    A bounded negative wait: long enough that the center's 0.25s ticker would
+    A bounded negative wait: long enough that the server's 0.25s ticker would
     have acted several times over, short enough to keep the suite fast.
     """
     deadline = time.monotonic() + duration
@@ -77,8 +77,8 @@ def _authorization_body(
     """Build the serialized authorization a real client would POST.
 
     The window is anchored to the wall clock on purpose: this suite exercises
-    the real center, so a record the consumer just signed must be valid at the
-    instant the center settles it. The digest is bound to `messages`, which must
+    the real server, so a record the consumer just signed must be valid at the
+    instant the server settles it. The digest is bound to `messages`, which must
     equal the ``messages`` in the POST body.
     """
     moment = dt.datetime.now(dt.UTC)
@@ -103,20 +103,20 @@ def _authorization_body(
     }
 
 
-class Center:
+class Server:
     """A real gateway over a real store, with credentials provisioned."""
 
     def __init__(self, tmp_path: Path, keyring: Keyring, **config: Any) -> None:
         self.keyring = keyring
         self.tmp_path = tmp_path
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         # `config` is the dispatch-queue policy a test wants to probe; the defaults
         # are the shipped ones, so a test that names none drives what an operator
         # who wrote no queue field gets.
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
@@ -215,7 +215,7 @@ class _GatedSpoolStore:
     Every method is the real store's; only `enqueue_spool` for one configured
     event type waits on a test-owned gate first. Used to hold a node between
     "the first output segment is spooled" and "the usage report is spooled", so
-    a test can drop the link deterministically after the center committed.
+    a test can drop the link deterministically after the server committed.
     """
 
     def __init__(self, inner: NodeStore, event_type: str, gate: threading.Event) -> None:
@@ -247,13 +247,13 @@ class _GatedSpoolStore:
 
 
 class Node:
-    """A real connector dialing the center over loopback TCP."""
+    """A real connector dialing the server over loopback TCP."""
 
     def __init__(
         self,
         tmp_path: Path,
         keyring: Keyring,
-        center_port: int,
+        server_port: int,
         *,
         node_id: str = "node-A",
         device_id: str = "device-A",
@@ -288,7 +288,7 @@ class Node:
         )
         keyring.registry.bind_device(device_id, provider_id)
         self.config = ConnectorConfig(
-            center_url=f"ws://127.0.0.1:{center_port}/v1/node-link",
+            server_url=f"ws://127.0.0.1:{server_port}/v1/node-link",
             node_id=node_id,
             device_id=device_id,
             device_key_id=device_key_id,
@@ -311,18 +311,18 @@ class Node:
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> Any:
-    """A running center, closed at the end of the test."""
-    built = Center(tmp_path, Keyring())
+def server(tmp_path: Path) -> Any:
+    """A running server, closed at the end of the test."""
+    built = Server(tmp_path, Keyring())
     yield built
     built.stop()
 
 
 def _admit(
-    center: Center, request_id: str, idempotency_key: str, *, deadline_ms: int = 60000
+    server: Server, request_id: str, idempotency_key: str, *, deadline_ms: int = 60000
 ) -> dict[str, Any]:
     """Submit one request through the real HTTP API."""
-    status, document = center.post(
+    status, document = server.post(
         "/v1/requests",
         {
             "idempotency_key": idempotency_key,
@@ -332,24 +332,24 @@ def _admit(
             "max_attempts": 2,
             "deadline_ms": deadline_ms,
             "max_charge_milli_credits": 20_000,
-            "authorization": _authorization_body(center.keyring, request_id),
+            "authorization": _authorization_body(server.keyring, request_id),
         },
     )
     assert status == 200, document
     return document
 
 
-def _await_settlement(center: Center, request_id: str) -> dict[str, Any]:
+def _await_settlement(server: Server, request_id: str) -> dict[str, Any]:
     """Block until the request settles, then return its status document."""
     _wait_until(
-        lambda: center.status_of(request_id).get("settlement") is not None,
+        lambda: server.status_of(request_id).get("settlement") is not None,
         what=f"request {request_id} to settle",
     )
-    return center.status_of(request_id)
+    return server.status_of(request_id)
 
 
 def _read_sse_events(
-    center: Center, request_id: str, cursor: int
+    server: Server, request_id: str, cursor: int
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Read the event endpoint over real HTTP and parse the SSE frames.
 
@@ -360,7 +360,7 @@ def _read_sse_events(
     non-streaming read. Returns `(events, done_status)` where each event carries
     the `cursor`, `event_type`, and decoded `data` payload.
     """
-    connection = http.client.HTTPConnection("127.0.0.1", center.port, timeout=10)
+    connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
     connection.request(
         "GET",
         f"/v1/requests/{request_id}/events?cursor={cursor}",
@@ -393,39 +393,39 @@ def _read_sse_events(
     return events, done_status
 
 
-def test_normal_path_one_upstream_call_one_receipt(center: Center) -> None:
+def test_normal_path_one_upstream_call_one_receipt(server: Server) -> None:
     """§6 step 2: OFFER → ACCEPT → EXECUTE with call_count=1 and a signed receipt."""
-    node = Node(center.tmp_path, center.keyring, center.port)
+    node = Node(server.tmp_path, server.keyring, server.port)
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
-        document = _admit(center, "R-e2e-1", "idem-e2e-1")
+        document = _admit(server, "R-e2e-1", "idem-e2e-1")
         request_id = document["request_id"]
 
-        document = _await_settlement(center, request_id)
+        document = _await_settlement(server, request_id)
         assert document["status"] == "SUCCEEDED"
         assert document["attempts"][0]["usage_tokens"] == 1_000
 
         settlement = document["settlement"]
-        _code, receipt = center.get(f"/v1/receipts/{settlement['receipt_id']}")
+        _code, receipt = server.get(f"/v1/receipts/{settlement['receipt_id']}")
         assert receipt["receipt_hash"] == settlement["receipt_hash"]
         assert receipt["log_index"] == settlement["log_index"]
         assert receipt["inclusion_proof"]["root_hash"]
 
         assert node.adapter.upstream_calls == 1
-        assert center.service.balance("consumer-X") == 99_000
-        assert center.service.balance("provider-A/pending") == 1_000
+        assert server.service.balance("consumer-X") == 99_000
+        assert server.service.balance("provider-A/pending") == 1_000
     finally:
         node.stop()
 
 
-def test_idempotent_replay_creates_nothing_new(center: Center) -> None:
+def test_idempotent_replay_creates_nothing_new(server: Server) -> None:
     """§6 step 3: the same key and payload returns the same logical request."""
-    node = Node(center.tmp_path, center.keyring, center.port)
+    node = Node(server.tmp_path, server.keyring, server.port)
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
         body = {
             "idempotency_key": "idem-e2e-2",
@@ -436,17 +436,17 @@ def test_idempotent_replay_creates_nothing_new(center: Center) -> None:
             "deadline_ms": 60000,
             "max_charge_milli_credits": 20_000,
             "authorization": _authorization_body(
-                center.keyring, "R-e2e-2", messages=(user_message("one prompt"),)
+                server.keyring, "R-e2e-2", messages=(user_message("one prompt"),)
             ),
         }
-        status, first = center.post("/v1/requests", body)
+        status, first = server.post("/v1/requests", body)
         assert status == 200
         request_id = first["request_id"]
-        _await_settlement(center, request_id)
+        _await_settlement(server, request_id)
         calls_after_first = node.adapter.upstream_calls
         assert calls_after_first == 1
 
-        status, second = center.post("/v1/requests", body)
+        status, second = server.post("/v1/requests", body)
         assert status == 200
         assert second["request_id"] == request_id
         time.sleep(0.3)
@@ -459,10 +459,10 @@ def test_idempotent_replay_creates_nothing_new(center: Center) -> None:
             **body,
             "messages": [{"role": "user", "content": "other"}],
             "authorization": _authorization_body(
-                center.keyring, "R-e2e-2", messages=(user_message("other"),)
+                server.keyring, "R-e2e-2", messages=(user_message("other"),)
             ),
         }
-        status, _conflict = center.post("/v1/requests", conflict_body)
+        status, _conflict = server.post("/v1/requests", conflict_body)
         assert status == 409
 
         assert node.adapter.upstream_calls == calls_after_first, (
@@ -478,17 +478,17 @@ def test_a_full_dispatch_queue_answers_503_on_the_platforms_own_surface(
     """The signed door names the queue's own condition, not a generic bad request.
 
     A caller cannot act on `400 bad_request`: it says the request was wrong, and
-    this request was not — the center was full. `503` with its own code says "the
+    this request was not — the server was full. `503` with its own code says "the
     platform is taking no more work right now", which is a condition that ends, and
     is the same fact the OpenAI-compatible surface answers as a `429` an existing
     client already backs off on.
     """
-    center = Center(tmp_path, Keyring(), max_queue_depth=1)
+    server = Server(tmp_path, Keyring(), max_queue_depth=1)
     try:
-        first = _admit(center, "R-queue-1", "idem-queue-1")
-        assert center.store.count_requests_by_status("ROUTING") == 1
+        first = _admit(server, "R-queue-1", "idem-queue-1")
+        assert server.store.count_requests_by_status("ROUTING") == 1
 
-        status, document = center.post(
+        status, document = server.post(
             "/v1/requests",
             {
                 "idempotency_key": "idem-queue-2",
@@ -498,22 +498,22 @@ def test_a_full_dispatch_queue_answers_503_on_the_platforms_own_surface(
                 "max_attempts": 2,
                 "deadline_ms": 60000,
                 "max_charge_milli_credits": 20_000,
-                "authorization": _authorization_body(center.keyring, "R-queue-2"),
+                "authorization": _authorization_body(server.keyring, "R-queue-2"),
             },
         )
 
         assert status == 503, document
         assert document["error"] == "queue_full"
         assert "queue bound of 1" in document["detail"]
-        assert center.store.get_request("R-queue-2") is None
-        assert center.store.count_requests_by_status("ROUTING") == 1
+        assert server.store.get_request("R-queue-2") is None
+        assert server.store.count_requests_by_status("ROUTING") == 1
         assert first["request_id"] == "R-queue-1"
     finally:
-        center.stop()
+        server.stop()
 
 
 def test_a_replayed_key_under_a_fresh_request_id_is_a_conflict_not_a_crash(
-    center: Center,
+    server: Server,
 ) -> None:
     """Re-signing the same work under the same key is a 409, in the conflict shape.
 
@@ -525,16 +525,16 @@ def test_a_replayed_key_under_a_fresh_request_id_is_a_conflict_not_a_crash(
     ``PotluckError``, so the transport had no vocabulary for it and answered
     ``500 internal_error``.
 
-    A 500 says "the center broke", which invites the caller to retry the very
+    A 500 says "the server broke", which invites the caller to retry the very
     request that broke it. A 409 says "this key already named another request",
-    which is true and is actionable: resubmit with the id the center returned, or
+    which is true and is actionable: resubmit with the id the server returned, or
     mint a fresh key for genuinely new work. Asserted over the real HTTP surface
     because the status and the error shape are the caller-visible half of the fix.
     """
-    node = Node(center.tmp_path, center.keyring, center.port)
+    node = Node(server.tmp_path, server.keyring, server.port)
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
         messages = [{"role": "user", "content": "one prompt"}]
         conversation = (user_message("one prompt"),)
@@ -547,20 +547,20 @@ def test_a_replayed_key_under_a_fresh_request_id_is_a_conflict_not_a_crash(
             "deadline_ms": 60000,
             "max_charge_milli_credits": 20_000,
             "authorization": _authorization_body(
-                center.keyring, "R-first", messages=conversation
+                server.keyring, "R-first", messages=conversation
             ),
         }
-        status, first = center.post("/v1/requests", body)
+        status, first = server.post("/v1/requests", body)
         assert status == 200
         first_request_id = first["request_id"]
 
         resigned = {
             **body,
             "authorization": _authorization_body(
-                center.keyring, "R-second", messages=conversation
+                server.keyring, "R-second", messages=conversation
             ),
         }
-        status, document = center.post("/v1/requests", resigned)
+        status, document = server.post("/v1/requests", resigned)
 
         assert status == 409, document
         assert document["error"] == "conflict"
@@ -568,22 +568,22 @@ def test_a_replayed_key_under_a_fresh_request_id_is_a_conflict_not_a_crash(
         assert first_request_id in document["detail"]
         # The stored request is untouched: still one row, still the first one's id,
         # and the second authorization dispatched nothing of its own.
-        assert center.store.get_request("R-second") is None
-        assert center.store.attempts_for_request(first_request_id)
+        assert server.store.get_request("R-second") is None
+        assert server.store.attempts_for_request(first_request_id)
         assert node.adapter.upstream_calls <= 1
     finally:
         node.stop()
 
 
-def test_a_node_reconnect_does_not_repeat_the_upstream_call(center: Center) -> None:
+def test_a_node_reconnect_does_not_repeat_the_upstream_call(server: Server) -> None:
     """§6 step 5: a dropped link is not an unexecuted attempt."""
-    node = Node(center.tmp_path, center.keyring, center.port)
+    node = Node(server.tmp_path, server.keyring, server.port)
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
-        document = _admit(center, "R-e2e-3", "idem-e2e-3")
-        _await_settlement(center, document["request_id"])
+        document = _admit(server, "R-e2e-3", "idem-e2e-3")
+        _await_settlement(server, document["request_id"])
         assert node.adapter.upstream_calls == 1
 
         # A second session over the same node database: reconnect, not redo.
@@ -596,12 +596,12 @@ def test_a_node_reconnect_does_not_repeat_the_upstream_call(center: Center) -> N
         assert node.adapter.upstream_calls == 1, (
             "a reconnect must not make a second upstream call"
         )
-        assert center.status_of(document["request_id"])["status"] == "SUCCEEDED"
+        assert server.status_of(document["request_id"])["status"] == "SUCCEEDED"
     finally:
         node.stop()
 
 
-def test_consumer_resume_by_cursor_replays_every_event_exactly_once(center: Center) -> None:
+def test_consumer_resume_by_cursor_replays_every_event_exactly_once(server: Server) -> None:
     """§6 step 4: reconnecting from cursor C sees the suffix once, in order.
 
     The read goes over real HTTP against the running server. The events
@@ -609,18 +609,18 @@ def test_consumer_resume_by_cursor_replays_every_event_exactly_once(center: Cent
     events replay, a `done` frame closes it, so a plain GET to EOF is an
     honest non-streaming read.
     """
-    node = Node(center.tmp_path, center.keyring, center.port)
+    node = Node(server.tmp_path, server.keyring, server.port)
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
-        document = _admit(center, "R-e2e-4", "idem-e2e-4")
+        document = _admit(server, "R-e2e-4", "idem-e2e-4")
         request_id = document["request_id"]
-        document = _await_settlement(center, request_id)
+        document = _await_settlement(server, request_id)
         assert document["status"] == "SUCCEEDED"
         attempt_id = document["attempts"][0]["attempt_id"]
 
-        full, done_status = _read_sse_events(center, request_id, 0)
+        full, done_status = _read_sse_events(server, request_id, 0)
         assert done_status == "SUCCEEDED"
         cursors = [event["cursor"] for event in full]
         assert cursors == list(range(1, len(cursors) + 1)), (
@@ -628,12 +628,12 @@ def test_consumer_resume_by_cursor_replays_every_event_exactly_once(center: Cent
         )
         types = [event["event_type"] for event in full]
         assert types == ["output.delta", "usage.final", "attempt.completed"]
-        assert center.store.has_event_gap(attempt_id) is False
+        assert server.store.has_event_gap(attempt_id) is False
 
         # A consumer that saw the first event, dropped, and reconnects from its
         # cursor gets exactly the suffix: no repeat, no gap, same payloads.
         seen_through = cursors[0]
-        tail, tail_done = _read_sse_events(center, request_id, seen_through)
+        tail, tail_done = _read_sse_events(server, request_id, seen_through)
         assert tail_done == "SUCCEEDED"
         assert [event["cursor"] for event in tail] == cursors[1:]
         assert [event["event_type"] for event in tail] == types[1:]
@@ -641,36 +641,36 @@ def test_consumer_resume_by_cursor_replays_every_event_exactly_once(center: Cent
 
         # A consumer that reads from cursor 0 gets the whole stream, including
         # the settlement-time events.
-        again, again_done = _read_sse_events(center, request_id, 0)
+        again, again_done = _read_sse_events(server, request_id, 0)
         assert again_done == "SUCCEEDED"
         assert again == full
     finally:
         node.stop()
 
 
-def test_node_killed_mid_submitting_reports_unknown_and_stays_unbilled(center: Center) -> None:
+def test_node_killed_mid_submitting_reports_unknown_and_stays_unbilled(server: Server) -> None:
     """§6 step 6 / §7.3: a kill between the upstream call and any report.
 
     The adapter is gated right after `FakeUpstream.execute` returned, which is
     inside `Connector._run_execution`'s window between the upstream call and the
-    first spool write — so the node's execution row is SUBMITTING and the center
+    first spool write — so the node's execution row is SUBMITTING and the server
     has seen nothing. The restart is a second `Connector` over the same node
     database, whose `__init__` runs `mark_interrupted_as_unknown`.
     """
     gate = threading.Event()
-    node = Node(center.tmp_path, center.keyring, center.port, post_call_gate=gate)
+    node = Node(server.tmp_path, server.keyring, server.port, post_call_gate=gate)
     restart: Connector | None = None
     restart_thread: threading.Thread | None = None
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
-        document = _admit(center, "R-e2e-6", "idem-e2e-6")
+        document = _admit(server, "R-e2e-6", "idem-e2e-6")
         request_id = document["request_id"]
         attempt_id = f"{request_id}-a1"
 
         # The crash window: upstream called, execution row SUBMITTING, the
-        # center has received nothing at all.
+        # server has received nothing at all.
         _wait_until(lambda: node.upstream.call_count == 1, what="the upstream call")
         execution = node.store.get_execution(attempt_id)
         assert execution is not None, "the node must have begun the execution"
@@ -679,8 +679,8 @@ def test_node_killed_mid_submitting_reports_unknown_and_stays_unbilled(center: C
         assert execution.upstream_calls == 0, (
             "the crash window is before the connector records the call"
         )
-        assert center.store.events_after(request_id, 0) == []
-        assert center.status_of(request_id)["attempts"][0]["usage_tokens"] is None
+        assert server.store.events_after(request_id, 0) == []
+        assert server.status_of(request_id)["attempts"][0]["usage_tokens"] is None
 
         # The kill: the session dies with the row still SUBMITTING. The worker
         # stays parked on the gate, like a process that ceased to exist.
@@ -691,27 +691,27 @@ def test_node_killed_mid_submitting_reports_unknown_and_stays_unbilled(center: C
         assert node.store.get_execution(attempt_id).state == "UNKNOWN"
         restart_thread = threading.Thread(target=restart.run_once, daemon=True)
         restart_thread.start()
-        # The center sends `resend_spool` for an accepted attempt, so the row
-        # must STAY unknown: the node reports what it knows and the center
+        # The server sends `resend_spool` for an accepted attempt, so the row
+        # must STAY unknown: the node reports what it knows and the server
         # rules. Waiting for a FAILED row here would be waiting for the node to
-        # overwrite evidence the center asked for.
+        # overwrite evidence the server asked for.
         _wait_until(
-            lambda: center.status_of(request_id)["attempts"][0]["status"]
+            lambda: server.status_of(request_id)["attempts"][0]["status"]
             == "OUTCOME_UNKNOWN",
-            what="the center to rule the attempt outcome-unknown",
+            what="the server to rule the attempt outcome-unknown",
             timeout=5,
         )
 
-        # §7.3: the center must report the attempt as outcome-unknown, keep the
+        # §7.3: the server must report the attempt as outcome-unknown, keep the
         # usage unknown (never zero), and bill nobody.
-        document = center.status_of(request_id)
+        document = server.status_of(request_id)
         attempt = document["attempts"][0]
         assert attempt["status"] == "OUTCOME_UNKNOWN", document
         assert attempt["usage_status"] == "UNKNOWN"
         assert attempt["usage_tokens"] is None
         assert "unknown" in (document["billing_note"] or "").lower()
         assert document["settlement"] is None
-        assert center.service.balance("consumer-X") == 100_000
+        assert server.service.balance("consumer-X") == 100_000
         assert node.upstream.call_count == 1, (
             "the whole episode must call the upstream exactly once"
         )
@@ -723,18 +723,18 @@ def test_node_killed_mid_submitting_reports_unknown_and_stays_unbilled(center: C
             restart_thread.join(timeout=5)
 
 
-def test_failure_before_any_output_retries_on_a_second_node(center: Center) -> None:
+def test_failure_before_any_output_retries_on_a_second_node(server: Server) -> None:
     """§6 step 7a / §7.4: a clean pre-output failure re-offers within budget.
 
     Node A's upstream raises before any output; the node reports the attempt
-    failed cleanly. With `max_attempts=2` and node B connected, the center is
+    failed cleanly. With `max_attempts=2` and node B connected, the server is
     expected to re-offer to B, whose attempt settles for the consumer.
     """
-    failed = Node(center.tmp_path, center.keyring, center.port, fault="error_before_output")
+    failed = Node(server.tmp_path, server.keyring, server.port, fault="error_before_output")
     healthy = Node(
-        center.tmp_path,
-        center.keyring,
-        center.port,
+        server.tmp_path,
+        server.keyring,
+        server.port,
         node_id="node-B",
         device_id="device-B",
         device_key_id="node-device-key-b",
@@ -744,16 +744,16 @@ def test_failure_before_any_output_retries_on_a_second_node(center: Center) -> N
     )
     try:
         _wait_until(
-            lambda: len(center.store.connected_nodes()) == 2, what="both nodes to register"
+            lambda: len(server.store.connected_nodes()) == 2, what="both nodes to register"
         )
-        document = _admit(center, "R-e2e-7", "idem-e2e-7")
+        document = _admit(server, "R-e2e-7", "idem-e2e-7")
         request_id = document["request_id"]
 
         _wait_until(
-            lambda: center.status_of(request_id)["status"] in ("SUCCEEDED", "FAILED"),
+            lambda: server.status_of(request_id)["status"] in ("SUCCEEDED", "FAILED"),
             what="the request to reach a terminal state",
         )
-        document = center.status_of(request_id)
+        document = server.status_of(request_id)
         assert document["status"] == "SUCCEEDED", document["billing_note"]
         attempts = document["attempts"]
         assert len(attempts) == 2, "the first attempt must be replaced, not reused"
@@ -764,19 +764,19 @@ def test_failure_before_any_output_retries_on_a_second_node(center: Center) -> N
         assert document["settlement"] is not None
         assert failed.upstream.call_count == 1
         assert healthy.upstream.call_count == 1
-        assert center.service.balance("consumer-X") == 99_000
+        assert server.service.balance("consumer-X") == 99_000
     finally:
         failed.stop()
         healthy.stop()
 
 
 def test_committed_output_then_link_drop_ends_expired_without_a_replacement(
-    center: Center,
+    server: Server,
 ) -> None:
     """§6 step 7b / §7.5: after the first segment commits, no attempt is spliced.
 
     The node is held between spooling its output delta and spooling its usage
-    report, so the center commits the output while the attempt is still live.
+    report, so the server commits the output while the attempt is still live.
     The link then drops. What this build actually does: the request is never
     re-offered (the output commit guards `_offer_new_attempt`), no second node
     executes anything, and the consumer's explicit terminal result is EXPIRED
@@ -784,15 +784,15 @@ def test_committed_output_then_link_drop_ends_expired_without_a_replacement(
     """
     pause = threading.Event()
     node_a = Node(
-        center.tmp_path,
-        center.keyring,
-        center.port,
+        server.tmp_path,
+        server.keyring,
+        server.port,
         pause_before_event=("usage.final", pause),
     )
     node_b = Node(
-        center.tmp_path,
-        center.keyring,
-        center.port,
+        server.tmp_path,
+        server.keyring,
+        server.port,
         node_id="node-B",
         device_id="device-B",
         device_key_id="node-device-key-b",
@@ -802,17 +802,17 @@ def test_committed_output_then_link_drop_ends_expired_without_a_replacement(
     )
     try:
         _wait_until(
-            lambda: len(center.store.connected_nodes()) == 2, what="both nodes to register"
+            lambda: len(server.store.connected_nodes()) == 2, what="both nodes to register"
         )
-        document = _admit(center, "R-e2e-8", "idem-e2e-8", deadline_ms=2000)
+        document = _admit(server, "R-e2e-8", "idem-e2e-8", deadline_ms=2000)
         request_id = document["request_id"]
         attempt_id = f"{request_id}-a1"
 
         _wait_until(
-            lambda: center.store.output_commit(request_id) is not None,
-            what="the first output segment to commit at the center",
+            lambda: server.store.output_commit(request_id) is not None,
+            what="the first output segment to commit at the server",
         )
-        commit = center.store.output_commit(request_id)
+        commit = server.store.output_commit(request_id)
         assert commit is not None
         assert commit.attempt_id == attempt_id
         assert node_a.upstream.call_count == 1
@@ -821,10 +821,10 @@ def test_committed_output_then_link_drop_ends_expired_without_a_replacement(
         node_a.stop()
 
         _wait_until(
-            lambda: center.status_of(request_id)["status"] == "EXPIRED",
+            lambda: server.status_of(request_id)["status"] == "EXPIRED",
             what="the deadline tick to give the consumer a terminal result",
         )
-        document = center.status_of(request_id)
+        document = server.status_of(request_id)
         assert document["status"] == "EXPIRED"
         assert "deadline" in (document["billing_note"] or "")
         assert len(document["attempts"]) == 1, (
@@ -834,7 +834,7 @@ def test_committed_output_then_link_drop_ends_expired_without_a_replacement(
         assert document["output"]["committed"] is True
         assert document["output"]["attempt_id"] == attempt_id
         assert document["settlement"] is None
-        assert center.service.balance("consumer-X") == 100_000
+        assert server.service.balance("consumer-X") == 100_000
         assert node_a.upstream.call_count == 1
         assert node_b.upstream.call_count == 0, (
             "no second node may execute anything once output is committed"
@@ -844,18 +844,18 @@ def test_committed_output_then_link_drop_ends_expired_without_a_replacement(
         node_b.stop()
 
 
-def test_a_paused_node_receives_no_new_work(center: Center) -> None:
+def test_a_paused_node_receives_no_new_work(server: Server) -> None:
     """§6 step 8 (partial) / §7.9: share_enabled=false means zero new offers.
 
     The pause travels the realistic route: the operator disables sharing and
-    the connector reconnects, so the center learns `share_enabled=false` from a
+    the connector reconnects, so the server learns `share_enabled=false` from a
     real `node.hello` over the real socket (not a hand-built heartbeat). A new
     admission must then produce no attempt, no offer, and no tick delivery.
     """
-    node = Node(center.tmp_path, center.keyring, center.port)
+    node = Node(server.tmp_path, server.keyring, server.port)
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
         node.stop()
 
@@ -866,35 +866,35 @@ def test_a_paused_node_receives_no_new_work(center: Center) -> None:
         try:
 
             def pause_registered() -> bool:
-                record = center.store.get_node("node-A")
+                record = server.store.get_node("node-A")
                 return (
                     record is not None
                     and record.share_enabled is False
                     and record.connected
                 )
 
-            _wait_until(pause_registered, what="the paused policy to reach the center")
+            _wait_until(pause_registered, what="the paused policy to reach the server")
 
-            document = _admit(center, "R-e2e-9", "idem-e2e-9")
+            document = _admit(server, "R-e2e-9", "idem-e2e-9")
             request_id = document["request_id"]
 
             _assert_absent_for(
-                lambda: center.store.attempts_for_request(request_id),
+                lambda: server.store.attempts_for_request(request_id),
                 duration=1.5,
                 what="an attempt offered to a paused node",
             )
-            document = center.status_of(request_id)
+            document = server.status_of(request_id)
             assert document["status"] == "ROUTING"
             assert document["attempts"] == []
-            assert center.store.attempts_for_request(request_id) == []
+            assert server.store.attempts_for_request(request_id) == []
 
-            deliveries = center.service.tick()
+            deliveries = server.service.tick()
             assert deliveries == [], "tick must not deliver anything to a paused node"
-            assert center.store.attempts_for_request(request_id) == []
+            assert server.store.attempts_for_request(request_id) == []
             assert node.adapter.upstream_calls == 0
             assert node.upstream.call_count == 0
 
-            _code, nodes = center.get("/v1/nodes")
+            _code, nodes = server.get("/v1/nodes")
             entry = next(n for n in nodes["nodes"] if n["node_id"] == "node-A")
             assert entry["share_enabled"] is False
         finally:

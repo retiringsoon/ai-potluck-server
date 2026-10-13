@@ -1,10 +1,10 @@
-"""End-to-end streaming over real sockets: center, connector, and consumer.
+"""End-to-end streaming over real sockets: server, connector, and consumer.
 
-Nothing is mocked. The center is a real `GatewayServer` on a loopback port, the
+Nothing is mocked. The server is a real `GatewayServer` on a loopback port, the
 connector dials it out with `ClientConnection` and reads a fake upstream that
 emits incrementally, and the consumer reads the event endpoint over plain HTTP.
 What this file proves is the U04 contract: a `stream_strict` request reaches the
-center as several `output.delta` events *before* its `usage.final`, the per-attempt
+server as several `output.delta` events *before* its `usage.final`, the per-attempt
 sequence stays contiguous, and the settlement is identical to the buffered path —
 while a buffered request still takes the `chunk_text` route. The last two tests
 drive the connector without a socket to pin the crash semantics: a stream that
@@ -41,7 +41,7 @@ from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore
+from aipotluck_server.persistence import ServerStore
 
 BASE = dt.datetime(2026, 10, 6, 12, 0, tzinfo=dt.UTC)
 REGISTERED_AT = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
@@ -106,17 +106,17 @@ def _authorization_body(
     }
 
 
-class Center:
+class Server:
     """A real gateway over a real store, with credentials provisioned."""
 
     def __init__(self, tmp_path: Path, keyring: Keyring) -> None:
         self.keyring = keyring
         self.tmp_path = tmp_path
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
@@ -179,7 +179,7 @@ class _GatedSpoolStore:
 
     Used to hold a node between "the first deltas are spooled" and "the usage
     report is spooled", so a test can observe — deterministically — that the
-    center received incremental output before any final usage arrived.
+    server received incremental output before any final usage arrived.
     """
 
     def __init__(self, inner: NodeStore, event_type: str, gate: threading.Event) -> None:
@@ -212,13 +212,13 @@ class _GatedSpoolStore:
 
 
 class Node:
-    """A real connector dialing the center over loopback TCP."""
+    """A real connector dialing the server over loopback TCP."""
 
     def __init__(
         self,
         tmp_path: Path,
         keyring: Keyring,
-        center_port: int,
+        server_port: int,
         *,
         pause_before_event: tuple[str, threading.Event] | None = None,
     ) -> None:
@@ -238,7 +238,7 @@ class Node:
         )
         keyring.registry.bind_device("device-A", "provider-A")
         self.config = ConnectorConfig(
-            center_url=f"ws://127.0.0.1:{center_port}/v1/node-link",
+            server_url=f"ws://127.0.0.1:{server_port}/v1/node-link",
             node_id="node-A",
             device_id="device-A",
             device_key_id="node-device-key",
@@ -265,15 +265,15 @@ class Node:
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> Iterator[Center]:
-    """A running center, closed at the end of the test."""
-    built = Center(tmp_path, Keyring())
+def server(tmp_path: Path) -> Iterator[Server]:
+    """A running server, closed at the end of the test."""
+    built = Server(tmp_path, Keyring())
     yield built
     built.stop()
 
 
 def _admit(
-    center: Center,
+    server: Server,
     request_id: str,
     idempotency_key: str,
     *,
@@ -281,7 +281,7 @@ def _admit(
     deadline_ms: int = 60000,
 ) -> dict[str, Any]:
     """Submit one request through the real HTTP API."""
-    status, document = center.post(
+    status, document = server.post(
         "/v1/requests",
         {
             "idempotency_key": idempotency_key,
@@ -292,7 +292,7 @@ def _admit(
             "deadline_ms": deadline_ms,
             "max_charge_milli_credits": 20_000,
             "authorization": _authorization_body(
-                center.keyring, request_id, delivery_mode=delivery_mode
+                server.keyring, request_id, delivery_mode=delivery_mode
             ),
         },
     )
@@ -300,17 +300,17 @@ def _admit(
     return document
 
 
-def _await_settlement(center: Center, request_id: str) -> dict[str, Any]:
+def _await_settlement(server: Server, request_id: str) -> dict[str, Any]:
     """Block until the request settles, then return its status document."""
     _wait_until(
-        lambda: center.status_of(request_id).get("settlement") is not None,
+        lambda: server.status_of(request_id).get("settlement") is not None,
         what=f"request {request_id} to settle",
     )
-    return center.status_of(request_id)
+    return server.status_of(request_id)
 
 
 def _read_sse_events(
-    center: Center, request_id: str, cursor: int
+    server: Server, request_id: str, cursor: int
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Read `/v1/requests/{id}/events` over real HTTP and parse the SSE frames.
 
@@ -319,7 +319,7 @@ def _read_sse_events(
     `(events, done_status)`, each event carrying `cursor`, `event_type`, and the
     decoded `data` payload.
     """
-    connection = http.client.HTTPConnection("127.0.0.1", center.port, timeout=10)
+    connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
     connection.request(
         "GET",
         f"/v1/requests/{request_id}/events?cursor={cursor}",
@@ -357,45 +357,45 @@ def _read_sse_events(
 # --------------------------------------------------------------------------- #
 
 
-def test_streaming_commits_deltas_before_the_usage_report(center: Center) -> None:
-    """The center must hold ≥2 deltas before it ever sees `usage.final`."""
+def test_streaming_commits_deltas_before_the_usage_report(server: Server) -> None:
+    """The server must hold ≥2 deltas before it ever sees `usage.final`."""
     gate = threading.Event()
     node = Node(
-        center.tmp_path, center.keyring, center.port, pause_before_event=("usage.final", gate)
+        server.tmp_path, server.keyring, server.port, pause_before_event=("usage.final", gate)
     )
     try:
-        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
-        document = _admit(center, "R-str-1", "idem-str-1", delivery_mode="stream_strict")
+        _wait_until(lambda: bool(server.store.connected_nodes()), what="the node to register")
+        document = _admit(server, "R-str-1", "idem-str-1", delivery_mode="stream_strict")
         request_id = document["request_id"]
         attempt_id = f"{request_id}-a1"
 
         def deltas_seen() -> int:
             return sum(
-                1 for event in center.store.events_after(request_id, 0)
+                1 for event in server.store.events_after(request_id, 0)
                 if event.event_type == "output.delta"
             )
 
-        # The worker is parked before spooling usage.final, so whatever the center
+        # The worker is parked before spooling usage.final, so whatever the server
         # has received is provably output-only.
-        _wait_until(lambda: deltas_seen() >= 2, what="two deltas to reach the center")
-        types_before = [event.event_type for event in center.store.events_after(request_id, 0)]
+        _wait_until(lambda: deltas_seen() >= 2, what="two deltas to reach the server")
+        types_before = [event.event_type for event in server.store.events_after(request_id, 0)]
         assert types_before.count("output.delta") >= 2
         assert "usage.final" not in types_before, "usage must not precede the deltas"
         assert node.adapter.upstream_calls == 1, "the whole stream is one upstream call"
 
         gate.set()
-        document = _await_settlement(center, request_id)
+        document = _await_settlement(server, request_id)
 
         assert document["status"] == "SUCCEEDED"
         assert document["attempts"][0]["usage_tokens"] == 1_000
         assert document["output"]["committed"] is True
         assert document["output"]["attempt_id"] == attempt_id
         assert node.adapter.upstream_calls == 1
-        assert center.service.balance("consumer-X") == 99_000
-        assert center.service.balance("provider-A/pending") == 1_000
+        assert server.service.balance("consumer-X") == 99_000
+        assert server.service.balance("provider-A/pending") == 1_000
 
         # The consumer sees the deltas as separate frames, in order, with no gap.
-        events, done_status = _read_sse_events(center, request_id, 0)
+        events, done_status = _read_sse_events(server, request_id, 0)
         assert done_status == "SUCCEEDED"
         assert [event["cursor"] for event in events] == list(range(1, len(events) + 1))
         assert [event["event_type"] for event in events] == [
@@ -411,7 +411,7 @@ def test_streaming_commits_deltas_before_the_usage_report(center: Center) -> Non
             if event["event_type"] == "output.delta"
         )
         assert streamed == EXPECTED_TEXT
-        assert center.store.has_event_gap(attempt_id) is False
+        assert server.store.has_event_gap(attempt_id) is False
     finally:
         gate.set()
         node.stop()
@@ -422,7 +422,7 @@ def test_streaming_commits_deltas_before_the_usage_report(center: Center) -> Non
 # --------------------------------------------------------------------------- #
 
 
-def test_streaming_settles_like_buffered_and_buffered_still_chunks(center: Center) -> None:
+def test_streaming_settles_like_buffered_and_buffered_still_chunks(server: Server) -> None:
     """Same answer, same bill; buffered keeps the `chunk_text` split.
 
     The two requests are run one after another. A node's local reservation
@@ -430,15 +430,15 @@ def test_streaming_settles_like_buffered_and_buffered_still_chunks(center: Cente
     on local policy — a capacity effect that has nothing to do with the delivery
     mode under test.
     """
-    node = Node(center.tmp_path, center.keyring, center.port)
+    node = Node(server.tmp_path, server.keyring, server.port)
     try:
         node.queue_response()  # one scripted answer per request
-        _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+        _wait_until(lambda: bool(server.store.connected_nodes()), what="the node to register")
 
-        streamed = _admit(center, "R-cmp-s", "idem-cmp-s", delivery_mode="stream_strict")
-        streamed_doc = _await_settlement(center, streamed["request_id"])
-        buffered = _admit(center, "R-cmp-b", "idem-cmp-b", delivery_mode="buffered_complete")
-        buffered_doc = _await_settlement(center, buffered["request_id"])
+        streamed = _admit(server, "R-cmp-s", "idem-cmp-s", delivery_mode="stream_strict")
+        streamed_doc = _await_settlement(server, streamed["request_id"])
+        buffered = _admit(server, "R-cmp-b", "idem-cmp-b", delivery_mode="buffered_complete")
+        buffered_doc = _await_settlement(server, buffered["request_id"])
 
         assert streamed_doc["status"] == "SUCCEEDED"
         assert buffered_doc["status"] == "SUCCEEDED"
@@ -452,14 +452,14 @@ def test_streaming_settles_like_buffered_and_buffered_still_chunks(center: Cente
             assert node.store.get_execution(attempt_id).upstream_calls == 1
 
         # One bill each: 1000 tokens at the flat rate.
-        assert center.service.balance("consumer-X") == 98_000
-        assert center.service.balance("provider-A/pending") == 2_000
+        assert server.service.balance("consumer-X") == 98_000
+        assert server.service.balance("provider-A/pending") == 2_000
 
         def _published(request_id: str) -> list[str]:
-            events, _ = _read_sse_events(center, request_id, 0)
+            events, _ = _read_sse_events(server, request_id, 0)
             return [event["event_type"] for event in events]
 
-        # The center publishes asynchronously: read again until the terminal
+        # The server publishes asynchronously: read again until the terminal
         # event is visible, otherwise a slow runner asserts a mid-flight list.
         _wait_until(
             lambda: _published(streamed["request_id"])[-1:] == ["attempt.completed"],
@@ -469,8 +469,8 @@ def test_streaming_settles_like_buffered_and_buffered_still_chunks(center: Cente
             lambda: _published(buffered["request_id"])[-1:] == ["attempt.completed"],
             what="the buffered attempt.completed to be published",
         )
-        streamed_events, _ = _read_sse_events(center, streamed["request_id"], 0)
-        buffered_events, _ = _read_sse_events(center, buffered["request_id"], 0)
+        streamed_events, _ = _read_sse_events(server, streamed["request_id"], 0)
+        buffered_events, _ = _read_sse_events(server, buffered["request_id"], 0)
         streamed_types = [event["event_type"] for event in streamed_events]
         buffered_types = [event["event_type"] for event in buffered_events]
 
@@ -498,7 +498,7 @@ def _node_config(tmp_path: Path, adapter: Any) -> ConnectorConfig:
     """Build a connector config for the socket-free tests."""
     _public, private_b64 = generate_key_pair()
     return ConnectorConfig(
-        center_url="ws://127.0.0.1:1/v1/node-link",
+        server_url="ws://127.0.0.1:1/v1/node-link",
         node_id="node-1",
         device_id="device-1",
         device_key_id="device-key-1",

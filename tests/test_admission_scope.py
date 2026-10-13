@@ -42,7 +42,7 @@ from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, Credential
+from aipotluck_server.persistence import Credential, ServerStore
 
 BASE = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
 REGISTERED_AT = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
@@ -64,17 +64,17 @@ def _wait_until(condition: Any, *, timeout: float = 10.0, what: str = "condition
     raise AssertionError(f"timed out waiting for {what}")
 
 
-class _Center:
+class _Server:
     """A real service and store, with a funded consumer and a settled keyring."""
 
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
         self.keyring = Keyring()
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=self.keyring.private_b64["settlement-key-1"],
@@ -107,9 +107,9 @@ class _Center:
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> _Center:
-    """Return a center over a fresh store, closed at the end of the test."""
-    built = _Center(tmp_path)
+def server(tmp_path: Path) -> _Server:
+    """Return a server over a fresh store, closed at the end of the test."""
+    built = _Server(tmp_path)
     yield built
     built.close()
 
@@ -124,62 +124,62 @@ def _authorize(keyring: Keyring, **overrides: Any) -> Any:
 # --------------------------------------------------------------------------
 
 
-def test_admission_accepts_a_request_matching_its_authorization(center: _Center) -> None:
+def test_admission_accepts_a_request_matching_its_authorization(server: _Server) -> None:
     """The positive path: everything the authorization signed is submitted."""
-    result = center.admit(_authorize(center.keyring, request_id="R-1"))
+    result = server.admit(_authorize(server.keyring, request_id="R-1"))
 
     assert result.created is True
     assert result.request_id == "R-1"
     assert result.delivery_mode == DELIVERY
 
 
-def test_admission_refuses_work_the_authorization_did_not_sign(center: _Center) -> None:
+def test_admission_refuses_work_the_authorization_did_not_sign(server: _Server) -> None:
     """A valid signature for one conversation cannot be re-pointed at another."""
     authorization = _authorize(
-        center.keyring, request_id="R-1", messages=(user_message("signed prompt"),)
+        server.keyring, request_id="R-1", messages=(user_message("signed prompt"),)
     )
 
     with pytest.raises(ProtocolError, match="request_digest"):
-        center.admit(authorization, messages=(user_message("a different prompt"),))
+        server.admit(authorization, messages=(user_message("a different prompt"),))
 
 
-def test_admission_refuses_a_model_outside_the_signed_allowlist(center: _Center) -> None:
+def test_admission_refuses_a_model_outside_the_signed_allowlist(server: _Server) -> None:
     """The model must be one the authorization allowed, not merely digest-matched."""
     authorization = _authorize(
-        center.keyring, request_id="R-1", model=MODEL,
+        server.keyring, request_id="R-1", model=MODEL,
         allowed_models=frozenset({"some-other-model"}),
     )
 
     with pytest.raises(ProtocolError, match="allowlist"):
-        center.admit(authorization, model=MODEL)
+        server.admit(authorization, model=MODEL)
 
 
 def test_admission_refuses_a_delivery_mode_the_authorization_did_not_sign(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """The delivery mode is part of the signed work, so it cannot be swapped."""
-    authorization = _authorize(center.keyring, request_id="R-1",
+    authorization = _authorize(server.keyring, request_id="R-1",
                                delivery_mode="buffered_complete")
 
     with pytest.raises(ProtocolError, match="request_digest"):
-        center.admit(authorization, delivery_mode="stream_strict")
+        server.admit(authorization, delivery_mode="stream_strict")
 
 
-def test_admission_refuses_more_attempts_than_authorized(center: _Center) -> None:
+def test_admission_refuses_more_attempts_than_authorized(server: _Server) -> None:
     """The attempt budget may not exceed what the consumer signed."""
-    authorization = _authorize(center.keyring, request_id="R-1", max_attempts=1)
+    authorization = _authorize(server.keyring, request_id="R-1", max_attempts=1)
 
     with pytest.raises(ProtocolError, match="max_attempts"):
-        center.admit(authorization, max_attempts=3)
+        server.admit(authorization, max_attempts=3)
 
 
-def test_admission_refuses_a_ceiling_above_the_signed_cap(center: _Center) -> None:
+def test_admission_refuses_a_ceiling_above_the_signed_cap(server: _Server) -> None:
     """The exposed charge ceiling may not exceed the signed cap."""
-    authorization = _authorize(center.keyring, request_id="R-1",
+    authorization = _authorize(server.keyring, request_id="R-1",
                                max_charge_milli_credits=1_000)
 
     with pytest.raises(ProtocolError, match="ceiling"):
-        center.admit(authorization, max_charge_milli_credits=5_000)
+        server.admit(authorization, max_charge_milli_credits=5_000)
 
 
 # --------------------------------------------------------------------------
@@ -187,53 +187,53 @@ def test_admission_refuses_a_ceiling_above_the_signed_cap(center: _Center) -> No
 # --------------------------------------------------------------------------
 
 
-def test_a_tenant_may_read_and_cancel_its_own_siblings_request(center: _Center) -> None:
+def test_a_tenant_may_read_and_cancel_its_own_siblings_request(server: _Server) -> None:
     """Requests are visible within a tenant, not only to their own subject."""
-    center.admit(_authorize(center.keyring, request_id="R-1"))
+    server.admit(_authorize(server.keyring, request_id="R-1"))
 
-    document = center.service.request_status(credential=SIBLING, request_id="R-1")
+    document = server.service.request_status(credential=SIBLING, request_id="R-1")
     assert document["tenant_id"] == "tenant-a"
     assert document["status"] == "ROUTING"
 
-    cancelled = center.service.cancel_request(
+    cancelled = server.service.cancel_request(
         credential=SIBLING, request_id="R-1", origin="consumer_cancel", now=BASE
     )
     assert cancelled["status"] == "CANCELLED"
-    events = center.service.request_events(credential=SIBLING, request_id="R-1", cursor=0)
+    events = server.service.request_events(credential=SIBLING, request_id="R-1", cursor=0)
     assert isinstance(events, list)
 
 
-def test_another_tenant_cannot_read_a_request(center: _Center) -> None:
+def test_another_tenant_cannot_read_a_request(server: _Server) -> None:
     """A credential of one tenant cannot see another tenant's request."""
-    center.admit(_authorize(center.keyring, request_id="R-1"))
+    server.admit(_authorize(server.keyring, request_id="R-1"))
 
     with pytest.raises(IdentityBindingError):
-        center.service.request_status(credential=FOREIGN, request_id="R-1")
+        server.service.request_status(credential=FOREIGN, request_id="R-1")
     with pytest.raises(IdentityBindingError):
-        center.service.request_events(credential=FOREIGN, request_id="R-1", cursor=0)
+        server.service.request_events(credential=FOREIGN, request_id="R-1", cursor=0)
 
 
-def test_another_tenant_cannot_cancel_a_request(center: _Center) -> None:
+def test_another_tenant_cannot_cancel_a_request(server: _Server) -> None:
     """Cancellation is refused across tenants, and the request survives."""
-    center.admit(_authorize(center.keyring, request_id="R-1"))
+    server.admit(_authorize(server.keyring, request_id="R-1"))
 
     with pytest.raises(IdentityBindingError):
-        center.service.cancel_request(
+        server.service.cancel_request(
             credential=FOREIGN, request_id="R-1", origin="consumer_cancel", now=BASE
         )
-    assert center.service.request_status(credential=CONSUMER, request_id="R-1")["status"] != (
+    assert server.service.request_status(credential=CONSUMER, request_id="R-1")["status"] != (
         "CANCELLED"
     )
 
 
-def test_an_unknown_request_is_not_readable(center: _Center) -> None:
+def test_an_unknown_request_is_not_readable(server: _Server) -> None:
     """A request nobody admitted is a state error, not an empty document."""
     with pytest.raises(StateTransitionError):
-        center.service.request_status(credential=CONSUMER, request_id="R-missing")
+        server.service.request_status(credential=CONSUMER, request_id="R-missing")
 
 
 def test_auto_invites_are_mutually_invisible_even_with_the_same_claimed_name(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """Two auto joins that both claim ``alice`` must still be fully separated.
 
@@ -244,17 +244,17 @@ def test_auto_invites_are_mutually_invisible_even_with_the_same_claimed_name(
     """
     first_public, first_private = generate_key_pair()
     second_public, _second_private = generate_key_pair()
-    center.store.add_invite("code-a", "consumer", "auto", max_uses=1, created_at=BASE)
-    center.store.add_invite("code-b", "consumer", "auto", max_uses=1, created_at=BASE)
-    first = center.service.join(
+    server.store.add_invite("code-a", "consumer", "auto", max_uses=1, created_at=BASE)
+    server.store.add_invite("code-b", "consumer", "auto", max_uses=1, created_at=BASE)
+    first = server.service.join(
         invite_code="code-a",
         identity={"subject_id": "alice", "key_id": "alice-key", "public_key_b64": first_public},
-        device=None, center_url="http://center.test", now=BASE,
+        device=None, server_url="http://server.test", now=BASE,
     )
-    second = center.service.join(
+    second = server.service.join(
         invite_code="code-b",
         identity={"subject_id": "alice", "key_id": "alice-key", "public_key_b64": second_public},
-        device=None, center_url="http://center.test", now=BASE,
+        device=None, server_url="http://server.test", now=BASE,
     )
 
     # Neither joiner became "alice", and their tenants and accounts differ.
@@ -289,7 +289,7 @@ def test_auto_invites_are_mutually_invisible_even_with_the_same_claimed_name(
         tenant_id=first.tenant_id, subject_id=first.subject_id, role="consumer",
         account_id=first.subject_id,
     )
-    center.service.admit_request(
+    server.service.admit_request(
         credential=credential_a, idempotency_key="idem-a",
         messages=(user_message("hi"),),
         authorization=record, model=MODEL, max_charge_milli_credits=20_000,
@@ -300,20 +300,20 @@ def test_auto_invites_are_mutually_invisible_even_with_the_same_claimed_name(
         tenant_id=second.tenant_id, subject_id=second.subject_id, role="consumer",
         account_id=second.subject_id,
     )
-    assert center.service.request_status(credential=credential_a, request_id="R-a")["status"]
+    assert server.service.request_status(credential=credential_a, request_id="R-a")["status"]
     with pytest.raises(IdentityBindingError):
-        center.service.request_status(credential=credential_b, request_id="R-a")
+        server.service.request_status(credential=credential_b, request_id="R-a")
 
 
 # --------------------------------------------------------------------------
-# One end-to-end `ask`: join then ask against a real center and a real node
+# One end-to-end `ask`: join then ask against a real server and a real node
 # --------------------------------------------------------------------------
 
 
 class _Node:
-    """A real connector dialing the center over loopback TCP."""
+    """A real connector dialing the server over loopback TCP."""
 
-    def __init__(self, tmp_path: Path, keyring: Keyring, center_port: int,
+    def __init__(self, tmp_path: Path, keyring: Keyring, server_port: int,
                  *, token: str) -> None:
         self.upstream = FakeUpstream()
         self.upstream.queue(
@@ -331,7 +331,7 @@ class _Node:
         self.adapter = FakeUpstreamAdapter(upstream=self.upstream, model=MODEL)
         self.store = NodeStore.open(tmp_path / "node.db")
         self.config = ConnectorConfig(
-            center_url=f"ws://127.0.0.1:{center_port}/v1/node-link",
+            server_url=f"ws://127.0.0.1:{server_port}/v1/node-link",
             node_id="node-A",
             device_id="device-A",
             device_key_id="device-key-A",
@@ -364,11 +364,11 @@ def test_ask_joins_and_prints_the_answer_and_a_cost_line(
 ) -> None:
     """The whole consumer path: `join`, `ask`, buffered answer plus a cost line."""
     keyring = Keyring()
-    store = CenterStore.open(tmp_path / "center.db")
+    store = ServerStore.open(tmp_path / "server.db")
     config = GatewayConfig(
         host="127.0.0.1",
         port=0,
-        database_path=str(tmp_path / "center.db"),
+        database_path=str(tmp_path / "server.db"),
         platform_id="platform-1",
         settlement_key_id="settlement-key-1",
         settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
@@ -389,7 +389,7 @@ def test_ask_joins_and_prints_the_answer_and_a_cost_line(
 
         identity_dir = tmp_path / "identity"
         assert main([
-            "join", "--center", server.url, "--invite", "code-ask",
+            "join", "--server", server.url, "--invite", "code-ask",
             "--config-dir", str(identity_dir), "--subject-id", "consumer-X",
         ]) == 0
         capsys.readouterr()
@@ -415,11 +415,11 @@ def test_ask_json_reports_a_machine_readable_result(
 ) -> None:
     """`ask --json` prints one canonical document a program can consume."""
     keyring = Keyring()
-    store = CenterStore.open(tmp_path / "center.db")
+    store = ServerStore.open(tmp_path / "server.db")
     config = GatewayConfig(
         host="127.0.0.1",
         port=0,
-        database_path=str(tmp_path / "center.db"),
+        database_path=str(tmp_path / "server.db"),
         platform_id="platform-1",
         settlement_key_id="settlement-key-1",
         settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
@@ -440,7 +440,7 @@ def test_ask_json_reports_a_machine_readable_result(
 
         identity_dir = tmp_path / "identity"
         assert main([
-            "join", "--center", server.url, "--invite", "code-json",
+            "join", "--server", server.url, "--invite", "code-json",
             "--config-dir", str(identity_dir), "--subject-id", "consumer-X",
         ]) == 0
         capsys.readouterr()
@@ -478,9 +478,9 @@ def test_ask_without_an_identity_fails_with_an_actionable_message(
 def test_join_over_http_is_unauthenticated_but_scoped(tmp_path: Path) -> None:
     """A sanity check that the join endpoint needs no bearer token at all."""
     keyring = Keyring()
-    store = CenterStore.open(tmp_path / "center.db")
+    store = ServerStore.open(tmp_path / "server.db")
     config = GatewayConfig(
-        host="127.0.0.1", port=0, database_path=str(tmp_path / "center.db"),
+        host="127.0.0.1", port=0, database_path=str(tmp_path / "server.db"),
         platform_id="platform-1", settlement_key_id="settlement-key-1",
         settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
     )

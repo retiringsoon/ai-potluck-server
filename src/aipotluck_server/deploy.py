@@ -1,15 +1,15 @@
-"""Center deployment: the ``center.json`` schema, provisioning, and inspection.
+"""Server deployment: the ``server.json`` schema, provisioning, and inspection.
 
-One JSON schema drives the center operator's role. Every file is parsed with
+One JSON schema drives the server operator's role. Every file is parsed with
 :func:`aipotluck.canonical.loads_strict`, so a float, a repeated key, or a
 ``NaN`` literal is refused at the boundary — the same rules the wire applies,
 because a config that only mostly parses is a config an operator cannot audit.
 
-``center.json`` — one center process::
+``server.json`` — one server process::
 
     {
       "host": "127.0.0.1", "port": 443,
-      "database_path": "center.db",
+      "database_path": "server.db",
       "platform_id": "platform-1",
       "settlement_key_id": "settlement-key-1",
       "settlement_private_key_b64": "<base64 Ed25519 private key>",
@@ -29,11 +29,11 @@ because a config that only mostly parses is a config an operator cannot audit.
 
 ``queue_enabled`` and ``max_queue_depth`` are optional and govern the dispatch
 queue: whether a request nothing can dispatch this instant waits for a node
-instead of being refused, and how many such requests the center holds at once.
+instead of being refused, and how many such requests the server holds at once.
 See `GatewayService`'s configuration for why the default is on. A request that
 waits still carries its own deadline, and the sweep that ends an overdue request
 is the same one that always ran, so a queued request nothing ever took still ends
-``EXPIRED`` with the center's own reason recorded — waiting changes when a
+``EXPIRED`` with the server's own reason recorded — waiting changes when a
 request is answered, never whether it is billed honestly.
 
 The node and consumer loaders, the consumer HTTP client, and the shared
@@ -46,10 +46,10 @@ Secrecy rules
 * A config file's tokens are only ever written into the credential store (as
   digests). No loader logs, and no error message raised here quotes a token
   value: validation messages name fields, not values.
-  `CenterDeployment.__repr__` is overridden for the same reason — the default
+  `ServerDeployment.__repr__` is overridden for the same reason — the default
   dataclass repr would embed ``config``, which carries the settlement private
   key.
-* Provisioning is idempotent by design: re-loading an unchanged center config
+* Provisioning is idempotent by design: re-loading an unchanged server config
   re-registers the same bindings (a no-op) and re-funds no float, so a restart
   never double-mints. A *changed* binding for an already-known token or device
   key is refused rather than silently applied.
@@ -82,7 +82,7 @@ from aipotluck.identity import IdentityRegistry, KeyPurpose, load_private_key
 
 from .gateway_server import GatewayServer
 from .gateway_service import DEFAULT_MAX_QUEUE_DEPTH, GatewayConfig, GatewayService
-from .persistence import CenterStore
+from .persistence import ServerStore
 
 if TYPE_CHECKING:
     from .gateway_server import GatewayConfig as _ServerGatewayConfig
@@ -91,8 +91,8 @@ if TYPE_CHECKING:
 _ROLES = frozenset({"consumer", "node"})
 
 @dataclass(frozen=True)
-class CenterDeployment:
-    """Everything a running center is made of, as one operator handle.
+class ServerDeployment:
+    """Everything a running server is made of, as one operator handle.
 
     ``provider_ids`` repeats the provider accounts the config provisioned, so
     ``potluck-server serve`` can report them without re-reading the file or exposing
@@ -102,31 +102,31 @@ class CenterDeployment:
     config: GatewayConfig
     service: GatewayService
     server: GatewayServer
-    store: CenterStore
+    store: ServerStore
     provider_ids: tuple[str, ...] = ()
 
     def __repr__(self) -> str:
         # Deliberately not the dataclass repr: `config` carries the settlement
         # private key, so rendering it would put a secret into every log line.
         return (
-            f"CenterDeployment(platform_id={self.config.platform_id!r}, "
+            f"ServerDeployment(platform_id={self.config.platform_id!r}, "
             f"provider_ids={self.provider_ids!r})"
         )
 
 
 @dataclass(frozen=True)
-class CenterInspection:
-    """A center's durable state opened for reading, with nothing written.
+class ServerInspection:
+    """A server's durable state opened for reading, with nothing written.
 
-    Deliberately not a `CenterDeployment`: there is no service and no server,
+    Deliberately not a `ServerDeployment`: there is no service and no server,
     because an audit reads durable rows rather than the in-memory books a running
-    center keeps. Building a service would replay the ledger and the log first,
+    server keeps. Building a service would replay the ledger and the log first,
     and that replay refuses a non-contiguous log — so the one defect an auditor
     most needs reported would stop the audit instead of appearing in it.
     """
 
     config: GatewayConfig
-    store: CenterStore
+    store: ServerStore
     registry: IdentityRegistry
 
     def close(self) -> None:
@@ -136,7 +136,7 @@ class CenterInspection:
     def __repr__(self) -> str:
         # Deliberately not the dataclass repr: `config` carries the settlement
         # private key, so rendering it would put a secret into every log line.
-        return f"CenterInspection(platform_id={self.config.platform_id!r})"
+        return f"ServerInspection(platform_id={self.config.platform_id!r})"
 
 
 @dataclass(frozen=True)
@@ -149,7 +149,7 @@ class _ProviderPlan:
 
 
 # --------------------------------------------------------------------------
-# Center provisioning
+# Server provisioning
 # --------------------------------------------------------------------------
 
 
@@ -192,7 +192,7 @@ def provision_settlement_key(
     except UnknownKeyError as exc:
         raise DeploymentError(
             f"settlement key {key_id!r} is not registered in the identity registry "
-            "at startup; refusing to serve a center that cannot sign receipts"
+            "at startup; refusing to serve a server that cannot sign receipts"
         ) from exc
     if registered.purpose != "platform_settlement" or registered.owner_id != platform_id:
         raise DeploymentError(
@@ -220,7 +220,7 @@ def provision_providers(
     known device key — a different owner, purpose, or public key — is refused
     rather than silently applied, because `register_key` alone would keep the
     old public key and an operator rotating a device key would never learn that
-    the center still verifies against the previous one.
+    the server still verifies against the previous one.
 
     Raises:
         DeploymentError: If an entry is malformed, or a known key is being
@@ -268,8 +268,8 @@ def provision_providers(
     return plans
 
 
-def _provision_credentials(store: CenterStore, entries: list[dict[str, Any]], context: str) -> None:
-    """Register every credential through `CenterStore.add_credential`.
+def _provision_credentials(store: ServerStore, entries: list[dict[str, Any]], context: str) -> None:
+    """Register every credential through `ServerStore.add_credential`.
 
     Re-adding an identical binding is a no-op; a different binding for a known
     token digest raises the store's `ConflictError`, which is surfaced as-is —
@@ -294,10 +294,10 @@ def _provision_credentials(store: CenterStore, entries: list[dict[str, Any]], co
         store.add_credential(token, tenant_id, subject_id, role, PROVISIONED_AT)
 
 
-def replay_dynamic_identities(registry: IdentityRegistry, store: CenterStore) -> None:
+def replay_dynamic_identities(registry: IdentityRegistry, store: ServerStore) -> None:
     """Rebuild the registry's dynamic identities from the store's rows.
 
-    `center.json` carries only the provisioned credentials and provider device
+    `server.json` carries only the provisioned credentials and provider device
     keys. An invited identity lives solely in the ``identities`` table, so this
     replay is what carries it across a restart. A revoked row is registered and
     then revoked, so its history survives exactly as a provisioned key's does.
@@ -305,7 +305,7 @@ def replay_dynamic_identities(registry: IdentityRegistry, store: CenterStore) ->
     Args:
         registry: The registry to populate. Keys provisioned from the config are
             already present; an identical binding here is a no-op.
-        store: The center store holding the persisted identities.
+        store: The server store holding the persisted identities.
 
     Raises:
         IdentityBindingError: If a stored identity disagrees with a key already
@@ -339,12 +339,12 @@ def replay_dynamic_identities(registry: IdentityRegistry, store: CenterStore) ->
             registry.revoke_key(record.key_id, record.revoked_at)
 
 
-def _already_issued(store: CenterStore, account_id: str) -> bool:
+def _already_issued(store: ServerStore, account_id: str) -> bool:
     """Whether the replay log already records an issuance into `account_id`.
 
     Funding is idempotent across restarts because it consults the same ordered
     log the rebuilt ledger replays: an account funded once is never funded
-    again, so restarting a center cannot double-mint its demo floats.
+    again, so restarting a server cannot double-mint its demo floats.
     """
     return any(
         kind == "issue" and payload.get("account_id") == account_id
@@ -354,7 +354,7 @@ def _already_issued(store: CenterStore, account_id: str) -> bool:
 
 def _fund_floats(
     service: GatewayService,
-    store: CenterStore,
+    store: ServerStore,
     providers: list[_ProviderPlan],
     consumer_floats: list[dict[str, Any]],
     context: str,
@@ -392,8 +392,8 @@ def _fund_floats(
             )
 
 
-def load_center(path: str | Path, *, start: bool = False) -> CenterDeployment:
-    """Load, provision, and optionally start a center from its JSON file.
+def load_server(path: str | Path, *, start: bool = False) -> ServerDeployment:
+    """Load, provision, and optionally start a server from its JSON file.
 
     The store is opened, every credential and provider device key in the config
     is provisioned idempotently, **every dynamically joined identity in the
@@ -404,12 +404,12 @@ def load_center(path: str | Path, *, start: bool = False) -> CenterDeployment:
     the error propagates; nothing is left half-provisioned on the socket side.
 
     Why the identity replay matters: an invited consumer exists only in the
-    ``identities`` table, never in ``center.json``. Rebuilding the registry from
+    ``identities`` table, never in ``server.json``. Rebuilding the registry from
     the store is what makes that consumer keep authenticating after a restart
     without any config edit — the property the invite flow exists to provide.
 
     Args:
-        path: The ``center.json`` file.
+        path: The ``server.json`` file.
         start: Whether to bind the listener. ``port: 0`` asks the OS for an
             ephemeral port, which is what makes tests and smoke runs cheap.
 
@@ -423,11 +423,11 @@ def load_center(path: str | Path, *, start: bool = False) -> CenterDeployment:
         ConflictError: If a token is re-provisioned with a different binding.
     """
     config_path = Path(path)
-    context = f"center configuration {config_path}"
-    config, credentials, provider_entries, consumer_floats = _center_parts(
+    context = f"server configuration {config_path}"
+    config, credentials, provider_entries, consumer_floats = _server_parts(
         load_document(config_path), context
     )
-    store = CenterStore.open(config.database_path)
+    store = ServerStore.open(config.database_path)
     try:
         registry = IdentityRegistry()
         provision_settlement_key(
@@ -456,7 +456,7 @@ def load_center(path: str | Path, *, start: bool = False) -> CenterDeployment:
     except BaseException:
         store.close()
         raise
-    return CenterDeployment(
+    return ServerDeployment(
         config=config,
         service=service,
         server=server,
@@ -465,14 +465,14 @@ def load_center(path: str | Path, *, start: bool = False) -> CenterDeployment:
     )
 
 
-def _center_parts(
+def _server_parts(
     document: dict[str, Any], context: str
 ) -> tuple[GatewayConfig, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Parse ``center.json`` into its gateway config and three provisioned lists.
+    """Parse ``server.json`` into its gateway config and three provisioned lists.
 
-    Shared by `load_center` and `load_center_for_inspection` so a field is read
+    Shared by `load_server` and `load_server_for_inspection` so a field is read
     and validated in exactly one place: an audit command that parsed the same
-    file slightly differently would be auditing a center the operator does not
+    file slightly differently would be auditing a server the operator does not
     run.
 
     Returns:
@@ -525,17 +525,17 @@ def _center_parts(
     )
 
 
-def load_center_for_inspection(path: str | Path) -> CenterInspection:
-    """Open a center for reading: its durable store and its trusted-key registry.
+def load_server_for_inspection(path: str | Path) -> ServerInspection:
+    """Open a server for reading: its durable store and its trusted-key registry.
 
-    This is `load_center` minus every step that writes and every step that
+    This is `load_server` minus every step that writes and every step that
     serves. No credential is provisioned, no float is funded, no listener is
     constructed and no in-memory book is rebuilt, so an operator's audit command
-    can be pointed at a live center's database without changing the books it is
+    can be pointed at a live server's database without changing the books it is
     auditing — and without a defect in those books stopping the audit before it
     reports anything.
 
-    The registry is built the same way `load_center` builds it, because a
+    The registry is built the same way `load_server` builds it, because a
     verifier that trusted a different set of keys would be verifying a different
     platform: the settlement key's public half is derived from the configured
     private half, the provider device keys come from the configuration, and every
@@ -547,11 +547,11 @@ def load_center_for_inspection(path: str | Path) -> CenterInspection:
     The database has to exist already, and nothing here creates it. An audit
     pointed at a ``database_path`` that names nothing must report that, because
     the empty database it would otherwise open has no records and therefore no
-    discrepancies either: "the center's books are consistent" and "there are no
+    discrepancies either: "the server's books are consistent" and "there are no
     books" would print the same verdict.
 
     Args:
-        path: The ``center.json`` file.
+        path: The ``server.json`` file.
 
     Returns:
         The inspection handle. Its `store` must be closed by the caller.
@@ -562,11 +562,11 @@ def load_center_for_inspection(path: str | Path) -> CenterInspection:
         PotluckError: If the configured ``database_path`` names no database.
     """
     config_path = Path(path)
-    context = f"center configuration {config_path}"
-    config, _credentials, provider_entries, _floats = _center_parts(
+    context = f"server configuration {config_path}"
+    config, _credentials, provider_entries, _floats = _server_parts(
         load_document(config_path), context
     )
-    store = CenterStore.open_existing(config.database_path)
+    store = ServerStore.open_existing(config.database_path)
     try:
         registry = IdentityRegistry()
         provision_settlement_key(
@@ -580,6 +580,6 @@ def load_center_for_inspection(path: str | Path) -> CenterInspection:
     except BaseException:
         store.close()
         raise
-    return CenterInspection(config=config, store=store, registry=registry)
+    return ServerInspection(config=config, store=store, registry=registry)
 
 

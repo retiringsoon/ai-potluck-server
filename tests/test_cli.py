@@ -1,11 +1,11 @@
-"""The consumer network commands of ``potluck`` against a real center.
+"""The consumer network commands of ``potluck`` against a real server.
 
 These tests drive the client CLI's ``main()`` the way the installed ``potluck``
 script uses it, over a real ``GatewayServer`` on loopback with a scripted
 contribution node driven by a real ``Connector`` thread — the same pattern
 ``test_end_to_end_network.py`` uses. The pre-network ``request`` refusal
-(no ``--auth-file``) needs no center and is covered in the ``ai-potluck``
-repository's own ``test_cli.py``. They live here because the center they
+(no ``--auth-file``) needs no server and is covered in the ``ai-potluck``
+repository's own ``test_cli.py``. They live here because the server they
 drive against ships in this package. The offline tools (``keygen``/``sign``/
 ``verify``) and the pre-network refusals are covered in the ``ai-potluck``
 repository's own ``test_cli.py``.
@@ -36,7 +36,7 @@ from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore
+from aipotluck_server.persistence import ServerStore
 
 MODEL = "coding-pool"
 TENANT = "tenant-cli"
@@ -48,7 +48,7 @@ REGISTERED_AT = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 
 
 # --------------------------------------------------------------------------
-# Consumer network commands against a real center on loopback.
+# Consumer network commands against a real server on loopback.
 # --------------------------------------------------------------------------
 
 
@@ -62,17 +62,17 @@ def _wait_until(condition: Any, *, timeout: float = 10.0, what: str = "condition
     raise AssertionError(f"timed out waiting for {what}")
 
 
-class _CliCenter:
+class _CliServer:
     """A real gateway over a real store, with credentials and floats ready."""
 
     def __init__(self, tmp_path: Path, keyring: Keyring) -> None:
         self.tmp_path = tmp_path
         self.keyring = keyring
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
@@ -94,7 +94,7 @@ class _CliCenter:
     def _write_consumer_config(self) -> Path:
         path = self.tmp_path / "consumer.json"
         path.write_text(
-            json.dumps({"center_url": self.server.url, "token": CONSUMER_TOKEN}),
+            json.dumps({"server_url": self.server.url, "token": CONSUMER_TOKEN}),
             encoding="utf-8",
         )
         return path
@@ -113,7 +113,7 @@ class _CliCenter:
 class _CliNode:
     """A scripted contribution node holding the outbound link like a real one."""
 
-    def __init__(self, tmp_path: Path, keyring: Keyring, center_port: int) -> None:
+    def __init__(self, tmp_path: Path, keyring: Keyring, server_port: int) -> None:
         self.upstream = FakeUpstream()
         self.upstream.queue(
             FakeResponse(
@@ -124,7 +124,7 @@ class _CliNode:
         self.adapter = FakeUpstreamAdapter(upstream=self.upstream, model=MODEL)
         self.store = NodeStore.open(tmp_path / "node.db")
         self.config = ConnectorConfig(
-            center_url=f"ws://127.0.0.1:{center_port}/v1/node-link",
+            server_url=f"ws://127.0.0.1:{server_port}/v1/node-link",
             node_id="node-A",
             device_id="device-A",
             device_key_id="device-key-A",
@@ -160,7 +160,7 @@ def _authorization_body(
     """Build the serialized signed authorization a real client would POST.
 
     The window is anchored to the wall clock: this suite exercises the real
-    center, so a just-signed authorization must be valid when it settles. The
+    server, so a just-signed authorization must be valid when it settles. The
     ``request_digest`` is computed for `messages`, which must match the
     ``--prompt`` the ``request`` command posts as its one user turn, because
     admission re-derives and compares it.
@@ -213,55 +213,55 @@ def _request_argv(consumer_config: Path, auth_file: Path | None, **overrides: An
 def test_request_without_wait_prints_the_request_id(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], keyring: Keyring
 ) -> None:
-    """A plain submission returns 0 and the id the center assigned."""
-    center = _CliCenter(tmp_path, keyring)
+    """A plain submission returns 0 and the id the server assigned."""
+    server = _CliServer(tmp_path, keyring)
     try:
         auth_path = tmp_path / "auth.json"
         auth_path.write_text(
             json.dumps(_authorization_body(keyring, REQUEST_ID)), encoding="utf-8"
         )
-        code = main(_request_argv(center.consumer_config, auth_path))
+        code = main(_request_argv(server.consumer_config, auth_path))
         captured = capsys.readouterr()
         assert code == 0
         assert captured.out.strip() == REQUEST_ID
-        # The center actually stored the request under that id.
-        assert center.store.get_request(REQUEST_ID) is not None
+        # The server actually stored the request under that id.
+        assert server.store.get_request(REQUEST_ID) is not None
     finally:
-        center.stop()
+        server.stop()
 
 
 def test_request_wait_reaches_succeeded_and_status_and_events_are_readable(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], keyring: Keyring
 ) -> None:
     """`request --wait` drives one upstream call and prints the receipt."""
-    center = _CliCenter(tmp_path, keyring)
-    node = _CliNode(tmp_path, keyring, center.port)
+    server = _CliServer(tmp_path, keyring)
+    node = _CliNode(tmp_path, keyring, server.port)
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
         auth_path = tmp_path / "auth.json"
         auth_path.write_text(
             json.dumps(_authorization_body(keyring, REQUEST_ID)), encoding="utf-8"
         )
-        code = main(_request_argv(center.consumer_config, auth_path, extra=["--wait"]))
+        code = main(_request_argv(server.consumer_config, auth_path, extra=["--wait"]))
         captured = capsys.readouterr()
         assert code == 0, captured.err
         assert captured.out.splitlines()[0] == REQUEST_ID
         assert "SUCCEEDED" in captured.out
         # The receipt summary line is printed with concrete values.
-        settlement = center.store.get_settlement(REQUEST_ID, 1)
+        settlement = server.store.get_settlement(REQUEST_ID, 1)
         assert settlement is not None
         assert settlement.receipt_id in captured.out
         assert str(settlement.log_index) in captured.out
         # The settlement actually moved credit: 1000 tokens at face value.
         assert node.adapter.upstream_calls == 1
-        assert center.service.balance("consumer-X") == 99_000
-        assert center.service.balance("provider-A/pending") == 1_000
+        assert server.service.balance("consumer-X") == 99_000
+        assert server.service.balance("provider-A/pending") == 1_000
 
         # `status` prints exactly one canonical JSON document.
         code = main(
-            ["status", "--config", str(center.consumer_config), "--request-id", REQUEST_ID]
+            ["status", "--config", str(server.consumer_config), "--request-id", REQUEST_ID]
         )
         status_out = capsys.readouterr().out
         assert code == 0
@@ -276,7 +276,7 @@ def test_request_wait_reaches_succeeded_and_status_and_events_are_readable(
             [
                 "events",
                 "--config",
-                str(center.consumer_config),
+                str(server.consumer_config),
                 "--request-id",
                 REQUEST_ID,
                 "--cursor",
@@ -295,4 +295,4 @@ def test_request_wait_reaches_succeeded_and_status_and_events_are_readable(
         assert frames[-1] == {"request_id": REQUEST_ID, "status": "SUCCEEDED"}
     finally:
         node.stop()
-        center.stop()
+        server.stop()

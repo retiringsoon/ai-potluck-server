@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest an idea or capability for the ai-potluck center
+about: Suggest an idea or capability for the ai-potluck server
 title: "[feature] "
 labels: ""
 assignees: ""
@@ -12,7 +12,7 @@ assignees: ""
 
 **Desired outcome** *(what would "done" look like for you)*
 
-**Your role in the group** *(center operator / contributor / consumer / not using yet)*
+**Your role in the group** *(server operator / contributor / consumer / not using yet)*
 
 **Environment** *(OS, Python version — `potluck-server version` covers the package side)*
 

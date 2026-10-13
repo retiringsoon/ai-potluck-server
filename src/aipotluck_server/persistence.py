@@ -1,6 +1,6 @@
-"""Durable persistence for the center.
+"""Durable persistence for the server.
 
-The center keeps its whole world replayable: which attempt won the output
+The server keeps its whole world replayable: which attempt won the output
 race, every stored event body a disconnected consumer can resume from, every
 settlement, receipt and transparency-log leaf, and the ordered ledger replay
 log a restart rebuilds the in-memory books from. These failures are impossible
@@ -9,8 +9,8 @@ because the store, not the process, is the authority.
 The node's own store (``NodeStore``) and the shared record shapes both sides
 speak (``ExecutionRecord``, ``SpoolRecord``, ``ReceiptRecord``) live in the
 ``ai-potluck`` package; this module holds the shared ``_Store`` plumbing
-carved to the center's schema, ``CenterStore`` built on it, and the
-center-side record types.
+carved to the server's schema, ``ServerStore`` built on it, and the
+server-side record types.
 
 Only the standard library is used. The project has exactly one runtime
 dependency (``cryptography``) and adding another is not allowed, so this module
@@ -26,7 +26,7 @@ guarded by a single `RLock` — is simpler, but it would (a) require disabling
 per-thread design keeps the default ``check_same_thread=True`` (a connection is
 created and used by exactly one thread) and pushes the critical section down to
 SQLite's own write lock, so the compare-and-set in
-:meth:`CenterStore.commit_output` is correct at the database level rather than
+:meth:`ServerStore.commit_output` is correct at the database level rather than
 only within one process. With WAL enabled, readers do not block behind the
 single writer.
 
@@ -82,7 +82,7 @@ from aipotluck.errors import (
 )
 
 # Explicit re-export: the shared record shape is defined once, in the client
-# package, and center code and tests import it from here as well as from there.
+# package, and server code and tests import it from here as well as from there.
 from aipotluck.persistence import ReceiptRecord as ReceiptRecord
 from aipotluck.statemachine import TERMINAL_REQUEST_STATES
 
@@ -166,8 +166,8 @@ class Credential:
 
     ``account_id`` is the consumer account this credential may commit money
     from, and it exists so admission can bind the authorization's payer to an
-    account the center itself recorded rather than to a string the caller sent.
-    It is ``None`` for a credential provisioned from ``center.json`` (which
+    account the server itself recorded rather than to a string the caller sent.
+    It is ``None`` for a credential provisioned from ``server.json`` (which
     predates per-identity accounts); for those the historical ``subject_id``
     equality still governs, so no pre-existing deployment changes meaning.
 
@@ -179,7 +179,7 @@ class Credential:
     this column the two rows share nothing but a tenant, and a tenant is shared
     by every member an operator invited into it. It is ``None`` for a consumer
     credential and for a node credential an operator provisioned in
-    ``center.json``, which names no device — that path writes ``node.json`` by
+    ``server.json``, which names no device — that path writes ``node.json`` by
     hand, and its documented sample dials with the credential's own subject as
     its ``node_id``.
     """
@@ -234,7 +234,7 @@ class SessionRecord:
     upstream's cache is the cheapest place to run the next one.
 
     The totals count only *settled* turns. A turn that failed or was cancelled
-    still counts in `request_count`, because it was a request the center
+    still counts in `request_count`, because it was a request the server
     admitted, but it adds no tokens and no charge: nothing here may report money
     the books did not move.
     """
@@ -399,11 +399,11 @@ class InviteRecord:
 class IdentityRecord:
     """A dynamically registered identity, and the key that speaks for it.
 
-    This row — not the ``center.json`` file — is the source of truth for an
+    This row — not the ``server.json`` file — is the source of truth for an
     invited identity: it carries the key material, the tenant it belongs to, its
     role, the consumer account admission must bind a payer to, and (for a
     contribution device) the provider it may report for. On every startup
-    `deploy.load_center` replays these rows into a fresh `IdentityRegistry`, so a
+    `deploy.load_server` replays these rows into a fresh `IdentityRegistry`, so a
     joined identity keeps working across a restart with no config edit.
     """
 
@@ -436,14 +436,14 @@ class ConsumerBinding:
     """The tenant and account a consumer subject spends through.
 
     Derived by the store from the rows it already holds — an invited identity's
-    own row first, then a credential an operator provisioned in ``center.json``
+    own row first, then a credential an operator provisioned in ``server.json``
     — so nothing has to be told twice and an API key can never be minted for a
-    subject the center has no account for.
+    subject the server has no account for.
     """
 
     subject_id: str
     tenant_id: str
-    #: The account admission binds a payer to. For every consumer the center
+    #: The account admission binds a payer to. For every consumer the server
     #: mints today this is the subject's own account; the column is read rather
     #: than assumed so a subject whose account is not its own name keeps working.
     account_id: str
@@ -457,7 +457,7 @@ class ApiKeyRecord:
     an invite code: the plaintext exists once, in the operator's terminal, so
     neither this table nor a backup of it can leak a usable key.
 
-    A key authenticates a subject the center already knows; it does not create an
+    A key authenticates a subject the server already knows; it does not create an
     identity, and it never widens what that subject may spend. The subject's own
     account balance stays the authority on money, while ``quota_milli_credits``
     caps what this one key may draw from it — so a key handed to a tool can be
@@ -502,7 +502,7 @@ class ApiKeyRecord:
         Revocation and expiry are both inclusive of their instant, matching how
         the registry treats key revocation and how an invite treats its expiry.
         The quota is deliberately *not* part of this answer: an exhausted key is
-        still a key the center knows, and admission has to be able to tell "this
+        still a key the server knows, and admission has to be able to tell "this
         is not yours" (401) from "you have spent it" (429) rather than collapsing
         the two into one refusal.
         """
@@ -532,7 +532,7 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
 #: against. All three must survive a restart, or a request can neither be
 #: re-offered nor settled.
 #:
-#: ``messages_json`` is NULL only in a row an earlier center version wrote as a
+#: ``messages_json`` is NULL only in a row an earlier server version wrote as a
 #: flattened prompt. Such a row holds no conversation to dispatch, and
 #: `get_request_input` says so rather than inventing a one-message conversation
 #: nobody signed for. It therefore cannot be ``NOT NULL``: the rebuild that
@@ -541,7 +541,7 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
 #:
 #: Defined once and embedded in `_SCHEMA`, because the rebuild in
 #: `_retire_request_inputs_prompt` must create exactly the shape a fresh
-#: database gets — one table, one spelling, whether the center is new or
+#: database gets — one table, one spelling, whether the server is new or
 #: upgraded.
 _REQUEST_INPUTS_DDL = """
 CREATE TABLE IF NOT EXISTS request_inputs (
@@ -793,7 +793,7 @@ CREATE INDEX IF NOT EXISTS idx_requests_status_created ON requests(status, creat
 
 #: Columns added after the first release, each as ``table -> (column, DDL)``.
 #: ``_migrate`` adds the ones an existing database is missing, so an upgraded
-#: center keeps its identities instead of failing to open.
+#: server keeps its identities instead of failing to open.
 _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "invites": (
         ("quota_milli_credits", "INTEGER NOT NULL DEFAULT 20000"),
@@ -808,13 +808,13 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     # A request admitted through an API key records which one, so the settlement
     # that bills it can also count it against that key's quota, and so an
     # operator can see what a key paid for. Both stay NULL for a request admitted
-    # on a signature, which is every request a center written before this change
+    # on a signature, which is every request a server written before this change
     # holds.
     "requests": (
         ("api_key_id", "TEXT"),
         ("api_key_charge_milli_credits", "INTEGER"),
         # The agent session a request belongs to. NULL for every request a
-        # center written before sessions holds, and for one whose caller named
+        # server written before sessions holds, and for one whose caller named
         # none: a request with no session is simply not aggregated, which is
         # what keeps a session's totals a statement about the turns that
         # declared one.
@@ -874,7 +874,7 @@ class _Store:
 
         A database created before the request model became a conversation holds
         ``prompt TEXT NOT NULL``, and no conversation write can satisfy that
-        constraint: every `set_request_input` then fails, so an upgraded center
+        constraint: every `set_request_input` then fails, so an upgraded server
         admits nothing at all. Every request it accepted stayed in ROUTING with
         no dispatch inputs behind it — undispatchable, unsettleable, and holding
         its API key's concurrency slot until the deadline sweep ended it.
@@ -882,7 +882,7 @@ class _Store:
         one shape this build writes and reads, created from `_SCHEMA` itself so
         a fresh database and an upgraded one hold the same columns.
 
-        Every row is carried over. A row an earlier center wrote has no
+        Every row is carried over. A row an earlier server wrote has no
         conversation, so its ``messages_json`` stays NULL and `get_request_input`
         reports it as undispatchable instead of inventing one nobody signed for.
         What the rebuild does drop is that row's retired ``prompt`` text, and the
@@ -923,7 +923,7 @@ class _Store:
         """Add columns a database from an earlier release is missing.
 
         The schema is created with ``IF NOT EXISTS``, so a table that already
-        exists is left untouched; without this step an upgraded center would not
+        exists is left untouched; without this step an upgraded server would not
         gain ``identities.account_id`` and every join would fail. Each addition
         is guarded by ``PRAGMA table_info`` so it is idempotent, and the added
         columns all carry a default, so existing rows stay valid.
@@ -940,7 +940,7 @@ class _Store:
     def open(cls, path: str | Path) -> Self:
         """Open (or create) the store at `path` and ensure the schema exists.
 
-        Creating is what the process that *owns* a database needs — a center
+        Creating is what the process that *owns* a database needs — a server
         started by ``potluck serve``, a node started by ``potluck share run``.
         A command that only opens somebody else's database calls
         `open_existing` instead, so a path that names nothing reports that fact
@@ -956,7 +956,7 @@ class _Store:
         which is fatal for a command that reads one. A lost or mistyped
         ``database_path`` would come back as a freshly created empty database,
         and an empty database reports no differences: ``admin reconcile`` over a
-        center whose database is entirely gone would print that both sides agree
+        server whose database is entirely gone would print that both sides agree
         and exit 0, which is the one answer an audit must never give. The same
         applies to a node database rebuilt from nothing, which a later
         ``share run`` would then continue with as if the node had never worked.
@@ -977,7 +977,7 @@ class _Store:
             raise PotluckError(
                 f"database {candidate} does not exist: this command opens a "
                 "database, it does not create one — start the process that owns "
-                "it (`potluck serve` for a center, `potluck share run` for a "
+                "it (`potluck serve` for a server, `potluck share run` for a "
                 f"node), or correct the database_path that names {candidate}"
             )
         if candidate.stat().st_size == 0:
@@ -985,7 +985,7 @@ class _Store:
                 f"database {candidate} is empty (0 bytes): no schema was ever "
                 "written to it, so it holds no records to open — restore it from "
                 "a backup, or delete it and let the process that owns it "
-                "(`potluck serve` for a center, `potluck share run` for a node) "
+                "(`potluck serve` for a server, `potluck share run` for a node) "
                 "create a fresh one"
             )
         return cls(path)
@@ -1100,8 +1100,8 @@ class _Store:
 
 
 
-class CenterStore(_Store):
-    """The center's durable store: credentials, requests, attempts, events,
+class ServerStore(_Store):
+    """The server's durable store: credentials, requests, attempts, events,
     output commits, settlements, receipts, log leaves, nodes and the outbox.
 
     All mutating methods are safe to call from multiple threads. Read methods
@@ -1137,7 +1137,7 @@ class CenterStore(_Store):
                 read be derived from the credential rather than from a tenant
                 the operator may have invited other nodes into; ``None`` for a
                 consumer credential and for one provisioned from
-                ``center.json``, which names no device.
+                ``server.json``, which names no device.
 
         Raises:
             ConflictError: If the token digest is known with a different binding.
@@ -1209,7 +1209,7 @@ class CenterStore(_Store):
         """Return the credential a join bound to `device_id`, or `None`.
 
         A node join is the only writer of ``credentials.device_id``, so a row
-        here is the center's own record that this device and this credential
+        here is the server's own record that this device and this credential
         belong together. `GatewayService.register_node` reads it to refuse a
         *different* credential — one an operator provisioned by hand, say —
         dialing as a device an invite already bound to somebody else.
@@ -1541,7 +1541,7 @@ class CenterStore(_Store):
     def identities(self) -> list[IdentityRecord]:
         """Return every dynamic identity, ordered by key id.
 
-        `load_center` replays these rows into the registry on startup, so this
+        `load_server` replays these rows into the registry on startup, so this
         is the one place a rebuild reads dynamic trust from. Revoked rows are
         included so their history is preserved.
         """
@@ -1583,7 +1583,7 @@ class CenterStore(_Store):
         """Return True if the identity owned by `owner_id` was revoked by `at`.
 
         Dispatch consults this so a node whose device key ``admin revoke-key``
-        revoked stops being offered new work on a center that is already
+        revoked stops being offered new work on a server that is already
         running: the in-memory registry is only a projection of the store, so
         the row is re-read here, exactly as the authentication paths re-read it.
         An owner with no identity row (an operator-provisioned node that names
@@ -1600,11 +1600,11 @@ class CenterStore(_Store):
 
         The identity row an invite minted is authoritative, because it is the row
         admission already binds a payer to; a credential an operator provisioned
-        in ``center.json`` predates per-identity accounts, so for those the
+        in ``server.json`` predates per-identity accounts, so for those the
         subject's own name is the account, exactly as `Credential.account_id`
         being `None` means the same thing on the bearer path.
 
-        Returns `None` when the center holds neither row, which is what stops an
+        Returns `None` when the server holds neither row, which is what stops an
         operator from minting an API key for a subject that does not exist — a
         typo would otherwise produce a key that authenticates and then can never
         settle, and the failure would surface only when somebody tried to use it.
@@ -1789,8 +1789,8 @@ class CenterStore(_Store):
 
         Counted from the durable request rows rather than from process state, so
         a per-key concurrency ceiling means the same thing after a restart as it
-        did before one, and a request left running by an interrupted center still
-        occupies its slot until the center's own recovery ends it.
+        did before one, and a request left running by an interrupted server still
+        occupies its slot until the server's own recovery ends it.
         """
         conn = self._connection()
         placeholders = ", ".join("?" for _ in TERMINAL_REQUEST_STATES)
@@ -2031,7 +2031,7 @@ class CenterStore(_Store):
 
         Oldest-first is what makes the dispatch order first-come-first-served:
         the queue *is* this ordering over the requests waiting to be dispatched,
-        so the order a caller reads here is the order the center offers in.
+        so the order a caller reads here is the order the server offers in.
         """
         conn = self._connection()
         rows = conn.execute(
@@ -2044,7 +2044,7 @@ class CenterStore(_Store):
         """Return how many requests are in `status`.
 
         The dispatch queue's depth is this count over `ROUTING`, read at an
-        admission gate so a center with nothing to dispatch with admits no more
+        admission gate so a server with nothing to dispatch with admits no more
         work than it has agreed to hold.
         """
         conn = self._connection()
@@ -2059,7 +2059,7 @@ class CenterStore(_Store):
         """Return the request a tenant's idempotency key already names, or `None`.
 
         An admission gate reads this before it refuses on capacity: a retry of a
-        request the center already admitted must get that request back, not a
+        request the server already admitted must get that request back, not a
         refusal, or the idempotency key would stop meaning what it says exactly
         when a caller is retrying under load.
         """
@@ -2264,7 +2264,7 @@ class CenterStore(_Store):
         exists because two upstream calls consume two sets of tokens even when
         only one result is delivered, and a refusal consumed none — so counting
         refusals would let one busy node spend a request's whole budget on zero
-        work and then have the center report the request as exhausted.
+        work and then have the server report the request as exhausted.
         """
         conn = self._connection()
         row = conn.execute(
@@ -2515,7 +2515,7 @@ class CenterStore(_Store):
         database is completely unchanged — a losing branch's chunk never enters
         the consumer's event stream, and there is no crash window between
         "store the chunk" and "decide who won" in which a consumer could see
-        text the center does not know it published.
+        text the server does not know it published.
 
         Returns:
             ``(accepted, cursor)`` where `cursor` is the chunk's event cursor on
@@ -3146,14 +3146,14 @@ class CenterStore(_Store):
         return [_node_from_row(row) for row in rows]
 
     def catalogued_models(self) -> frozenset[str]:
-        """Return every model a willing node of this center advertises.
+        """Return every model a willing node of this server advertises.
 
         Connected or not, and that is the point. The catalogue is a fact about the
-        nodes this center knows, while `connected_nodes` is a fact about which of
+        nodes this server knows, while `connected_nodes` is a fact about which of
         them hold a socket open this instant — and a pool whose nodes are all
         restarting still serves the models they advertise. Telling a caller
         ``model_not_found`` in that moment would be a false statement about the
-        center, and is exactly the moment a dispatch queue exists for.
+        server, and is exactly the moment a dispatch queue exists for.
 
         A node that turned sharing off has withdrawn its model, so it is no longer
         part of the catalogue; a node that merely lost its link has not withdrawn
@@ -3241,7 +3241,7 @@ class CenterStore(_Store):
             PotluckError: If the row could not be written for any other reason.
                 A store that cannot hold a request's inputs is reported as
                 itself: naming every integrity failure a duplicate is what let an
-                upgraded center swallow the failure, admit a request, and then
+                upgraded server swallow the failure, admit a request, and then
                 leave it in ROUTING with nothing to dispatch.
         """
         conn = self._connection()
@@ -3282,7 +3282,7 @@ class CenterStore(_Store):
             ``authorization`` keys.
 
         Raises:
-            PotluckError: If the row was written by a center that stored a
+            PotluckError: If the row was written by a server that stored a
                 flattened ``prompt`` instead of a conversation. Such a request
                 can neither be re-offered nor settled — its authorization's
                 request digest no longer has an input to be re-derived from — so
@@ -3300,7 +3300,7 @@ class CenterStore(_Store):
         if row["messages_json"] is None:
             raise PotluckError(
                 f"request {request_id} stores its dispatch input as a flattened "
-                "prompt from an earlier center version, which this build cannot "
+                "prompt from an earlier server version, which this build cannot "
                 "offer or settle; resubmit the request"
             )
         stored = _load_payload(str(row["messages_json"]))

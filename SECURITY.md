@@ -29,7 +29,7 @@ there too if so; cross-repo fixes are coordinated through both advisories).
 
 ## Scope
 
-Highest priority — the trust core the center operates:
+Highest priority — the trust core the server operates:
 
 - Settlement books: ledger, receipts, and reconciliation correctness
 - Transparency log integrity and checkpoint validation

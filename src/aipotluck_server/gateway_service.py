@@ -1,6 +1,6 @@
-"""Center gateway domain logic: admission, dispatch, events, and settlement.
+"""Server gateway domain logic: admission, dispatch, events, and settlement.
 
-This module holds every decision the center makes. It touches **no socket and
+This module holds every decision the server makes. It touches **no socket and
 no HTTP object**: `register_node` receives an `enqueue` callback rather than a
 connection, and consumer reads return plain documents. `aipotluck.gateway_server`
 is the plumbing that maps HTTP and WebSocket traffic onto these calls, and it
@@ -109,11 +109,11 @@ from .errors import ApiKeyRateLimited, ApiKeyUnavailable, ModelUnavailable, Queu
 from .persistence import (
     ApiKeyRecord,
     AttemptRecord,
-    CenterStore,
     Credential,
     NodeRecord,
     ReceiptRecord,
     RequestRecord,
+    ServerStore,
     SettlementRecord,
     StoredEvent,
 )
@@ -133,24 +133,24 @@ MAX_DEADLINE_MS = 86_400_000
 DEFAULT_MAX_ATTEMPTS = 1
 DEFAULT_CONSUMER_QUEUE_SIZE = 256
 
-#: How many requests the center holds in its dispatch queue by default. A bound
+#: How many requests the server holds in its dispatch queue by default. A bound
 #: rather than a policy: a queue with no bound is a promise to hold every request
-#: that arrives until its deadline, which on a center with no nodes connected is
+#: that arrives until its deadline, which on a server with no nodes connected is
 #: a promise to accept work it cannot do and to answer all of it with a timeout.
 #: One hundred is comfortably above the per-key in-flight ceiling times any
-#: plausible number of keys a small center has issued, and comfortably below the
+#: plausible number of keys a small server has issued, and comfortably below the
 #: point where the deadline sweep's own batch bound would stop covering the
 #: queue in one pass.
 DEFAULT_MAX_QUEUE_DEPTH = 100
 
-#: How long a request that every candidate node declined waits before the center
+#: How long a request that every candidate node declined waits before the server
 #: asks them again, in seconds. Without it a waiting request would be re-offered
 #: on every tick — four times a second — and each offer is a round trip to a node
 #: that just said no. With it, a node that frees up takes the work within this
 #: window, which is short against a deadline measured in tens of seconds.
 QUEUE_REOFFER_BACKOFF_S = 2.0
 
-#: The event types the center appends to a request's own stream for the dispatch
+#: The event types the server appends to a request's own stream for the dispatch
 #: decisions it makes by itself. They ride the same ordered, replayable, never
 #: rewritten stream a node's `output.delta` and `usage.final` do, so a consumer
 #: reading ``GET /v1/requests/{id}/events`` sees the request wait and then get
@@ -160,11 +160,11 @@ DISPATCHED_EVENT_TYPE = "request.dispatched"
 
 #: How many requests one deadline sweep examines per non-terminal status.
 #: Bounded because the sweep runs both on the ticker's interval and at every
-#: admission gate, so it must not become a full-table walk on a center with a
+#: admission gate, so it must not become a full-table walk on a server with a
 #: long history; a row one pass does not reach, the next one does.
 DEADLINE_SWEEP_BATCH = 256
 
-#: How far a signed request's `issued_at` may sit from the center's clock, in
+#: How far a signed request's `issued_at` may sit from the server's clock, in
 #: seconds, in either direction. A window rather than a one-sided deadline so a
 #: client whose clock runs slightly fast is not rejected as "from the future".
 REQUEST_AUTH_WINDOW_S = 120
@@ -207,8 +207,8 @@ API_KEY_PREFIX = "ak-"
 API_KEY_BYTES = 32
 
 #: How many non-terminal requests one API key may have in flight. A ceiling
-#: rather than a policy knob: the endpoint is shared by every key the center has
-#: issued, so one key must not be able to occupy the center's whole dispatch.
+#: rather than a policy knob: the endpoint is shared by every key the server has
+#: issued, so one key must not be able to occupy the server's whole dispatch.
 API_KEY_MAX_IN_FLIGHT = 4
 
 #: How many requests one API key may admit per `API_KEY_RATE_WINDOW_S`.
@@ -222,12 +222,12 @@ API_KEY_RATE_WINDOW_S = 60.0
 #: per-request cap is always the smaller of this and the key's remaining quota.
 API_KEY_DEFAULT_MAX_CHARGE_MILLI_CREDITS = 20_000
 
-#: How much longer a center-signed authorization stays valid than the request's
+#: How much longer a server-signed authorization stays valid than the request's
 #: own deadline. Settlement happens after the answer does, and an authorization
 #: that expired in between would leave a node's tokens spent and unbillable.
 AUTHORIZATION_SETTLEMENT_GRACE = dt.timedelta(minutes=10)
 
-#: The pricing terms a center-signed authorization carries. These are the
+#: The pricing terms a server-signed authorization carries. These are the
 #: platform's published defaults — the same rate card, billing basis and
 #: evidence floor a consumer's own client signs — and a request admitted on an
 #: API key cannot ask for weaker ones, because there is no consumer signature to
@@ -252,11 +252,11 @@ def _aware(moment: dt.datetime) -> dt.datetime:
 
 
 def _dispatch_stream_id(request_id: str) -> str:
-    """Return the event-stream identity for the center's own dispatch events.
+    """Return the event-stream identity for the server's own dispatch events.
 
     The event store orders every event by a per-request cursor but deduplicates
     replays by ``(attempt_id, attempt_seq)``, and a queue transition happens
-    before any attempt exists. Rather than weaken that key, the center's own
+    before any attempt exists. Rather than weaken that key, the server's own
     dispatch events are appended under one synthetic stream identity per request.
 
     The identity is deliberately not a row in the ``attempts`` table: no resume
@@ -305,7 +305,7 @@ _LIVE_ATTEMPT_STATES = frozenset(
 
 @dataclass(frozen=True)
 class GatewayConfig:
-    """Serializable center configuration."""
+    """Serializable server configuration."""
 
     host: str
     port: int
@@ -328,11 +328,11 @@ class GatewayConfig:
     #: is what makes the second door behave like the first rather than the
     #: reverse.
     #:
-    #: Two: waiting is bounded by facts the center already keeps honest. The
+    #: Two: waiting is bounded by facts the server already keeps honest. The
     #: queue has a depth bound (`max_queue_depth`), each request still carries its
     #: own deadline, and the deadline sweep that ends an overdue request is the
     #: same sweep that has always run — so a queued request that nothing ever
-    #: took still ends `EXPIRED` with the center's own reason on its billing
+    #: took still ends `EXPIRED` with the server's own reason on its billing
     #: note, and is neither billed nor reported as served.
     #:
     #: Three: contention is the condition an operator can fix, by running another
@@ -340,13 +340,13 @@ class GatewayConfig:
     #: the caller has to notice, classify and retry, which is strictly more work
     #: for everybody and loses the requests that a short wait would have saved.
     #:
-    #: Turning it off is the right answer for a center whose operator would rather
+    #: Turning it off is the right answer for a server whose operator would rather
     #: shed load than hold it — a public one, where every waiting request is an
     #: open connection and a client's own backoff is a better place to decide than
-    #: the center's memory. With it off, a request nothing can dispatch is refused
+    #: the server's memory. With it off, a request nothing can dispatch is refused
     #: immediately and nothing waits.
     queue_enabled: bool = True
-    #: The most requests the center holds waiting for a node at once. Read at
+    #: The most requests the server holds waiting for a node at once. Read at
     #: every admission gate; a request that would exceed it is refused with
     #: `QueueFull` rather than admitted to wait past any useful deadline.
     max_queue_depth: int = DEFAULT_MAX_QUEUE_DEPTH
@@ -377,15 +377,15 @@ class JoinResult:
     subject_id: str
     role: str
     key_id: str
-    center_url: str
+    server_url: str
     #: Derived device identifiers, present only for a node join. They are echoed
-    #: back so the node can configure its connector with the ids the center
+    #: back so the node can configure its connector with the ids the server
     #: actually minted.
     device_id: str | None = None
     device_key_id: str | None = None
     provider_id: str | None = None
     #: The plaintext node-link credential, present **only** on the node join that
-    #: created the identity. The center stores its digest and cannot show it
+    #: created the identity. The server stores its digest and cannot show it
     #: again, so this one response is the only channel it ever travels on — the
     #: same "shown once" contract an ``admin invite`` code has. An idempotent
     #: re-join leaves it `None` rather than minting a second credential.
@@ -398,7 +398,7 @@ class JoinResult:
             "subject_id": self.subject_id,
             "role": self.role,
             "key_id": self.key_id,
-            "center_url": self.center_url,
+            "server_url": self.server_url,
         }
         if self.device_id is not None:
             payload["device_id"] = self.device_id
@@ -437,7 +437,7 @@ def derive_allocation_contract(
 
 
 class GatewayService:
-    """Center-side domain logic over durable state.
+    """Server-side domain logic over durable state.
 
     Deliberately not a dataclass: construction replays durable state into
     in-memory objects, which is behaviour worth owning in one place.
@@ -447,7 +447,7 @@ class GatewayService:
         self,
         *,
         config: GatewayConfig,
-        store: CenterStore,
+        store: ServerStore,
         registry: IdentityRegistry,
         ledger: Ledger | None = None,
         now: dt.datetime | None = None,
@@ -455,7 +455,7 @@ class GatewayService:
         """Build a service over durable state.
 
         Args:
-            config: Center configuration.
+            config: Server configuration.
             store: The durable authority for everything but live connections.
             registry: Trusted keys. The settlement key must already be
                 registered under the platform settlement role.
@@ -642,7 +642,7 @@ class GatewayService:
     # -- properties ---------------------------------------------------------
 
     @property
-    def store(self) -> CenterStore:
+    def store(self) -> ServerStore:
         """The durable store."""
         return self._store
 
@@ -702,7 +702,7 @@ class GatewayService:
         invite_code: str,
         identity: dict[str, Any],
         device: dict[str, Any] | None,
-        center_url: str,
+        server_url: str,
         now: dt.datetime | None = None,
     ) -> JoinResult:
         """Redeem an invite and mint a server-derived identity for the joiner.
@@ -728,12 +728,12 @@ class GatewayService:
         A node join likewise mints the node's own link credential and registers
         it in the credential table, so the invited node can dial ``/v1/node-link``
         without an operator hand-writing a ``credentials[]`` entry and
-        restarting the center. The plaintext is returned once, in this response,
+        restarting the server. The plaintext is returned once, in this response,
         and only its digest is stored — an operator who lost it cannot read it
         back, and the recovery path is ``admin revoke-key`` plus a fresh invite.
 
         Idempotency is keyed on the public key, not on the invite's remaining
-        uses: a re-join presenting a key this center already minted returns the
+        uses: a re-join presenting a key this server already minted returns the
         existing identity and does **not** consume another use, re-fund the
         account, or mint a second node credential. This holds even after a
         single-use code is spent — the identity, not the code, stays
@@ -747,13 +747,13 @@ class GatewayService:
             device: For a node invite, a mapping with ``public_key_b64`` (the
                 device's key); `None` for consumer invites. Any ids it carries
                 are ignored.
-            center_url: The center's public URL, echoed back to the joiner.
+            server_url: The server's public URL, echoed back to the joiner.
             now: The join instant; defaults to the wall clock.
 
         Returns:
             The minted (or pre-existing) identity. `node_token` is set only on
             the node join that created it; a re-join carries no token, because
-            the center kept the digest and cannot reproduce the plaintext.
+            the server kept the digest and cannot reproduce the plaintext.
 
         Raises:
             ProtocolError: If the invite is unusable, the identity names no
@@ -778,7 +778,7 @@ class GatewayService:
                 raise ProtocolError(f"the invite names an unknown role {role!r}")
             self._check_join_shape(role=role, device=device)
             purpose = cast("KeyPurpose", _PURPOSE_BY_ROLE[role])
-            # A re-join of an identity this center already minted is decided
+            # A re-join of an identity this server already minted is decided
             # before the invite's remaining uses are consulted, and is keyed on
             # the public key because the derived key id is fresh on every join.
             # The invite gates *creating* an identity; once created, the
@@ -792,7 +792,7 @@ class GatewayService:
                     subject_id=existing.owner_id,
                     role=existing.role,
                     key_id=existing.key_id,
-                    center_url=center_url,
+                    server_url=server_url,
                 )
             if not invite.is_redeemable_at(moment):
                 raise ProtocolError("the invite code is not valid or is not usable")
@@ -874,10 +874,10 @@ class GatewayService:
                     # join derived, and stored as a digest only, exactly as the
                     # operator-provisioned `credentials[]` path stores one.
                     # Without it the invited node could authenticate nowhere and
-                    # the operator would be back to hand-editing center.json.
+                    # the operator would be back to hand-editing server.json.
                     #
                     # The device this join derived rides along in the row: this
-                    # is the only moment the center knows the credential and the
+                    # is the only moment the server knows the credential and the
                     # device belong together, since the two identity rows share
                     # nothing but a tenant, and a tenant is shared by every
                     # member an operator invited into it. A node-scoped read
@@ -904,7 +904,7 @@ class GatewayService:
                 subject_id=subject_id,
                 role=role,
                 key_id=key_id,
-                center_url=center_url,
+                server_url=server_url,
                 device_id=device_row["device_id"] if device_row else None,
                 device_key_id=device_row["device_key_id"] if device_row else None,
                 provider_id=device_row["provider_id"] if device_row else None,
@@ -998,7 +998,7 @@ class GatewayService:
             issued_at: The instant the header claimed.
             nonce: The single-use value from the header.
             signature_b64: The base64 signature from the header.
-            now: The center's clock; defaults to the wall clock.
+            now: The server's clock; defaults to the wall clock.
 
         Returns:
             The credential the signature authenticates, carrying the account the
@@ -1027,20 +1027,20 @@ class GatewayService:
         skew = abs((_aware(moment) - _aware(issued_at)).total_seconds())
         if skew > REQUEST_AUTH_WINDOW_S:
             raise ProtocolError(
-                f"the request timestamp is {skew:.0f}s from the center clock, "
+                f"the request timestamp is {skew:.0f}s from the server clock, "
                 f"outside the {REQUEST_AUTH_WINDOW_S}s window"
             )
         self._claim_nonce(key_id, nonce)
         identity = self._store.get_identity(key_id)
         if identity is None or identity.owner_id != key.owner_id:
             raise IdentityBindingError(
-                f"key {key_id} has no registered identity this center trusts"
+                f"key {key_id} has no registered identity this server trusts"
             )
         # The store row, not only the in-memory registry, governs revocation:
         # `potluck admin revoke-key` writes to the store, so reading the row's
-        # `revoked_at` here is what makes a revocation bite a running center
+        # `revoked_at` here is what makes a revocation bite a running server
         # without a restart. The registry check above still covers a key revoked
-        # in memory (as a rebuilt center does when it replays a revoked row).
+        # in memory (as a rebuilt server does when it replays a revoked row).
         if identity.revoked_at is not None and _aware(moment) >= _aware(identity.revoked_at):
             raise KeyRevokedError(f"key {key_id} is not valid at {moment.isoformat()}")
         return Credential(
@@ -1128,8 +1128,8 @@ class GatewayService:
                 outside the signed allowlist, if the attempt budget and deadline
                 are not positive, or if `session_id` is not an identifier the
                 wire accepts.
-            QueueFull: If the center's dispatch queue is at its bound and this
-                idempotency key names no request the center already admitted.
+            QueueFull: If the server's dispatch queue is at its bound and this
+                idempotency key names no request the server already admitted.
             ConflictError: On a reused idempotency key with different content.
         """
         moment = now or self._moment()
@@ -1170,8 +1170,8 @@ class GatewayService:
                 "comes from the credential, never the body"
             )
         # The payer must be the account this credential is *bound* to, which the
-        # center itself recorded at join time — not any account the body names.
-        # A credential provisioned from `center.json` predates per-identity
+        # server itself recorded at join time — not any account the body names.
+        # A credential provisioned from `server.json` predates per-identity
         # accounts and carries no `account_id`, so for those the historical
         # `subject_id` equality governs and no existing deployment changes
         # meaning.
@@ -1266,7 +1266,7 @@ class GatewayService:
         The second admission path, and the difference is exactly one thing: who
         authorized the spend. A signed request carries the consumer's own
         signature over the work and the ceiling; here the caller proved it holds
-        a key the center issued, and the center signs the terms it is admitting
+        a key the server issued, and the server signs the terms it is admitting
         with its own settlement key, labelled ``gateway_authenticated`` so
         settlement and every later audit read it as the platform's
         authorization and never as a consumer signature. Nothing else about the
@@ -1302,22 +1302,22 @@ class GatewayService:
                 OpenAI-compatible surface it arrives as the `wire.SESSION_HEADER`
                 header, which an OpenAI SDK client can send through
                 ``default_headers`` without any other change.
-            now: The center's clock; defaults to the wall clock.
+            now: The server's clock; defaults to the wall clock.
 
         Returns:
             The admission result, as for a signed request.
 
         Raises:
             ApiKeyUnavailable: If the key is no longer usable, or speaks for a
-                subject this center holds no consumer for.
+                subject this server holds no consumer for.
             ApiKeyRateLimited: If the key is at its concurrency ceiling or its
                 request rate.
             InsufficientFundsError: If the key has spent its quota.
-            ModelUnavailable: If no connected node runs `model` at all. A center
+            ModelUnavailable: If no connected node runs `model` at all. A server
                 that runs it but has nothing free this instant does not refuse
                 here: the request is admitted and waits in the dispatch queue,
                 unless the queue is at its bound.
-            QueueFull: If the center's dispatch queue is at its bound.
+            QueueFull: If the server's dispatch queue is at its bound.
             ProtocolError: If the conversation is empty, the ceiling is not
                 positive, or `session_id` is not an identifier the wire accepts.
         """
@@ -1333,7 +1333,7 @@ class GatewayService:
         forwarded = dict(parameters or {})
         # Authenticating the key is the transport's resolution, exactly as on the
         # bearer path: the plaintext never reaches this module, and the record it
-        # hands over is the center's own answer from a moment ago. What is
+        # hands over is the server's own answer from a moment ago. What is
         # re-checked here is what this call owns — that the key is still inside
         # its window, and that its quota, its rate and its subject still permit
         # the spend.
@@ -1352,11 +1352,11 @@ class GatewayService:
         if binding is None:
             raise ApiKeyUnavailable(
                 f"API key {key.key_id} speaks for {key.subject_id!r}, which this "
-                "center holds no consumer identity or credential for"
+                "server holds no consumer identity or credential for"
             )
-        # A model this center has no node for is refused here rather than queued,
+        # A model this server has no node for is refused here rather than queued,
         # and the two refusals it could make are different facts. "No node of this
-        # center runs that model" is a statement about the request: waiting cannot
+        # server runs that model" is a statement about the request: waiting cannot
         # make it true, so holding the request would only turn a typo into a
         # timeout that names nothing. "Nothing can take it right now" is a
         # statement about load, which ends, and that one `_admit_and_offer` decides
@@ -1365,12 +1365,12 @@ class GatewayService:
         # The catalogue is read across every willing node rather than only the
         # connected ones, because a pool whose nodes are all mid-restart still
         # serves the models they advertise: answering `model_not_found` then would
-        # be a false statement about the center, and would refuse the requests a
+        # be a false statement about the server, and would refuse the requests a
         # queue exists to hold.
         catalogue = sorted(self._store.catalogued_models())
         if model not in catalogue:
             raise ModelUnavailable(
-                f"no contribution node of this center runs model {model!r}; the "
+                f"no contribution node of this server runs model {model!r}; the "
                 f"models it has nodes for are {catalogue}"
             )
         # The key's own deadline wins over the surface default, because it is the
@@ -1440,7 +1440,7 @@ class GatewayService:
 
         The concurrency count is read from the durable request rows, so it means
         the same thing after a restart as before one and a request an interrupted
-        center left running still occupies its slot. The rate window is this
+        server left running still occupies its slot. The rate window is this
         process's own memory: a rate limit is a load-shedding decision about the
         requests arriving now, not a fact about the books, and a restart clearing
         it costs one window.
@@ -1481,9 +1481,9 @@ class GatewayService:
         deadline_ms: int,
         moment: dt.datetime,
     ) -> SignedRecord:
-        """Sign the authorization for a request the center admitted itself.
+        """Sign the authorization for a request the server admitted itself.
 
-        The center holds no consumer key — a joiner keeps its own — so the
+        The server holds no consumer key — a joiner keeps its own — so the
         platform's settlement key signs the terms being admitted and the record
         says so through ``auth_method``. Settlement verifies that signature under
         the platform purpose, and the receipt keeps the label: this is real
@@ -1501,7 +1501,7 @@ class GatewayService:
 
         Raises:
             SignatureError: If the platform's own key cannot sign an
-                authorization this center can settle.
+                authorization this server can settle.
         """
         payer_account_id = credential.account_id or credential.subject_id
         self._registry.check_spend_authority(
@@ -1579,15 +1579,15 @@ class GatewayService:
 
         The API key is bound to the request row before the offer goes out, inside
         the same lock: settlement reads that binding to count the charge against
-        the key's quota, and a center interrupted between dispatch and settlement
+        the key's quota, and a server interrupted between dispatch and settlement
         must still find it. The queue bound is read under that same lock, so two
         concurrent admissions cannot each see room for one request.
 
         Raises:
-            ModelUnavailable: If nothing can dispatch this request and the center
+            ModelUnavailable: If nothing can dispatch this request and the server
                 is configured not to hold it.
             QueueFull: If nothing can dispatch it and the queue is at its bound.
-            ConflictError: If the idempotency key names a request the center
+            ConflictError: If the idempotency key names a request the server
                 already admitted under a *different* request id. The replay is
                 only idempotent when it replays the same request; a fresh
                 signature over the same work is a second request wearing the
@@ -1622,7 +1622,7 @@ class GatewayService:
                 raise ConflictError(
                     f"idempotency key {idempotency_key} already admitted request "
                     f"{stored.request_id}, which is not {request_id}; one key replays "
-                    "one request, so either resubmit with the request id the center "
+                    "one request, so either resubmit with the request id the server "
                     "returned or mint a fresh idempotency key for new work"
                 )
             if created:
@@ -1700,24 +1700,24 @@ class GatewayService:
         """Decide whether a request nothing can dispatch yet may wait for one.
 
         Called only when `_pick_node` found nothing, so the question is not
-        whether this request can run now — it cannot — but whether the center
+        whether this request can run now — it cannot — but whether the server
         holds it or refuses it. Both answers are honest; which one an operator
         wants is `GatewayConfig.queue_enabled`.
 
-        A retry of a request the center already admitted is let through even at
+        A retry of a request the server already admitted is let through even at
         the bound, because the idempotency key's whole promise is that a retry is
         a no-op: refusing it would make the key stop meaning what it says exactly
         when a caller is retrying under load, and the request it would refuse is
-        one the center is already holding.
+        one the server is already holding.
 
         Raises:
-            ModelUnavailable: If the center is configured not to hold work.
+            ModelUnavailable: If the server is configured not to hold work.
             QueueFull: If it is, and is already holding as much as it agreed to.
         """
         if not self._config.queue_enabled:
             raise ModelUnavailable(
                 f"no connected contribution node can run model {model!r} right now, "
-                "and this center is configured not to hold a request that nothing "
+                "and this server is configured not to hold a request that nothing "
                 "can dispatch (queue_enabled is false); retry, or run a node that "
                 "serves it"
             )
@@ -1727,7 +1727,7 @@ class GatewayService:
             )
             if replay is None:
                 raise QueueFull(
-                    f"this center is already holding {self._queue_depth()} request(s) "
+                    f"this server is already holding {self._queue_depth()} request(s) "
                     f"waiting for a contribution node, at its queue bound of "
                     f"{max(0, self._config.max_queue_depth)}; nothing can run model "
                     f"{model!r} right now, so retry later or ask the operator to run "
@@ -1737,7 +1737,7 @@ class GatewayService:
     def _queue_depth(self) -> int:
         """How many requests are waiting for a node.
 
-        The queue *is* this count: a request in `ROUTING` is one the center has
+        The queue *is* this count: a request in `ROUTING` is one the server has
         admitted and has not yet placed with a node, so there is no separate queue
         structure to disagree with the request rows, and nothing to rebuild after a
         restart.
@@ -1745,7 +1745,7 @@ class GatewayService:
         return self._store.count_requests_by_status("ROUTING")
 
     def _queue_is_full(self) -> bool:
-        """Whether the center is holding as many waiting requests as it agreed to.
+        """Whether the server is holding as many waiting requests as it agreed to.
 
         Callers hold the service lock, so the depth read and the decision made from
         it see one consistent moment: two admissions cannot each find room for one
@@ -1760,7 +1760,7 @@ class GatewayService:
         payload: dict[str, Any],
         moment: dt.datetime,
     ) -> None:
-        """Append one of the center's own dispatch events to a request's stream.
+        """Append one of the server's own dispatch events to a request's stream.
 
         The stream is the same ordered, replayable, never-rewritten one a node's
         `output.delta` and `usage.final` ride, so a queue transition is as
@@ -1811,7 +1811,7 @@ class GatewayService:
 
         The status is EXPIRED, the answer `tick` has always given for a passed
         deadline, so one condition keeps one meaning: the OpenAI surface reports
-        it as a 504 carrying the center's own reason rather than as a 502.
+        it as a 504 carrying the server's own reason rather than as a 502.
 
         Returns:
             `(node_id, cancel)` pairs for the attempts those requests still held,
@@ -1851,7 +1851,7 @@ class GatewayService:
         of `tick` it becomes everybody's: the round aborts, so nothing else is
         offered, nothing else expires, and the ticker — which swallows the
         failure and retries — repeats that forever. That is how a single
-        undispatchable row once stopped every overdue request on the center from
+        undispatchable row once stopped every overdue request on the server from
         ever being ended.
         """
         try:
@@ -1973,9 +1973,9 @@ class GatewayService:
         cannot derive on its own: recomputing the split needs the weights the
         platform actually settled under, and the receipt only carries their
         digest. Weights are not a secret — the beneficiary accounts are already
-        in the receipt's postings — so publishing them turns "trust the center's
-        arithmetic" into "check the center's arithmetic". It is ``None`` when the
-        winning attempt row is gone, which is itself a finding the center-side
+        in the receipt's postings — so publishing them turns "trust the server's
+        arithmetic" into "check the server's arithmetic". It is ``None`` when the
+        winning attempt row is gone, which is itself a finding the server-side
         reconciliation reports rather than something to paper over here.
 
         Scope: the receipt's *tenant*, not its payer. Every consumer credential in
@@ -1991,7 +1991,7 @@ class GatewayService:
         """
         stored = self._store.get_receipt(receipt_id)
         if stored is None:
-            raise GatewayError(f"receipt {receipt_id} was never issued by this center")
+            raise GatewayError(f"receipt {receipt_id} was never issued by this server")
         request = self._store.get_request(stored.request_id)
         if request is None or request.tenant_id != credential.tenant_id:
             raise IdentityBindingError(
@@ -2014,7 +2014,7 @@ class GatewayService:
 
         The contract is re-derived from the winner attempt's persisted provider
         and epoch — the same two fields settlement derived it from — so what is
-        published is the contract the center would compute again, not a copy
+        published is the contract the server would compute again, not a copy
         somebody could edit.
 
         Returns:
@@ -2042,9 +2042,9 @@ class GatewayService:
         does not exist. `public_key_b64` is the public half of the settlement key
         that signs the checkpoint, published so a consumer can authenticate the
         root it is being handed instead of trusting it. A public key is not a
-        secret; the private half never leaves ``center.json``. It is still the
-        center's own claim about itself, so a consumer who wants a root the
-        center cannot rewrite pins this key out of band and compares.
+        secret; the private half never leaves ``server.json``. It is still the
+        server's own claim about itself, so a consumer who wants a root the
+        server cannot rewrite pins this key out of band and compares.
         """
         del credential
         moment = now or self._moment()
@@ -2072,13 +2072,13 @@ class GatewayService:
         endpoint cannot be pointed at anybody else's books. It exists because
         `account_history_complete` is the one verification dimension a consumer
         cannot assess from a receipt alone — the receipt proves what one charge
-        says, not that the center showed every charge.
+        says, not that the server showed every charge.
 
         `entry_count` is reported next to `entries` rather than left to be
         inferred from the list's length, so a verifier can tell a history that
         arrived whole from one that was truncated or reordered in transit. Both
         come from the same ledger, which bounds what this proves: it catches a
-        lost or duplicated entry, not a center that rewrote the books and the
+        lost or duplicated entry, not a server that rewrote the books and the
         count together. Only the transparency log anchors that, and it is why
         `ledger_included` is a separate dimension.
 
@@ -2139,10 +2139,10 @@ class GatewayService:
         return mapping
 
     def node_attempts(self, *, credential: Credential) -> dict[str, Any]:
-        """Return the attempts the center dispatched to this credential's node.
+        """Return the attempts the server dispatched to this credential's node.
 
-        This is the center half of the contributor's reconciliation: the node
-        holds what it signed and executed locally, and this is what the center
+        This is the server half of the contributor's reconciliation: the node
+        holds what it signed and executed locally, and this is what the server
         claims about the same attempts. The node ids come from `_node_ids_for`,
         which derives them from the credential the transport authenticated;
         there is no node id in the path or the query, so a request cannot name
@@ -2184,7 +2184,7 @@ class GatewayService:
         * a credential a *join* minted carries the device that join derived, and
           the connector dials as that device (``node.json``'s ``node_id`` is the
           ``device_id`` the wizard wrote), so the device id is the node id;
-        * a credential an *operator* provisioned in ``center.json`` names no
+        * a credential an *operator* provisioned in ``server.json`` names no
           device; that path writes ``node.json`` by hand, and its documented
           sample dials with the credential's own subject as its ``node_id``.
         """
@@ -2203,7 +2203,7 @@ class GatewayService:
         every member would read every other member's dispatch history with their
         own valid token. A node that dials under a node id of its own choosing,
         matching neither binding, gets an empty answer, which `share reconcile`
-        reports as ``center_does_not_know_this_node`` naming both ids.
+        reports as ``server_does_not_know_this_node`` naming both ids.
         """
         return frozenset({self._bound_node_id(credential)})
 
@@ -2212,7 +2212,7 @@ class GatewayService:
 
         The transport authenticated the *credential*; every id in the hello is a
         claim the peer typed. Binding the two is what makes a node link
-        attributable, and it must run before the center writes anything — a node
+        attributable, and it must run before the server writes anything — a node
         record, an enqueue slot, a `hello.ack` — or a refused claim would
         already have displaced the node it named. Node ids key both the
         live-connection table and routing, so an unbound claim is also a way to
@@ -2226,7 +2226,7 @@ class GatewayService:
           that device. An operator-provisioned credential carries none, and its
           ``node_id`` binding is the constraint that replaces it: a missing
           device binding is not a licence to claim any device;
-        * either way, a device the center already bound to a credential may only
+        * either way, a device the server already bound to a credential may only
           be dialed by that credential, which is what closes the same
           impersonation from the provisioning path that has no device column.
 
@@ -2260,11 +2260,11 @@ class GatewayService:
     def _node_attempt_view(self, attempt: AttemptRecord) -> dict[str, Any]:
         """Render one attempt for its own node, plus the receipt it settled into.
 
-        The receipt is looked up only for an attempt the center marked settled:
+        The receipt is looked up only for an attempt the server marked settled:
         a settlement row is keyed by the request, and attaching it to a losing or
         failed attempt of the same request would tell the node it was paid for
-        work the center never billed. The lookup takes the highest stored
-        revision, the same rule `reconcile_center` reads a settlement by, so a
+        work the server never billed. The lookup takes the highest stored
+        revision, the same rule `reconcile_server` reads a settlement by, so a
         correction is what the contributor is shown rather than the revision it
         superseded.
         """
@@ -2328,7 +2328,7 @@ class GatewayService:
         except PotluckError as exc:
             raise GatewayError(
                 f"device key {hello.device_key_id!r} is not registered; a node must "
-                "hold a key the center provisioned"
+                "hold a key the server provisioned"
             ) from exc
         if key.purpose != "provider_device":
             raise IdentityBindingError(
@@ -2355,11 +2355,11 @@ class GatewayService:
                     request_id=attempt.request_id,
                     attempt_id=attempt.attempt_id,
                     epoch=attempt.dispatch_epoch,
-                    # The center's own execution_state only records what it has
+                    # The server's own execution_state only records what it has
                     # SEEN. A node that died before its first event arrived is
                     # NULL here while its attempt was already accepted, so the
                     # safe instruction is always "replay and report": the node
-                    # knows whether it executed, and the center does not.
+                    # knows whether it executed, and the server does not.
                     action=(
                         "abandon" if attempt.status == "OFFERED" else "resend_spool"
                     ),
@@ -2393,7 +2393,7 @@ class GatewayService:
 
         Anything addressed to *another* node is delivered through that node's own
         enqueue callback, after this method has released its lock, so a slow peer
-        cannot stall the center.
+        cannot stall the server.
 
         Raises:
             GatewayError: If the node is not registered.
@@ -2424,10 +2424,10 @@ class GatewayService:
                 self._on_heartbeat(node_id, envelope, moment)
                 replies = []
             elif envelope.type == "event.ack":
-                raise ProtocolError("event.ack travels from the center to a node only")
+                raise ProtocolError("event.ack travels from the server to a node only")
             else:
                 raise ProtocolError(
-                    f"{envelope.type} is not a message a node sends to the center"
+                    f"{envelope.type} is not a message a node sends to the server"
                 )
         self._deliver(deliveries)
         return replies
@@ -2443,7 +2443,7 @@ class GatewayService:
         requests oldest-first, so the order they are offered in is the order they
         arrived in. That ordering is first-come-first-served on a best-effort
         basis and is not a promise about position — a request's own deadline, not
-        its place in line, is what bounds its wait, and the center reports a wait
+        its place in line, is what bounds its wait, and the server reports a wait
         it could not end as EXPIRED rather than pretending the queue guarantees
         anything.
 
@@ -2512,7 +2512,7 @@ class GatewayService:
 
         Args:
             record: The request to dispatch.
-            moment: The center's clock.
+            moment: The server's clock.
             leaving_queue: Whether this request was waiting for a node when the
                 offer went out. It decides whether the offer is recorded on the
                 request's event stream as a queue exit: a request dispatched
@@ -2536,7 +2536,7 @@ class GatewayService:
         attempts = self._store.attempts_for_request(record.request_id)
         # The budget counts executions, not offers. An offer a node refused
         # consumed no tokens, so it occupies no slot; see
-        # `CenterStore.count_budget_attempts`.
+        # `ServerStore.count_budget_attempts`.
         if self._store.count_budget_attempts(record.request_id) >= record.max_attempts:
             if record.status not in ("FAILED", "CANCELLED", "EXPIRED", "SUCCEEDED"):
                 self._store.set_request_status(
@@ -2549,11 +2549,11 @@ class GatewayService:
         try:
             inputs = self._store.get_request_input(record.request_id)
         except PotluckError as exc:
-            # A row an earlier center version stored as a flattened prompt: it has
+            # A row an earlier server version stored as a flattened prompt: it has
             # no conversation to offer and no digest to settle against, and it
             # never will. Ending it here rather than raising is what keeps one
             # such row from being offered again on every tick for as long as the
-            # center runs.
+            # server runs.
             self._terminate_undispatchable(record.request_id, "FAILED", str(exc), moment)
             return []
         if inputs is None:
@@ -2699,7 +2699,7 @@ class GatewayService:
 
         A node whose device key ``admin revoke-key`` revoked is skipped too, so
         an already-connected session that has since been revoked is offered no
-        new work: the revocation bites dispatch on the running center through a
+        new work: the revocation bites dispatch on the running server through a
         store re-read, not only the next reconnect. Skipping (rather than
         tearing the socket down here) keeps this on the dispatch decision alone;
         the revoked node's own next message or reconnect is refused elsewhere.
@@ -2725,7 +2725,7 @@ class GatewayService:
         """Resolve an attempt reference, refusing a peer that does not own it.
 
         Raises:
-            ProtocolError: If the attempt is unknown to the center's store, is
+            ProtocolError: If the attempt is unknown to the server's store, is
                 assigned to another node, names another request, or the epoch is
                 stale — each of which means the peer is speaking about work that
                 is not its own.
@@ -2809,11 +2809,11 @@ class GatewayService:
         it occupies no slot in a budget that exists to bound executions.
 
         When nothing else can take the work the request goes back into the
-        dispatch queue instead of being ended, provided the center holds a queue
+        dispatch queue instead of being ended, provided the server holds a queue
         at all. That is the difference between a pool that is momentarily full and
         a request that can never run: the first ends when a node frees up, which
         `tick` discovers by asking the nodes that declined again, and the second
-        is what `ModelUnavailable` at admission is for. A center configured not to
+        is what `ModelUnavailable` at admission is for. A server configured not to
         hold work keeps the old answer and fails the request here.
         """
         decision = AttemptDecision.from_payload(envelope.payload, accepted=False)
@@ -2842,7 +2842,7 @@ class GatewayService:
         # declines, so this is the door most queued requests actually come through.
         # A caller cannot be refused any more — it was told the request was
         # admitted — so a full queue ends the request with the reason on its books
-        # instead of holding it past what the center agreed to hold.
+        # instead of holding it past what the server agreed to hold.
         if not self._config.queue_enabled or self._queue_is_full():
             self._store.set_request_status(
                 record.request_id,
@@ -2880,7 +2880,7 @@ class GatewayService:
 
         The revoked-key check runs **before** the replay short-circuit below.
         A usage report is journalled before it is verified, so a report the
-        center refused once would otherwise still be on file: a resent copy —
+        server refused once would otherwise still be on file: a resent copy —
         or the same copy after a restart — would satisfy ``event.seq <=
         acked`` and be silently acknowledged, handing a revoked device a
         receipt it never earned. Checking first makes refusal the single
@@ -2916,7 +2916,7 @@ class GatewayService:
             return [_ack_envelope(attempt.attempt_id, acked)]
         # A superseded branch may not publish output. It is told to stop in the
         # same reply that acknowledges its event, so it can wind down without
-        # the center re-reading the same stale delta forever. Its usage still
+        # the server re-reading the same stale delta forever. Its usage still
         # counts — real tokens were spent — it just is not the billed branch.
         superseded = not attempt.output_eligible
         if superseded and event.event_type == "output.delta":
@@ -3118,7 +3118,7 @@ class GatewayService:
         Before anything is recorded or settled, the reporting device key is
         checked against the **store**, not only the in-memory registry.
         `admin revoke-key` writes the store, so a device revoked while the
-        center runs would otherwise keep reporting and settling until a
+        server runs would otherwise keep reporting and settling until a
         restart; reading the row here is what makes the revocation bite on the
         reporting path exactly as it already does on the request-signature path.
 
@@ -3157,7 +3157,7 @@ class GatewayService:
             authorization_hash=offer.authorization_hash,
         )
         if str(report.payload.get("permit_hash", "")) != expected:
-            raise ProtocolError("the report's permit hash is not the one the center issued")
+            raise ProtocolError("the report's permit hash is not the one the server issued")
         decision = self._accepted.get(attempt.attempt_id)
         claimed = str(report.payload.get("acceptance_hash", ""))
         if decision is None or decision.acceptance_hash != claimed:
@@ -3329,7 +3329,7 @@ class GatewayService:
         belongs to must still reach a named result: leaving it live would either
         hang it until its deadline or let `tick` re-offer the work to a second
         node that spends again on a request the first node may already have run.
-        Usage is marked *unknown*, never zero — the center cannot know whether
+        Usage is marked *unknown*, never zero — the server cannot know whether
         the revoked device called upstream — and the request goes to FAILED with
         a billing note, so it surfaces for hand reconciliation instead of
         silently billing nothing.
@@ -3359,10 +3359,10 @@ class GatewayService:
     # -- timers -------------------------------------------------------------
 
     def _stuck_attempts(self, moment: dt.datetime) -> list[AttemptRecord]:
-        """Return accepted attempts the center has heard nothing about.
+        """Return accepted attempts the server has heard nothing about.
 
         A node that accepted work and then went quiet may have executed or may
-        have died; only the node knows, so the center asks instead of guessing.
+        have died; only the node knows, so the server asks instead of guessing.
         Without this probe the unknown-usage reconciliation has no online path.
         """
         quiet_for = dt.timedelta(seconds=self._config.offer_accept_timeout_s)
@@ -3429,7 +3429,7 @@ class GatewayService:
         otherwise rest on the registry copy therefore re-reads the row here,
         with the same inclusive-at-the-instant semantics as
         `authenticate_signed_request`. A key with no store row (a key
-        provisioned from ``center.json``) has nothing to test and is allowed, so
+        provisioned from ``server.json``) has nothing to test and is allowed, so
         this never changes a pre-existing deployment's meaning.
 
         Raises:

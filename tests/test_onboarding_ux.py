@@ -11,10 +11,10 @@ What these tests pin, and why each is here rather than in an adapter test:
   purpose and then asserts all three.
 * Buffered mode must say it is waiting and then print once. It must not be
   dressed up as streaming.
-* Ctrl-C must be a real end-to-end cancel: the center marks the request and the
+* Ctrl-C must be a real end-to-end cancel: the server marks the request and the
   node's in-flight attempt is stopped.
 * "No node" must be bounded and explained, not an open-ended wait.
-* A request the center ended in a failure state must carry the center's own
+* A request the server ended in a failure state must carry the server's own
   reason to the screen: ``billing_note`` verbatim, because "did not finish"
   alone is what made a default-config mismatch look like an unexplained outage.
 * With no ``--model``, the model is read off the online nodes (majority, ties
@@ -53,7 +53,7 @@ from conftest import Keyring
 
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, NodeRecord
+from aipotluck_server.persistence import NodeRecord, ServerStore
 
 BASE = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
 REGISTERED_AT = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
@@ -119,7 +119,7 @@ class _Node:
         self,
         tmp_path: Path,
         keyring: Keyring,
-        center_port: int,
+        server_port: int,
         *,
         upstream: FakeUpstream,
         name: str = "node-A",
@@ -146,7 +146,7 @@ class _Node:
         # conftest keyring binds `device-key-A` to `device-A` and it verifies the
         # claimed device, so a mismatch is refused at hello time.
         self.config = ConnectorConfig(
-            center_url=f"ws://127.0.0.1:{center_port}/v1/node-link",
+            server_url=f"ws://127.0.0.1:{server_port}/v1/node-link",
             node_id=name,
             device_id="device-A",
             device_key_id="device-key-A",
@@ -175,7 +175,7 @@ class _Node:
         self.store.close()
 
 
-class _Center:
+class _Server:
     """A real gateway over a real store, with an invite ready to redeem."""
 
     def __init__(
@@ -188,11 +188,11 @@ class _Center:
     ) -> None:
         self.tmp_path = tmp_path
         self.keyring = keyring
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
@@ -224,7 +224,7 @@ class _Center:
         assert main(
             [
                 "join",
-                "--center",
+                "--server",
                 self.server.url,
                 "--invite",
                 INVITE,
@@ -255,31 +255,31 @@ def _streaming_upstream(chunks: tuple[str, ...], *, delay: float = 0.0) -> FakeU
 
 @pytest.fixture
 def harness(tmp_path: Path) -> Any:
-    """Provide a center, a node and a joined consumer, torn down afterwards."""
+    """Provide a server, a node and a joined consumer, torn down afterwards."""
     keyring = Keyring()
-    center = _Center(tmp_path, keyring)
+    server = _Server(tmp_path, keyring)
     nodes: list[_Node] = []
-    yield center, keyring, nodes, tmp_path
+    yield server, keyring, nodes, tmp_path
     for node in nodes:
         node.stop()
-    center.stop()
+    server.stop()
 
 
 @pytest.fixture
 def shedding_harness(tmp_path: Path) -> Any:
-    """The same center configured to shed load instead of holding it.
+    """The same server configured to shed load instead of holding it.
 
     ``queue_enabled=false`` is the operator's other choice, and a test about what
     a *refusal* looks like has to be able to ask for one: with the shipped default
     a request nothing can dispatch waits out its deadline instead.
     """
     keyring = Keyring()
-    center = _Center(tmp_path, keyring, queue_enabled=False)
+    server = _Server(tmp_path, keyring, queue_enabled=False)
     nodes: list[_Node] = []
-    yield center, keyring, nodes, tmp_path
+    yield server, keyring, nodes, tmp_path
     for node in nodes:
         node.stop()
-    center.stop()
+    server.stop()
 
 
 def _start_node(
@@ -290,22 +290,22 @@ def _start_node(
     local_reserved: int | None = None,
 ) -> _Node:
     """Start a node in the fixture's centre and wait for it to register."""
-    center, keyring, nodes, tmp_path = harness
+    server, keyring, nodes, tmp_path = harness
     node = _Node(
         tmp_path,
         keyring,
-        center.port,
+        server.port,
         upstream=upstream,
         adapter=adapter,
         local_reserved=local_reserved,
     )
     nodes.append(node)
-    _wait_until(lambda: bool(center.store.connected_nodes()), what="the node to register")
+    _wait_until(lambda: bool(server.store.connected_nodes()), what="the node to register")
     return node
 
 
 def _advertise_node(
-    center: Any, *, node_id: str, model: str, share_enabled: bool = True
+    server: Any, *, node_id: str, model: str, share_enabled: bool = True
 ) -> None:
     """Publish a connected node record, the way a `node.hello` would have.
 
@@ -313,7 +313,7 @@ def _advertise_node(
     choose between and no real work to run: dialling three live connectors to
     prove a client-side counting rule would test the connector, not the rule.
     """
-    center.store.upsert_node(
+    server.store.upsert_node(
         NodeRecord(
             node_id=node_id,
             device_id=f"device-{node_id}",
@@ -336,7 +336,7 @@ def _record_submissions(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]
     The submit boundary is the only race-free place to read what ``ask``
     requested. ``pending.json`` is not: the CLI deletes it as soon as the request
     reaches a terminal state, and a request nobody online can run is failed by
-    the center before ``ask`` returns — so on a fast machine the file is gone by
+    the server before ``ask`` returns — so on a fast machine the file is gone by
     the time the test looks at it.
     """
     bodies: list[dict[str, Any]] = []
@@ -397,10 +397,10 @@ def test_ask_stream_shows_the_first_increment_before_the_model_finishes(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The point of streaming: text appears while the model is still writing."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     node = _start_node(harness, _streaming_upstream(("alpha ", "beta ", "gamma"), delay=0.4))
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     out = _Recorder()
     err = _Recorder()
@@ -435,12 +435,12 @@ def test_ask_buffered_says_it_is_waiting_and_prints_the_answer_once(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Buffered mode must be visibly buffered, not a fake stream."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     upstream = _streaming_upstream(("alpha ", "beta ", "gamma"))
     adapter = _SlowBufferedAdapter(upstream=upstream, model=MODEL, delay_s=1.5)
     _start_node(harness, upstream, adapter=adapter)
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     out = _Recorder()
     err = _Recorder()
@@ -479,10 +479,10 @@ def test_ask_stream_json_prints_one_machine_readable_document(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`--stream --json` still yields exactly one document a program can read."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     _start_node(harness, _streaming_upstream(("alpha ", "beta ", "gamma")))
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     out = _Recorder()
     monkeypatch.setattr("sys.stdout", out)
@@ -550,10 +550,10 @@ def test_ask_stream_reconnect_by_cursor_neither_repeats_nor_double_charges(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A dropped stream resumes from the cursor: one request, one charge."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     node = _start_node(harness, _streaming_upstream(("one ", "two ", "three"), delay=0.2))
     identity = tmp_path / "identity"
-    subject = center.join_consumer(identity)
+    subject = server.join_consumer(identity)
 
     real_open = SignedClient.open_event_stream
     calls = {"n": 0}
@@ -584,17 +584,17 @@ def test_ask_stream_reconnect_by_cursor_neither_repeats_nor_double_charges(
     # One upstream call and one charge: the reconnect re-read the event store,
     # it did not re-run the request.
     assert node.adapter.upstream_calls == 1
-    assert center.service.balance(subject) == 100_000 - 1_000
+    assert server.service.balance(subject) == 100_000 - 1_000
 
 
 def test_ask_stream_cancel_is_a_real_end_to_end_cancellation(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Ctrl-C must stop the node's in-flight attempt, not just the client."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     node = _start_node(harness, _streaming_upstream(("a", "b", "c", "d", "e", "f"), delay=0.5))
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     posted: dict[str, str] = {}
     real_post = SignedClient.post
@@ -623,7 +623,7 @@ def test_ask_stream_cancel_is_a_real_end_to_end_cancellation(
     assert code == 130, (out.text(), err.text())
     assert "cancelled" in err.text() or "cancelled" in out.text()
     request_id = posted["request_id"]
-    record = center.store.get_request(request_id)
+    record = server.store.get_request(request_id)
     assert record is not None and record.status == "CANCELLED"
     # The cancellation stopped the upstream loop: the scripted answer had six
     # blocks and the node made exactly one call, with no retry.
@@ -648,9 +648,9 @@ def test_no_node_wait_is_bounded_and_explains_itself(
     model nobody serves must end on the short no-node grace rather than sitting
     in ROUTING until ``--timeout``.
     """
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     err = _Recorder()
     monkeypatch.setattr("sys.stderr", err)
@@ -698,12 +698,12 @@ def test_ask_reports_a_revoked_credential_with_a_next_step(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A revoked key must produce the credentials remedy, not a bare 403."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     _start_node(harness, _streaming_upstream(("alpha ", "beta")))
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
     key_id = str(json.loads((identity / "config.json").read_text())["key_id"])
-    center.store.revoke_identity(key_id, dt.datetime.now(dt.UTC))
+    server.store.revoke_identity(key_id, dt.datetime.now(dt.UTC))
 
     err = _Recorder()
     monkeypatch.setattr("sys.stderr", err)
@@ -714,29 +714,29 @@ def test_ask_reports_a_revoked_credential_with_a_next_step(
     assert "join" in err.text()
 
 
-def test_ask_surfaces_the_centers_billing_note_when_a_request_fails(
+def test_ask_surfaces_the_servers_billing_note_when_a_request_fails(
     shedding_harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A FAILED request must carry the center's own reason, not just "did not finish".
+    """A FAILED request must carry the server's own reason, not just "did not finish".
 
     This is the P0-2 report: a default consumer charge against a node whose
     local exposure ceiling was lower died in milliseconds with the cause already
     written to ``requests.billing_note``, while the CLI printed only the status
-    phrase and the user was left guessing. The note is the center's wording, so
+    phrase and the user was left guessing. The note is the server's wording, so
     it is printed verbatim — a client that paraphrased a reason it did not
     produce would be a second source of truth about why a request failed.
 
-    Run against a center that sheds load rather than queues it, because that is
+    Run against a server that sheds load rather than queues it, because that is
     the configuration in which a decline ends a request: with the shipped default
     the same request waits for a node that will free up, and what it ends as is a
     deadline rather than a refusal.
     """
-    center, _keyring, _nodes, tmp_path = shedding_harness
+    server, _keyring, _nodes, tmp_path = shedding_harness
     # A ceiling of zero refuses every offer, which is the cheapest way to reach
     # a terminal FAILED with a real note attached.
     _start_node(shedding_harness, _streaming_upstream(("never used",)), local_reserved=0)
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     out = _Recorder()
     err = _Recorder()
@@ -748,40 +748,40 @@ def test_ask_surfaces_the_centers_billing_note_when_a_request_fails(
 
     assert code == 1
     assert ux.describe_request("FAILED") in out.text()
-    assert "center note" in err.text()
+    assert "server note" in err.text()
     # The note `ask` printed came off the HTTP status document it fetched, so
     # matching it against the stored row proves both that the endpoint carries
     # the field and that the CLI did not rewrite it.
-    failed = center.store.requests_by_status("FAILED")
+    failed = server.store.requests_by_status("FAILED")
     assert len(failed) == 1
     note = failed[0].billing_note
     assert note is not None
     assert "no node left to take the work" in note
     assert "local budget would be exceeded" in note
-    assert note in err.text(), "ask must print the center's note verbatim"
+    assert note in err.text(), "ask must print the server's note verbatim"
 
 
-def test_ask_prints_the_centers_reason_when_a_wait_ends_on_a_queued_request(
+def test_ask_prints_the_servers_reason_when_a_wait_ends_on_a_queued_request(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A wait that ends unfinished still says why the center could not place it.
+    """A wait that ends unfinished still says why the server could not place it.
 
     The same P0-2 defect in its queued shape. With the shipped default a request
     every node declined is *held* rather than ended, so the status `ask` reads back
     is not a failure state at all — it is a request still waiting, whose reason sits
-    on the center's own note. Printing that note only for FAILED and EXPIRED would
+    on the server's own note. Printing that note only for FAILED and EXPIRED would
     swallow exactly the explanation a wait ends without, and leave the user with
     "did not finish" and nothing to act on.
 
-    The status read is scripted rather than raced: the center's own deadline and
+    The status read is scripted rather than raced: the server's own deadline and
     the client's wait window are the same number of seconds, so which of the two
     fires first is a timing question, and the rule under test is not about timing —
     it is that a request which did not succeed gets its note printed.
     """
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     _start_node(harness, _streaming_upstream(("never used",)), local_reserved=0)
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     note = "waiting for a node: node-A declined: local budget would be exceeded"
     queued = {"request_id": "req-queued", "status": "ROUTING", "billing_note": note}
@@ -814,25 +814,25 @@ def test_ask_prints_the_centers_reason_when_a_wait_ends_on_a_queued_request(
     )
 
     assert code == 1
-    assert f"center note: {note}" in err.text()
+    assert f"server note: {note}" in err.text()
     assert ux.describe_request("FAILED") not in out.text(), (
-        "a request the center is still holding must not be reported as failed"
+        "a request the server is still holding must not be reported as failed"
     )
 
 
-def test_ask_prints_the_centers_reason_for_a_request_it_cancelled(
+def test_ask_prints_the_servers_reason_for_a_request_it_cancelled(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cancellation carries a note too, and the note is the center's wording.
+    """A cancellation carries a note too, and the note is the server's wording.
 
     The rule is "did not succeed", not "is in one of two terminal states": a
     request the user stopped has a reason recorded against it exactly as a failed
     one does, and withholding it leaves the user reading a status phrase where the
-    center had already written a sentence.
+    server had already written a sentence.
     """
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     note = "cancelled by consumer_cancel"
     real_get = SignedClient.get
@@ -865,7 +865,7 @@ def test_ask_prints_the_centers_reason_for_a_request_it_cancelled(
     )
 
     assert code == 1
-    assert f"center note: {note}" in err.text()
+    assert f"server note: {note}" in err.text()
 
 
 def test_ask_without_a_model_requests_what_the_majority_of_nodes_serve(
@@ -874,17 +874,17 @@ def test_ask_without_a_model_requests_what_the_majority_of_nodes_serve(
     """With no ``--model``, the model comes from the nodes, not from a constant.
 
     The old default was this suite's own test pool name: a real consumer cannot
-    know it, and a hardcoded guess is a request the center cannot route. The
+    know it, and a hardcoded guess is a request the server cannot route. The
     majority rule is what "the platform's model" means once contributors serve
     different ones, and a paused node must not vote for a model nobody can run.
     """
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
-    _advertise_node(center, node_id="node-1", model="zebra-7b")
-    _advertise_node(center, node_id="node-2", model="zebra-7b")
-    _advertise_node(center, node_id="node-3", model="alpha-70b")
-    _advertise_node(center, node_id="node-paused", model="paused-only", share_enabled=False)
+    server.join_consumer(identity)
+    _advertise_node(server, node_id="node-1", model="zebra-7b")
+    _advertise_node(server, node_id="node-2", model="zebra-7b")
+    _advertise_node(server, node_id="node-3", model="alpha-70b")
+    _advertise_node(server, node_id="node-paused", model="paused-only", share_enabled=False)
 
     submitted = _record_submissions(monkeypatch)
     err = _Recorder()
@@ -905,12 +905,12 @@ def test_ask_without_a_model_breaks_a_tie_alphabetically(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An even split must not depend on the order a listing happened to arrive."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
     # Advertised so that the listing order and the alphabetical order disagree.
-    _advertise_node(center, node_id="node-1", model="zebra-7b")
-    _advertise_node(center, node_id="node-2", model="alpha-70b")
+    _advertise_node(server, node_id="node-1", model="zebra-7b")
+    _advertise_node(server, node_id="node-2", model="alpha-70b")
 
     submitted = _record_submissions(monkeypatch)
     monkeypatch.setattr("sys.stderr", _Recorder())
@@ -931,9 +931,9 @@ def test_ask_without_a_model_and_no_online_node_creates_no_request(
     routed, spending a nonce and an idempotency key on it, and then cancelling
     it — and the consumer would watch a bounded wait instead of reading a remedy.
     """
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     out = _Recorder()
     err = _Recorder()
@@ -952,8 +952,8 @@ def test_ask_without_a_model_and_no_online_node_creates_no_request(
     assert "--model" in err.text(), "the remedy must name the explicit override"
     assert "no request was created" in err.text()
     assert not (identity / "pending.json").exists()
-    assert center.store.requests_by_status("CREATED") == []
-    assert center.store.requests_by_status("ROUTING") == []
+    assert server.store.requests_by_status("CREATED") == []
+    assert server.store.requests_by_status("ROUTING") == []
     assert out.text() == "", "a refused ask must not produce an answer document"
 
 
@@ -978,13 +978,13 @@ def test_unknown_usage_never_becomes_a_zero_cost(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A cancelled request whose usage is unknown says it is to be confirmed, never 0."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     # A 1s-per-chunk stream leaves a wide mid-flight window, so the Ctrl-C at
     # 0.6s deterministically lands before the answer is complete — the point
     # being that the usage is then unknown, and must never read as zero.
     _start_node(harness, _streaming_upstream(("only ", "part"), delay=1.0))
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
 
     def _interrupt() -> None:
         time.sleep(0.6)
@@ -1036,7 +1036,7 @@ def _write_doctor_node_config(directory: Path) -> tuple[Path, dict[str, str]]:
 
     _device_public, device_private = generate_key_pair()
     document = {
-        "center_url": "ws://127.0.0.1:1/v1/node-link",
+        "server_url": "ws://127.0.0.1:1/v1/node-link",
         "node_id": "node-doctor",
         "device_id": "device-doctor",
         "device_key_id": "device-key-doctor",
@@ -1070,9 +1070,9 @@ def test_doctor_report_is_redacted_and_complete(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The report names what matters and never a credential."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
     identity_key = json.loads((identity / "key.json").read_text())["private_key_b64"]
     _write_doctor_node_config(identity)
 
@@ -1083,7 +1083,7 @@ def test_doctor_report_is_redacted_and_complete(
     text = out.text()
     # The useful picture is present.
     assert (
-        "version" in text and "identity" in text and "center" in text and "node" in text
+        "version" in text and "identity" in text and "server" in text and "node" in text
     )
     assert "credential valid" in text
     assert "unfinished local requests" in text
@@ -1100,9 +1100,9 @@ def test_doctor_json_is_machine_readable_and_redacted(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`doctor --json` is one canonical document with the same guarantees."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
     identity_key = json.loads((identity / "key.json").read_text())["private_key_b64"]
     _write_doctor_node_config(identity)
 
@@ -1115,8 +1115,8 @@ def test_doctor_json_is_machine_readable_and_redacted(
         assert secret not in text
     document = json.loads(text)
     assert document["identity"]["present"] is True
-    assert document["center"]["reachable"] is True
-    assert document["center"]["credential_valid"] is True
+    assert document["server"]["reachable"] is True
+    assert document["server"]["credential_valid"] is True
     node = document["node"]
     assert node is not None and node["valid"] is True
     # The redacted node summary reports shape, never the credential itself.
@@ -1131,11 +1131,11 @@ def test_doctor_reports_a_revoked_credential_with_the_remedy(
     harness: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A revoked key makes the report say so and how to recover."""
-    center, _keyring, _nodes, tmp_path = harness
+    server, _keyring, _nodes, tmp_path = harness
     identity = tmp_path / "identity"
-    center.join_consumer(identity)
+    server.join_consumer(identity)
     key_id = str(json.loads((identity / "config.json").read_text())["key_id"])
-    center.store.revoke_identity(key_id, dt.datetime.now(dt.UTC))
+    server.store.revoke_identity(key_id, dt.datetime.now(dt.UTC))
 
     out = _Recorder()
     monkeypatch.setattr("sys.stdout", out)

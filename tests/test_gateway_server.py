@@ -1,4 +1,4 @@
-"""Transport tests for the center gateway, over real loopback TCP.
+"""Transport tests for the server gateway, over real loopback TCP.
 
 Everything here drives a real `GatewayServer` on ``127.0.0.1`` with real
 `http.client`, `ssl` and `websocket.ClientConnection` peers. The socket layer is
@@ -88,7 +88,7 @@ class _StubJoinResult:
     subject_id: str
     role: str
     key_id: str
-    center_url: str
+    server_url: str
 
     def to_payload(self) -> dict[str, str]:
         """Return the response document ``POST /v1/join`` answers with."""
@@ -97,7 +97,7 @@ class _StubJoinResult:
             "subject_id": self.subject_id,
             "role": self.role,
             "key_id": self.key_id,
-            "center_url": self.center_url,
+            "server_url": self.server_url,
         }
 
 
@@ -135,7 +135,7 @@ class _StubService:
         self.api_key_admissions: list[dict[str, Any]] = []
         self.cancel_origins: list[str] = []
         self.receipts: dict[str, dict[str, Any]] = {}
-        #: What `node_attempts` answers with, so a test can stage the center's
+        #: What `node_attempts` answers with, so a test can stage the server's
         #: claim without a domain service behind it.
         self.node_attempts_served: list[dict[str, Any]] = []
         self.registered: list[NodeHello] = []
@@ -293,7 +293,7 @@ class _StubService:
         }
 
     def node_attempts(self, *, credential: Credential) -> dict[str, Any]:
-        """Return the attempts the center dispatched to the calling node."""
+        """Return the attempts the server dispatched to the calling node."""
         return {
             "node_ids": [credential.subject_id],
             "attempts": self.node_attempts_served,
@@ -350,7 +350,7 @@ class _StubService:
         invite_code: str,
         identity: dict[str, Any],
         device: dict[str, Any] | None,
-        center_url: str,
+        server_url: str,
         now: dt.datetime | None = None,
     ) -> Any:
         """Record a join and return a minimal result the transport can render."""
@@ -360,7 +360,7 @@ class _StubService:
                 "invite_code": invite_code,
                 "identity": identity,
                 "device": device,
-                "center_url": center_url,
+                "server_url": server_url,
             }
         )
         return _StubJoinResult(
@@ -368,7 +368,7 @@ class _StubService:
             subject_id=str(identity.get("subject_id", "")),
             role="consumer",
             key_id=str(identity.get("key_id", "")),
-            center_url=center_url,
+            server_url=server_url,
         )
 
     def authenticate_signed_request(
@@ -1016,11 +1016,11 @@ def test_a_node_reads_only_its_own_attempts_when_two_share_a_tenant(
 
     from aipotluck_server.gateway_service import GatewayConfig as DomainGatewayConfig
     from aipotluck_server.gateway_service import GatewayService
-    from aipotluck_server.persistence import CenterStore
+    from aipotluck_server.persistence import ServerStore
 
     keyring = Keyring()
-    database = tmp_path / "center.db"
-    store = CenterStore.open(database)
+    database = tmp_path / "server.db"
+    store = ServerStore.open(database)
     service = GatewayService(
         config=DomainGatewayConfig(
             host="127.0.0.1",
@@ -1050,7 +1050,7 @@ def test_a_node_reads_only_its_own_attempts_when_two_share_a_tenant(
                 invite_code=f"code-node-{name}",
                 identity={"public_key_b64": node_public},
                 device={"public_key_b64": device_public},
-                center_url="http://center.test",
+                server_url="http://server.test",
                 now=NOW,
             )
             assert joined.tenant_id == "friends", "both nodes must share one tenant"
@@ -1315,7 +1315,7 @@ def test_a_kept_alive_connection_survives_a_refusal_it_did_not_read(
     * per-request state on a per-connection handler — "this request has been
       answered" above all — silences the answer the *next* request is owed.
 
-    Either one turns a `401` the center meant into a transport failure the caller
+    Either one turns a `401` the server meant into a transport failure the caller
     sees, so the fourth request here is the assertion: it is answered, on the
     same socket, after a refusal that read nothing.
     """

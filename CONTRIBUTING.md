@@ -1,6 +1,6 @@
 # Contributing to ai-potluck-server
 
-Thanks for helping make shared AI access provable. This repo is the center:
+Thanks for helping make shared AI access provable. This repo is the server:
 the HTTP/WebSocket/SSE gateway, the settlement books, and the operator CLI
 `potluck-server`. The client and protocol/verification core live in
 [ai-potluck](https://github.com/retiringsoon/ai-potluck), which this package
@@ -40,7 +40,7 @@ python -m pytest tests/ -q --basetemp=.pytest_bt
 `--basetemp` is **required** for local runs: the sandboxed environments many
 contributors use cannot write to the system temp directory. CI omits it
 because runner temp space is writable. The suite includes cross-package
-integration tests that drive real client CLIs and a real center.
+integration tests that drive real client CLIs and a real server.
 
 ### Lint and types
 
@@ -84,7 +84,7 @@ releasable.
   fix and passes after.
 - **All green.** ruff, mypy (strict), and the full pytest suite pass in CI
   before review.
-- **Docs in the same PR.** If the change affects `center.json`, operator
+- **Docs in the same PR.** If the change affects `server.json`, operator
   commands, or the network contract, update `README.md` (and the client
   repo's `docs/` when the contract moves) in the same pull request.
 - Keep PRs small and coherent; split unrelated refactors from behavior changes.
@@ -96,6 +96,6 @@ releasable.
 - [SECURITY.md](SECURITY.md) — how to report a vulnerability privately.
 - Client repo docs:
   [network contract](https://github.com/retiringsoon/ai-potluck/blob/dev/docs/network-contract-v0.1.md),
-  [center deployment](https://github.com/retiringsoon/ai-potluck/blob/dev/docs/center-deployment.md).
+  [server deployment](https://github.com/retiringsoon/ai-potluck/blob/dev/docs/server-deployment.md).
 - Questions or ideas before opening an issue:
   [Discussions](https://github.com/retiringsoon/ai-potluck-server/discussions).
