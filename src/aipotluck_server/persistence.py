@@ -375,6 +375,14 @@ class InviteRecord:
     #: ``join`` then ``ask`` path has something to spend without an operator
     #: funding each account by hand.
     quota_milli_credits: int = 20_000
+    #: Whether redeeming this invite also mints an API key for the
+    #: OpenAI-compatible surface, bound to the identity the join derived and
+    #: capped by `quota_milli_credits`. A flag on the invite and nothing more:
+    #: until somebody redeems the code there is no key, no subject and no
+    #: spending authority behind it, so a leaked code is still only a way to
+    #: join. Only a ``consumer`` invite may carry it, because a key speaks for
+    #: a consumer account and a node has none.
+    issues_api_key: bool = False
 
     @property
     def remaining_uses(self) -> int:
@@ -699,7 +707,8 @@ CREATE TABLE IF NOT EXISTS invites (
     used_count INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     revoked_at TEXT,
-    quota_milli_credits INTEGER NOT NULL DEFAULT 20000
+    quota_milli_credits INTEGER NOT NULL DEFAULT 20000,
+    issues_api_key INTEGER NOT NULL DEFAULT 0
 );
 
 -- Dynamic identities minted by an invite. This is the source of truth that a
@@ -797,6 +806,11 @@ CREATE INDEX IF NOT EXISTS idx_requests_status_created ON requests(status, creat
 _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "invites": (
         ("quota_milli_credits", "INTEGER NOT NULL DEFAULT 20000"),
+        # Whether redeeming the invite mints an API key for the joiner. Zero for
+        # every invite an earlier server minted, which is the behaviour those
+        # invites were promised: a join on one mints an identity and funds it,
+        # and issues no credential for the OpenAI-compatible surface.
+        ("issues_api_key", "INTEGER NOT NULL DEFAULT 0"),
     ),
     "identities": (
         ("account_id", "TEXT"),
@@ -1284,6 +1298,7 @@ class ServerStore(_Store):
         created_at: dt.datetime,
         expires_at: dt.datetime | None = None,
         quota_milli_credits: int = 20_000,
+        issues_api_key: bool = False,
     ) -> InviteRecord:
         """Register an invite by the digest of its plaintext code.
 
@@ -1302,25 +1317,45 @@ class ServerStore(_Store):
             expires_at: Optional expiry; `None` never expires.
             quota_milli_credits: Milli-credits minted into the identity's own
                 account exactly once, at its first join.
+            issues_api_key: Whether the join that redeems this invite also mints
+                an API key for the identity it derived, capped by
+                `quota_milli_credits`. Only a ``consumer`` invite may carry it.
 
         Returns:
             The stored invite.
 
         Raises:
-            ValueError: If `max_uses` is not positive.
+            ValueError: If `max_uses` is not positive, if the quota is negative,
+                if a key-issuing invite names no quota to cap the key with, or
+                if a non-consumer invite asks to issue one.
         """
         if max_uses < 1:
             raise ValueError("max_uses must be >= 1")
         if quota_milli_credits < 0:
             raise ValueError("quota_milli_credits must be >= 0")
+        if issues_api_key:
+            # Both refusals are the same rule the operator CLI enforces when it
+            # mints a key by hand: a key that speaks for no consumer, or for one
+            # with nothing to spend, authenticates happily and then can never
+            # settle. Refusing it here keeps an invite from promising one.
+            if role != "consumer":
+                raise ValueError(
+                    f"only a consumer invite can issue an API key, got role {role!r}:"
+                    " a key spends a consumer account, and a node has none"
+                )
+            if quota_milli_credits < 1:
+                raise ValueError(
+                    "an invite that issues an API key needs quota_milli_credits >= 1:"
+                    " a key with no quota admits nothing"
+                )
         digest = canonical_digest(code)
         conn = self._connection()
         with self._immediate(conn):
             conn.execute(
                 "INSERT OR IGNORE INTO invites (code_digest, role, tenant_scope,"
                 " expires_at, max_uses, used_count, created_at, revoked_at,"
-                " quota_milli_credits)"
-                " VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?)",
+                " quota_milli_credits, issues_api_key)"
+                " VALUES (?, ?, ?, ?, ?, 0, ?, NULL, ?, ?)",
                 (
                     digest,
                     role,
@@ -1329,6 +1364,7 @@ class ServerStore(_Store):
                     max_uses,
                     _to_text(created_at),
                     quota_milli_credits,
+                    int(issues_api_key),
                 ),
             )
             row = conn.execute(
@@ -3451,6 +3487,7 @@ def _invite_from_row(row: Any) -> InviteRecord:
         created_at=_from_text(str(row["created_at"])),
         revoked_at=_opt_instant(row["revoked_at"]),
         quota_milli_credits=int(row["quota_milli_credits"]),
+        issues_api_key=bool(int(row["issues_api_key"])),
     )
 
 

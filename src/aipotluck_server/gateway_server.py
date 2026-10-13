@@ -27,6 +27,14 @@ Trust boundaries
   the code is usable. Only the joiner's public key is read from the body: the
   identity itself (subject, key id, tenant, device and provider ids) is derived
   by the server, so a body cannot name the identity it becomes.
+
+  It is also the one endpoint that answers *with* a credential rather than
+  refusing to echo one: a node join carries the plaintext link token back, and a
+  consumer join on an invite flagged ``--with-api-key`` carries the plaintext API
+  key back. Both are minted by that very request, exist in no store row as
+  plaintext, and travel once inside the TLS session the join arrived on — the
+  "shown once" contract an invite code itself has. Neither is logged, and
+  neither is reproduced by a re-join.
 * **The body is untrusted.** Every body is parsed with
   `canonical.loads_strict`, so floats, duplicate keys and ``NaN`` are refused at
   the boundary with a ``400`` rather than reaching domain code. Bodies are
@@ -1985,6 +1993,14 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         Only ``identity.public_key_b64`` is read. Any ``subject_id``/``key_id``
         the body carries is deliberately **not** forwarded: the server derives
         the identity, so a body cannot name the identity it becomes.
+
+        The response is the one place a credential this server minted is sent
+        back over the wire: `node_token` for a node join, `api_key` for a
+        consumer join whose invite was flagged ``issues_api_key``. Both are
+        produced by this request, both are stored as a digest only, and both are
+        absent from an idempotent re-join — so the plaintext exists exactly once,
+        on the connection that asked for it, and is not logged here or anywhere
+        else in this module.
         """
         body = self._json_object()
         if body is None:

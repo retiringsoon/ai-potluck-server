@@ -12,7 +12,8 @@ signed request.
 
 ```
 base_url:  https://<server-host>:<port>/openai/v1
-api_key:   ak-...            # minted by the operator, see below
+api_key:   ak-...            # minted by the operator, or issued by an invite at
+                             # join — see below
 ```
 
 ## Minting a key
@@ -51,6 +52,68 @@ potluck-server admin api-key-revoke --config server.json --key-id apikey-9f2c1a
 * Revocation takes effect on a running server immediately: every request on this
   surface re-reads the key's row. Revoking the *identity* behind a key
   (`admin revoke-key`) withdraws its keys too.
+
+An invite can carry this instruction instead of an operator running it after the
+fact — see [A key an invite issues](#a-key-an-invite-issues).
+
+## A key an invite issues
+
+The round trip above is optional. `--with-api-key` puts the instruction on the
+invite, and the join that redeems it hands the joiner a key:
+
+```bash
+potluck-server admin invite --config server.json --role consumer \
+    --tenant friends --quota 500000 --with-api-key
+# <invite code>                              <- printed once, to stdout
+
+potluck-server admin invite-list --config server.json
+# 3f0c1a2b…c9d4 role=consumer tenant=friends api-key=yes uses=0/1 expires=… active
+```
+
+The person given that code needs no second command, and no operator to run one:
+
+```bash
+potluck join --server https://<server> --invite <code>
+# potluck: joined as consumer-1a2b3c (role consumer, tenant friends, key consumer-1a2b3c); …
+# ak-<43 url-safe characters>                <- printed once, on its own line
+# potluck: this invite also issued an API key for the OpenAI-compatible endpoint …
+#   base_url: https://<server>/openai/v1
+#   shown once; store it now — the server stored only its digest, so a lost key is
+#   replaced by the operator, never recovered
+```
+
+What the flag does, and what it deliberately does not do:
+
+* **The key is minted at the join, not with the invite.** An invite nobody has
+  redeemed has no key, no subject and no quota behind it, so a code that leaks
+  before it is used is still only a way to join — and there is nothing to revoke
+  until somebody joins. An unredeemed invite can spend nothing.
+* **The key's quota is the invite's quota.** `--quota` funds the joiner's account
+  once *and* caps the key they are handed, so one number is the whole budget for
+  that member's tool. `--with-api-key` with `--quota 0` is refused at the
+  command: a key with no quota admits nothing.
+* **Only `--role consumer` may carry it.** A key spends a consumer account and a
+  node has none, so `--role node --with-api-key` is refused rather than minted an
+  invite that could only fail in front of whoever redeemed it.
+* **The key stays its own credential.** It appears in `admin api-key-list` named
+  `issued at join`, and `admin api-key-revoke` withdraws that one key: the
+  identity keeps signing requests and its account keeps its balance.
+  `admin revoke-key` on the identity withdraws the identity and every key it
+  holds, exactly as before.
+* **It carries no expiry and no per-request deadline of its own**, so it lives as
+  long as the identity, stays revocable either way, and each request on it gets
+  this endpoint's default window. A member who needs a longer window for
+  agent-sized turns gets a key minted by hand with `--deadline-ms` — a separate
+  key, with a separate quota, which the first one can then be revoked against.
+* **A re-join shows no key.** `potluck join` is idempotent on the identity and
+  the server kept only a digest, so a second run cannot reproduce the first
+  one's plaintext and does not mint a second key. A lost key is replaced
+  (`admin api-key --subject <subject>`), not recovered.
+* **Nothing else about the request changes.** A key issued at join is admitted
+  exactly like one an operator minted by hand — `gateway_authenticated`, the
+  same dispatch, the same books, the same receipts. Arriving beside an identity
+  does not make it a consumer signature; see
+  [what the key authorizes](#billing-receipts-and-what-the-key-authorizes).
 
 ## Using it
 
