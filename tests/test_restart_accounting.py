@@ -32,10 +32,12 @@ Each requirement is pinned by its own test:
   no final usage — survives as durable rows and is handled after the restart by
   asking the node what happened and recording the outcome as **unknown**, never
   as a settled success and never as zero usage.
-* **G01·f** the permit/acceptance context is **in-memory only** and is pinned as
-  such: after a restart the offer terms and the node's acceptance are gone, so a
-  late acceptance or a late usage report is *refused* rather than trusted. This
-  is a documented limitation, not a passing grade.
+* **G01·f** the permit terms and the node's acceptance are now **durable**, so a
+  late acceptance or a late usage report that arrives after a restart is verified
+  against the stored rows and *settled*, never silently free. The in-memory offer
+  is gone, but the permit hash is recomputed from the stored dispatch inputs and
+  the acceptance hash is read back from the attempt row. This is a passing grade,
+  not a documented limitation.
 
 What this file canNOT prove
 ---------------------------
@@ -44,8 +46,8 @@ What this file canNOT prove
 * It does not prove anything about a real process restart: the store is closed
   and reopened in one process, so only the *durable* boundary is exercised, not
   socket teardown, worker threads, or the OS.
-* It does not make permit/acceptance durable. The tests assert the honest
-  post-restart refusal; they do not claim a late report can be completed.
+* It does not prove the server is crash-safe *during* a settlement write — that
+  is G02's territory (`tests/test_settlement_interruption.py`).
 * It relies on `load_server` as the rebuild entry point, so it pins that path
   (config provisioning + identity replay + ledger replay) and not a bespoke one.
 """
@@ -805,34 +807,19 @@ def test_an_in_flight_request_survives_and_is_reconciled_as_unknown(
         assert document["output"]["committed"] is True
         assert document["settlement"] is None
 
-        # G01·f: the offer terms and the node's acceptance are gone. A late
-        # acceptance is refused rather than trusted against terms the rebuilt
-        # server can no longer recompute.
-        with pytest.raises(GatewayError, match="no permit context"):
-            rebuilt.handle_node_message(
-                node_id="node-A", envelope=_accept(offer, acceptance), now=BASE
-            )
-        # A late usage report is refused for the same reason, and leaves no
-        # fabricated usage behind.
-        with pytest.raises(GatewayError, match="no permit context"):
-            rebuilt.handle_node_message(
-                node_id="node-A",
-                envelope=_usage_event(
-                    server.keyring,
-                    request_id="req-2",
-                    attempt_id=offer.attempt_id,
-                    epoch=offer.epoch,
-                    permit_hash="unused-with-no-permit-context",
-                    acceptance_hash=acceptance,
-                ),
-                now=BASE,
-            )
-        refused = deployment.store.get_attempt(offer.attempt_id)
-        assert refused is not None
-        assert refused.usage_status != "COMPLETE"
-        assert refused.usage_tokens is None, "a refused report must not write zero usage"
-        assert deployment.store.get_settlement("req-2", 1) is None
-        assert deployment.store.log_size() == 1
+        # G01·f: the offer terms and the node's acceptance are now durable, so a
+        # late acceptance after the restart is re-verified and re-accepted rather
+        # than refused against terms the rebuilt server can no longer recompute in
+        # memory. The node's acceptance commitment was persisted at accept time.
+        replies = rebuilt.handle_node_message(
+            node_id="node-A", envelope=_accept(offer, acceptance), now=BASE
+        )
+        assert [reply.type for reply in replies] == ["attempt.execute"]
+        reread = deployment.store.get_attempt(offer.attempt_id)
+        assert reread is not None
+        assert reread.acceptance_hash == acceptance, (
+            "the acceptance commitment must survive the restart on the row"
+        )
 
         # Reconcile on the live path: the node reconnects, the server probes the
         # silent attempt, and the node answers "unknown".
@@ -878,6 +865,103 @@ def test_an_in_flight_request_survives_and_is_reconciled_as_unknown(
             )["status"]
             == "FAILED"
         )
+    finally:
+        deployment.store.close()
+
+
+def test_a_late_usage_report_after_a_restart_settles_and_is_not_free(
+    server: Server,
+) -> None:
+    """A final usage that arrives only after a restart still settles the attempt.
+
+    G01·f, positive branch: the permit terms and the node's acceptance
+    commitment both survive on the durable rows, so `_ingest_usage` re-derives
+    the permit hash and reads the acceptance hash back instead of trusting an
+    in-memory offer the restart destroyed. The request is billed and the
+    provider is paid exactly as if the usage had arrived before the stop — never
+    silently free, never silently zero.
+    """
+    server.connect()
+    joined = server.join("code-late")
+    credential = server.authenticate(server.service, joined.key_id)
+    # Settle req-1 first so the log, the provider account and a receipt all
+    # exist before the restart, mirroring the in-flight test.
+    server.settle(
+        server.service,
+        credential,
+        request_id="req-1",
+        messages=(user_message("first answer"),),
+    )
+
+    # Admit req-2 and stop after the output commit: no usage.final ever arrives
+    # before the restart.
+    offer = server.admit(
+        server.service,
+        credential,
+        request_id="req-2",
+        messages=(user_message("in flight"),),
+    )
+    acceptance = server.acceptance_hash(offer)
+    server.accept(server.service, offer, acceptance)
+    server.service.handle_node_message(
+        node_id="node-A", envelope=_delta(offer, 1, "partial"), now=BASE
+    )
+
+    deployment = server.rebuild()
+    try:
+        rebuilt = deployment.service
+        rebuilt_credential = rebuilt.authenticate_signed_request(
+            **_auth_kwargs(server.joined_private, joined.key_id), now=BASE
+        )
+
+        provider_before = rebuilt.balance("provider-A/pending")
+        consumer_before = rebuilt.balance(credential.subject_id)
+
+        # The late usage carries the correct permit hash and acceptance hash,
+        # which the rebuilt server recovers from the stored rows.
+        replies = rebuilt.handle_node_message(
+            node_id="node-A",
+            envelope=_usage_event(
+                server.keyring,
+                request_id=offer.request_id,
+                attempt_id=offer.attempt_id,
+                epoch=offer.epoch,
+                permit_hash=offer.permit_hash,
+                acceptance_hash=acceptance,
+            ),
+            now=BASE,
+        )
+        assert [reply.type for reply in replies] == ["event.ack"]
+
+        document = rebuilt.request_status(
+            credential=rebuilt_credential, request_id="req-2"
+        )
+        assert document["status"] == "SUCCEEDED"
+        assert document["settlement"] is not None
+        assert document["settlement"]["log_index"] == 1
+
+        stored = deployment.store.get_attempt(offer.attempt_id)
+        assert stored is not None
+        assert stored.usage_status == "COMPLETE"
+        assert stored.usage_tokens == 1000, (
+            "the late usage must be recorded, never folded to zero or left free"
+        )
+        assert stored.status == "COMPLETED"
+        assert stored.settlement_status == "SETTLED"
+
+        # The books moved by exactly the reported total: the provider earned the
+        # tokens and the consumer was charged them.
+        settlement = deployment.store.get_settlement("req-2", 1)
+        assert settlement is not None
+        assert rebuilt.balance("provider-A/pending") == provider_before + 1000
+        assert rebuilt.balance(credential.subject_id) == consumer_before - 1000
+
+        # A receipt was issued and is readable with a verifiable hash.
+        receipt = rebuilt.receipt_for(
+            credential=rebuilt_credential, receipt_id=settlement.receipt_id
+        )
+        assert receipt["receipt_hash"] == settlement.receipt_hash
+        assert receipt["log_index"] == 1
     finally:
         deployment.store.close()
 

@@ -48,11 +48,12 @@ What this file canNOT prove
 * It does not inject a real process kill: the store is an ordinary object in one
   process, so the "interruption" is an exception raised from a named method. It
   exercises the transaction boundaries, not ``SIGKILL``, WAL recovery, or the OS.
-* It does not make the offer/acceptance context survive a restart. When a
-  settlement is interrupted and the server is then *rebuilt*, the resend can no
-  longer settle (`GatewayError: no permit context`) and the request converges as
-  unknown — see `test_an_interrupted_settlement_survives_a_restart_as_an_untouched_request`,
-  which asserts that honestly rather than papering over it.
+* It does not exercise a settlement write that survives a restart as a
+  half-written row. The interruption here rolls back inside its transaction, so
+  the rebuilt server sees an *untouched* request; P0-3 then makes the late resend
+  settle (the permit terms are recomputed from the stored dispatch inputs and the
+  acceptance commitment is read back from the attempt row) rather than refuse —
+  see `test_an_interrupted_settlement_survives_a_restart_and_is_later_settled`.
 * It does not exercise two concurrent settlements for one request; the service
   serialises node messages under its own lock, so that race is out of reach here.
 """
@@ -69,7 +70,6 @@ from typing import Any
 import pytest
 from aipotluck.canonical import sign_payload
 from aipotluck.errors import (
-    GatewayError,
     ProtocolError,
     SettlementError,
 )
@@ -688,17 +688,18 @@ def test_a_lost_acknowledgement_after_a_commit_is_answered_from_durable_state(
     assert second == first
 
 
-def test_an_interrupted_settlement_survives_a_restart_as_an_untouched_request(
+def test_an_interrupted_settlement_survives_a_restart_and_is_later_settled(
     rig: _Rig,
 ) -> None:
     """The recoverable state is durable, and a rebuild reads it back intact.
 
     After an interruption at the settlement write and a rebuild, the database
     must not contain a leaf, a receipt or a journal for a request that never
-    settled. The honest consequence is then pinned too: the rebuilt server has
-    lost the offer terms (G01·f), so a resent ``usage.final`` is refused with
-    "no permit context" rather than settled — the request converges as unknown
-    through the recovery path, not by silently completing.
+    settled — the interruption rolled back inside its transaction. P0-3 then
+    makes the late resend *settle* rather than refuse: the permit terms are
+    recomputed from the stored dispatch inputs and the acceptance commitment is
+    read back from the attempt row, so the rebuilt server completes the very
+    settlement the first run could not finish.
     """
     _credential, offer = rig.prepare(
         "code-restart", request_id="req-1", messages=(user_message("durable?"),)
@@ -717,22 +718,41 @@ def test_an_interrupted_settlement_survives_a_restart_as_an_untouched_request(
         assert attempt is not None
         assert attempt.usage_status != "COMPLETE"
         assert attempt.usage_tokens is None
+        assert attempt.acceptance_hash == rig.acceptance, (
+            "the acceptance commitment survived the restart on the row"
+        )
         # No credit moved, so the rebuilt books agree with the durable log.
         assert deployment.service.balance("provider-A/pending") == 0
-        assert deployment.service.balance(_credential.subject_id) == 20_000
+        assert deployment.service.balance(rig.credential_obj.subject_id) == 20_000
 
-        # The permit context did not survive the restart, so the resend cannot
-        # settle; it is refused, and the refusal leaves no fabricated usage.
-        with pytest.raises(GatewayError, match="no permit context"):
-            deployment.service.handle_node_message(
-                node_id="node-A", envelope=usage, now=BASE
-            )
+        # P0-3: the permit terms and the acceptance both survive on the durable
+        # rows, so the resent usage.final is recomputed, verified and settled —
+        # not refused. The request completes exactly as if the resend had landed
+        # before the restart.
+        replies = deployment.service.handle_node_message(
+            node_id="node-A", envelope=usage, now=BASE
+        )
+        assert [reply.type for reply in replies] == ["event.ack"]
+
+        settled = deployment.store.get_settlement("req-1", 1)
+        assert settled is not None
+        assert deployment.store.log_size() == 1
         after = deployment.store.get_attempt(offer.attempt_id)
         assert after is not None
-        assert after.usage_status != "COMPLETE"
-        assert after.usage_tokens is None
-        assert deployment.store.get_settlement("req-1", 1) is None
-        assert deployment.store.log_size() == 0
+        assert after.usage_status == "COMPLETE"
+        assert after.usage_tokens == 1000
+        assert after.settlement_status == "SETTLED"
+        assert deployment.service.balance("provider-A/pending") == 1000
+        assert deployment.service.balance(rig.credential_obj.subject_id) == 19_000
+
+        # The receipt the late settlement issued verifies against the log.
+        rebuilt_credential = deployment.service.authenticate_signed_request(
+            **_auth_kwargs(rig.joined_private, rig.credential_obj.subject_id), now=BASE
+        )
+        receipt = deployment.service.receipt_for(
+            credential=rebuilt_credential, receipt_id=settled.receipt_id
+        )
+        assert receipt["log_index"] == 0
     finally:
         deployment.store.close()
 
