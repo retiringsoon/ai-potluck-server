@@ -38,11 +38,33 @@ in the client repository:
 
 ```bash
 potluck-server serve --config server.json
+potluck-server serve --config server.json --admin-ui 9802
 potluck-server admin invite --config server.json --role consumer --tenant friends
 potluck-server admin invite --config server.json --role consumer --with-api-key
 potluck-server admin reconcile --config server.json
 potluck-server verify receipt --config server.json --receipt-id R-1
 ```
+
+## Admin page
+
+`serve --admin-ui PORT` starts a second listener beside the gateway: the
+operator's dashboard over the same database — consumers and nodes ranked by what
+they spent, the queue and the work in flight, today's and this week's requests,
+tokens and milli-credits, the session aggregates and the most recent receipts.
+
+```bash
+potluck-server serve --config server.json --admin-ui 9802
+ssh -L 9802:127.0.0.1:9802 server.example.com   # then open http://127.0.0.1:9802/
+```
+
+It is off unless the flag names it, and it is read-only in both directions: the
+page offers no action, its store is opened `mode=ro` so SQLite itself refuses a
+write, and its listener binds an IPv4 loopback literal and refuses to start on
+any other address, because it authenticates nobody. One HTML document with its
+CSS and JavaScript inline, no CDN and no framework, refreshing five JSON
+endpoints every ten seconds. The reference — endpoints, the meaning of each
+number, and the tunnel and security notes — is
+[docs/admin-ui.md](docs/admin-ui.md).
 
 ## OpenAI-compatible endpoint
 
