@@ -34,13 +34,22 @@ uv pip install -e ".[dev]" -e "file://$(cd ../ai-potluck && pwd)"
 ### Tests
 
 ```bash
-python -m pytest tests/ -q --basetemp=.pytest_bt
+python -m pytest tests/ -q --basetemp=.pytest_bt -n auto
 ```
 
 `--basetemp` is **required** for local runs: the sandboxed environments many
 contributors use cannot write to the system temp directory. CI omits it
 because runner temp space is writable. The suite includes cross-package
 integration tests that drive real client CLIs and a real server.
+
+`-n auto` runs them in parallel across the machine's cores, which is how the
+suite stays quick: it is dominated by tests that start a real server and a real
+contribution node. That is safe without any test opting out, and two rules keep
+it so — every server binds `port=0` and takes its port from the socket, and
+every file a test touches lives under its own `tmp_path`. A new test that binds
+a fixed port, or that reaches for a shared path outside `tmp_path`, will pass
+alone and fail intermittently under xdist. Drop `-n auto` when debugging one
+test, since spinning up workers costs more than it saves there.
 
 ### Lint and types
 

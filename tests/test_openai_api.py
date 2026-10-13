@@ -69,6 +69,12 @@ REGISTERED_AT = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
 ANSWER = "Hello from the node"
 BILLED_TOKENS = 1_000
 
+#: The wall-clock budget a queued request is given when a test has to watch it
+#: end on its own deadline. The server's ticker expires an overdue request every
+#: 0.25s, so this is the shortest budget that still leaves the admissions around
+#: it room to happen under a loaded machine.
+HELD_REQUEST_DEADLINE_MS = 3_000
+
 
 def _wait_until(condition: Any, *, timeout: float = 20.0, what: str = "condition") -> None:
     """Block until `condition()` is truthy, failing with a readable message."""
@@ -931,10 +937,15 @@ def test_a_revoked_key_stops_working_on_a_running_server(
 def test_an_expired_key_is_401(server: Server, capsys: pytest.CaptureFixture[str]) -> None:
     """A key whose lifetime has passed authenticates nothing."""
     key = _mint_key(server, capsys, expires_in="1s")
-    record = server.store.list_api_keys()[0]
-    assert record.expires_at is not None
+    expires_at = server.store.list_api_keys()[0].expires_at
+    assert expires_at is not None
 
-    time.sleep(1.2)
+    # Wait out the key's own lifetime instead of a fixed pause that overshoots
+    # it. One second is the shortest lifetime `--expires-in` accepts, so this
+    # wait is the subject of the test rather than padding around it.
+    _wait_until(
+        lambda: dt.datetime.now(dt.UTC) >= expires_at, what="the key's lifetime to pass"
+    )
 
     status, _headers, raw = _post_chat(server, _chat_body(), key=key)
     assert status == 401
@@ -1092,7 +1103,18 @@ def test_the_concurrency_ceiling_answers_429(
 def test_a_model_no_node_runs_is_404_model_not_found(
     server: Server, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Refused before a request exists, rather than queued until its deadline."""
+    """Refused before a request exists, rather than queued until its deadline.
+
+    A server that held every request it could not dispatch would answer a model
+    name it has never heard of with a 504 a hundred seconds later, naming nothing
+    that was actually wrong. The catalogue check is what keeps the two refusals
+    distinguishable: this model has no node here, so waiting cannot help.
+
+    Nothing is stored either, which is the half that is easy to lose. A refusal
+    that created a request row in order to refuse it would be a server holding
+    work it just said it would not hold, and would leave a row for the deadline
+    sweep to end.
+    """
     node = Node(server)
     try:
         _wait_until(lambda: bool(server.store.connected_nodes()), what="the node to register")
@@ -1106,6 +1128,7 @@ def test_a_model_no_node_runs_is_404_model_not_found(
         assert error["code"] == "model_not_found"
         assert error["type"] == "invalid_request_error"
         assert MODEL in error["message"], "the answer names what the pool can run"
+        assert server.store.requests() == [], "a refused model stores nothing to sweep"
     finally:
         node.stop()
 
@@ -2264,7 +2287,12 @@ def test_a_full_dispatch_queue_answers_429_rather_than_holding_everything(
         assert server.store.catalogued_models() == {MODEL}, (
             "a node that lost its link has not withdrawn its model"
         )
-        key = _mint_key(server, capsys, deadline_ms=8_000)
+        # The held request's own deadline is the test's clock: everything before
+        # it — mint, admit, observe ROUTING, second admission — is a few round
+        # trips, so a three-second budget leaves that work orders of magnitude
+        # of headroom while keeping the wait for the honest 504 short. A longer
+        # budget would only make the same assertion slower to reach.
+        key = _mint_key(server, capsys, deadline_ms=HELD_REQUEST_DEADLINE_MS)
 
         held: list[int] = []
         thread = threading.Thread(
@@ -2290,36 +2318,6 @@ def test_a_full_dispatch_queue_answers_429_rather_than_holding_everything(
 
         thread.join(timeout=60)
         assert held == [504], "the held request ends on its own deadline, honestly"
-    finally:
-        node.stop()
-        server.stop()
-
-
-def test_a_model_no_node_of_the_server_runs_is_still_404_while_a_queue_holds_work(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Queueing does not turn a typo into a timeout.
-
-    A server that held every request it could not dispatch would answer a model
-    name it has never heard of with a 504 a hundred seconds later, naming nothing
-    that was actually wrong. The catalogue check is what keeps the two refusals
-    distinguishable: this model has no node here, so waiting cannot help.
-    """
-    server = Server(tmp_path, Keyring())
-    node = Node(server)
-    try:
-        _wait_until(lambda: bool(server.store.connected_nodes()), what="the node to register")
-        key = _mint_key(server, capsys)
-
-        status, _headers, raw = _post_chat(
-            server, _chat_body() | {"model": "no-such-model"}, key=key
-        )
-
-        error = json.loads(raw)["error"]
-        assert status == 404
-        assert error["code"] == "model_not_found"
-        assert MODEL in error["message"]
-        assert server.store.requests() == []
     finally:
         node.stop()
         server.stop()

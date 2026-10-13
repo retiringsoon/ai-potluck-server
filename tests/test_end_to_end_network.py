@@ -318,6 +318,17 @@ def server(tmp_path: Path) -> Any:
     built.stop()
 
 
+def _node_seen_at(server: Server, node_id: str = "node-A") -> dt.datetime:
+    """Return when the server last heard this node announce itself.
+
+    A HELLO and a heartbeat both stamp it, so a test that pins
+    ``heartbeat_interval_s`` an hour away reads the HELLO alone.
+    """
+    record = server.store.get_node(node_id)
+    assert record is not None, f"{node_id} has not registered"
+    return record.last_seen_at
+
+
 def _admit(
     server: Server, request_id: str, idempotency_key: str, *, deadline_ms: int = 60000
 ) -> dict[str, Any]:
@@ -449,7 +460,14 @@ def test_idempotent_replay_creates_nothing_new(server: Server) -> None:
         status, second = server.post("/v1/requests", body)
         assert status == 200
         assert second["request_id"] == request_id
-        time.sleep(0.3)
+        # Watch the call count instead of sleeping once and looking afterwards: a
+        # replay that dispatched anything would do it within a tick or two of the
+        # server's 0.25s ticker, and this checks every poll across that window.
+        _assert_absent_for(
+            lambda: node.adapter.upstream_calls > calls_after_first,
+            duration=0.5,
+            what="a second upstream call for a replayed request",
+        )
 
         # A different conversation under the same key is a conflict. Its
         # authorization is rebuilt for that conversation so the request digest
@@ -587,11 +605,30 @@ def test_a_node_reconnect_does_not_repeat_the_upstream_call(server: Server) -> N
         assert node.adapter.upstream_calls == 1
 
         # A second session over the same node database: reconnect, not redo.
+        #
+        # `run_once` returns only when the link closes, so joining it would spend
+        # its whole timeout proving nothing. The session is watched instead: the
+        # reconnect's own HELLO stamps `last_seen_at`, which is the instant the
+        # server has answered it with resume directives — and a repeat call is
+        # decided by those directives, so anything the reconnect was going to
+        # redo is already in motion by then.
+        announced_at = _node_seen_at(server)
         reconnect = Connector(node.config, adapter=node.adapter, store=node.store)
         thread = threading.Thread(target=reconnect.run_once, daemon=True)
         thread.start()
-        thread.join(timeout=5)
-        time.sleep(0.2)
+        try:
+            _wait_until(
+                lambda: _node_seen_at(server) > announced_at,
+                what="the reconnect to announce itself to the server",
+            )
+            _assert_absent_for(
+                lambda: node.adapter.upstream_calls > 1,
+                duration=0.75,
+                what="a second upstream call",
+            )
+        finally:
+            reconnect.stop()
+            thread.join(timeout=5)
 
         assert node.adapter.upstream_calls == 1, (
             "a reconnect must not make a second upstream call"

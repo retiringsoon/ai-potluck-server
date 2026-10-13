@@ -41,11 +41,20 @@ Operator deployment docs live in the client repo:
 ```bash
 uv venv --python 3.11 .venv
 uv pip install -e ".[dev]" -e "file://$(cd ../ai-potluck && pwd)"
-python -m pytest tests/ -q --basetemp=.pytest_bt   # --basetemp is required locally
+python -m pytest tests/ -q --basetemp=.pytest_bt -n auto  # both flags required locally
 ruff check .
 mypy                                                # strict
 ./scripts/release_gate.sh                           # end-to-end, both packages, clean trees
 ```
+
+`--basetemp` is required because sandboxed environments cannot write to the
+system temp directory. `-n auto` runs the suite in parallel under xdist, which
+is what keeps it short: most of the wall clock is tests that start a real server
+and a real contribution node. Parallelism needs no test to opt out, and two
+rules keep it that way — every server binds `port=0` and reads its port back
+from the socket, and every file a test touches is under its own `tmp_path`. A
+test that binds a fixed port or reaches outside `tmp_path` passes alone and
+fails intermittently under xdist. Drop `-n auto` when debugging a single test.
 
 **Verification is evidence-based.** Never claim green without running the
 command; a change is complete only when ruff, mypy, and the full pytest suite

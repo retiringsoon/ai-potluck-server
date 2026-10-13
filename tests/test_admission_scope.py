@@ -174,12 +174,17 @@ def test_admission_refuses_more_attempts_than_authorized(server: _Server) -> Non
 
 
 def test_admission_refuses_a_ceiling_above_the_signed_cap(server: _Server) -> None:
-    """The exposed charge ceiling may not exceed the signed cap."""
+    """The exposed charge ceiling may not exceed the signed cap.
+
+    One milli-credit over is the case that has to fail: a check that only refused
+    a ceiling far above the cap would still offer a node more than the consumer
+    signed for, which is the exposure this check exists to close.
+    """
     authorization = _authorize(server.keyring, request_id="R-1",
                                max_charge_milli_credits=1_000)
 
-    with pytest.raises(ProtocolError, match="ceiling"):
-        server.admit(authorization, max_charge_milli_credits=5_000)
+    with pytest.raises(ProtocolError, match="outside the signed cap of 1000"):
+        server.admit(authorization, max_charge_milli_credits=1_001)
 
 
 # --------------------------------------------------------------------------

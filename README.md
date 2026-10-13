@@ -90,7 +90,7 @@ Embeddings and the legacy completions endpoint are not implemented and say so
 uv venv --python 3.13 .venv
 uv pip install -e ".[dev]" -e "file://$(cd ../ai-potluck && pwd)"
 
-.venv/bin/python -m pytest tests/ -q --basetemp=.pytest_basetemp
+.venv/bin/python -m pytest tests/ -q --basetemp=.pytest_basetemp -n auto
 .venv/bin/ruff check src/ tests/
 .venv/bin/mypy
 ./scripts/release_gate.sh   # end-to-end: real install + the default join/ask path
@@ -113,5 +113,8 @@ repositories, and permission to bind localhost ports; any failed step exits
 non-zero with redacted logs.
 
 `--basetemp` is only needed in sandboxes that block pytest from creating its
-temporary directory under the system temp path. `mypy` runs with `--strict`
-(configured in `pyproject.toml`) and must stay at zero warnings.
+temporary directory under the system temp path. `-n auto` runs the suite in
+parallel under xdist, which is safe because every server binds `port=0` and
+every file a test touches is under its own `tmp_path`; drop it when debugging a
+single test. `mypy` runs with `--strict` (configured in `pyproject.toml`) and
+must stay at zero warnings.

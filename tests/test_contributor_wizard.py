@@ -767,6 +767,11 @@ def test_pause_reaches_a_running_node_without_a_restart(tmp_path: Path) -> None:
         device_private_key_b64=keyring.private_b64["device-key-A"],
         heartbeat_interval_s=3600,
         config_path=str(node_json),
+        # What this test asserts is that a pause reaches a *running* node and
+        # comes back, not how long the shipped poll interval is — that throttle
+        # has its own unit tests above. Polling fast keeps the two propagations
+        # here from costing a second each of wall clock.
+        policy_poll_interval_s=0.05,
     )
     store = NodeStore.open(tmp_path / "node.db")
     connector = Connector(config, adapter=adapter, store=store)

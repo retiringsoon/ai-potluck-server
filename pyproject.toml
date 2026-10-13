@@ -15,6 +15,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    # The suite is parallel-safe: every server binds port 0 and every path is a
+    # per-test temporary, so `-n auto` needs no test to opt out of it.
+    "pytest-xdist>=3.6",
     "mypy>=1.11",
     "ruff>=0.6",
     # The real client library, so the OpenAI-compatible surface is tested against

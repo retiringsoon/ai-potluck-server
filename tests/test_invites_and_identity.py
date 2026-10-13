@@ -548,9 +548,14 @@ def test_a_node_invite_registers_and_binds_the_device(setup: _Setup) -> None:
 
 
 def test_join_requires_a_public_key(setup: _Setup) -> None:
-    """A join without a public key is a protocol error, not a crash."""
+    """A join without a public key is a protocol error, not a crash.
+
+    The refusal names why: the key is the one field a join body must carry,
+    because every other identity field is derived by the server rather than read
+    from the body.
+    """
     setup.mint("code-shape")
-    with pytest.raises(ProtocolError):
+    with pytest.raises(ProtocolError, match="needs a public_key_b64"):
         setup.join("code-shape", subject_id="user-1", key_id="key-1", public_key_b64="")
 
 

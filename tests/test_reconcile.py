@@ -449,8 +449,16 @@ def test_the_three_commands_leave_both_databases_untouched(settled: Platform) ->
     assert server_main(["admin", "reconcile", "--config", str(settled.server_json)]) == 0
     assert main(["share", "reconcile", "--config", str(settled.node_json)]) == 0
 
-    assert _database_digest(settled.server_db) == server_before
-    assert _database_digest(settled.node_db) == node_before
+    server_after = _database_digest(settled.server_db)
+    node_after = _database_digest(settled.node_db)
+    assert server_after == server_before, (
+        "admin reconcile / verify receipt changed the server database:\n"
+        + _database_diff(server_before, server_after, settled.server_db)
+    )
+    assert node_after == node_before, (
+        "share reconcile / verify receipt changed the node database:\n"
+        + _database_diff(node_before, node_after, settled.node_db)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1066,6 +1074,39 @@ def _database_digest(database: Path) -> str:
     finally:
         connection.close()
     return canonical_digest(dump)
+
+
+def _database_diff(before: str, after: str, database: Path) -> str:
+    """Return a human-readable table-level diff for two logical digests.
+
+    The digests themselves are opaque; when the invariance assertion fires on a
+    slow runner the operator needs the offending table and rows, not two hashes.
+    """
+    import sqlite3
+
+    from aipotluck.canonical import canonical_digest
+
+    connection = sqlite3.connect(database)
+    try:
+        names = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        ]
+        lines: list[str] = []
+        for name in names:
+            rows = [[_cell(v) for v in row] for row in connection.execute(
+                f"SELECT * FROM {name} ORDER BY 1"
+            ).fetchall()]
+            if canonical_digest(rows) in (before, after):
+                continue
+            lines.append(f"table {name}: {len(rows)} rows now")
+            for row in rows[-5:]:
+                lines.append(f"  {row}")
+        return "\n".join(lines) or "(no per-table difference found)"
+    finally:
+        connection.close()
 
 
 def _cell(value: Any) -> Any:

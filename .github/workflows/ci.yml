@@ -8,7 +8,9 @@
 #
 # pytest's system temp directory is writable on a normal CI runner, so no
 # --basetemp override is needed here (the sandboxed local runs are the ones
-# that require it).
+# that require it). The suite runs under xdist because it is parallel-safe: each
+# server binds port 0 and each test owns its temporary directory, so the workers
+# share nothing but the CPU.
 
 name: ci
 
@@ -51,4 +53,4 @@ jobs:
         run: .venv/bin/mypy
 
       - name: pytest
-        run: .venv/bin/python -m pytest tests/ -q
+        run: .venv/bin/python -m pytest tests/ -q -n auto
