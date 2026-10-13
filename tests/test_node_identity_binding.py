@@ -11,7 +11,7 @@ Each test here pins one half of the acceptance in
 ``docs/release-fix-plan.zh-CN.md`` §2:
 
 * a token cannot claim another node's device, another node's node id, or a
-  device the center bound to a different credential — within one tenant or
+  device the server bound to a different credential — within one tenant or
   across tenants;
 * a refused hello changes nothing: not the claimed node's record, not its
   connection, not an uninvolved third node's;
@@ -21,7 +21,7 @@ Each test here pins one half of the acceptance in
 * the refusal also holds over a real loopback WebSocket handshake, so it is not
   an artefact of calling the service function directly.
 
-Everything drives a real `GatewayService` over a real `CenterStore`; the socket
+Everything drives a real `GatewayService` over a real `ServerStore`; the socket
 tests additionally run a real `GatewayServer`. Time comes from the wall clock,
 as it does in ``test_end_to_end_network.py``, because the transport resolves a
 bearer token at the instant a link opens.
@@ -43,7 +43,7 @@ from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, Credential, NodeRecord
+from aipotluck_server.persistence import Credential, NodeRecord, ServerStore
 
 MODEL = "coding-pool"
 TENANT = "tenant-a"
@@ -103,7 +103,7 @@ def _legacy_hello(**claims: str) -> NodeHello:
 
 @dataclass(frozen=True)
 class JoinedNode:
-    """One node an invite minted: its credential and the ids the center derived.
+    """One node an invite minted: its credential and the ids the server derived.
 
     `node_id` is the device id on purpose — that is what the contributor wizard
     writes into ``node.json``, and it is the only node id `register_node` accepts
@@ -129,16 +129,16 @@ class JoinedNode:
         return _hello(share_enabled=share_enabled, **fields)
 
 
-class Center:
+class Server:
     """A real service over a real store, with invites minted on demand."""
 
     def __init__(self, tmp_path: Path) -> None:
         self.keyring = Keyring()
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=self.keyring.private_b64["settlement-key-1"],
@@ -187,7 +187,7 @@ class Center:
             invite_code=code,
             identity={"public_key_b64": node_public},
             device={"public_key_b64": device_public},
-            center_url="http://center.test",
+            server_url="http://server.test",
             now=self.moment(),
         )
         token = result.node_token
@@ -208,7 +208,7 @@ class Center:
         )
 
     def provision_node(self, subject_id: str, token: str) -> Credential:
-        """Register a credential the way an operator's ``center.json`` does.
+        """Register a credential the way an operator's ``server.json`` does.
 
         This is the pre-registration route: the entry names no device, so the
         credential carries no device binding and its subject is the node id it
@@ -229,7 +229,7 @@ class Center:
         return drained
 
     def register(self, credential: Credential, hello: NodeHello) -> None:
-        """Open a node link, buffering what the center sends into an outbox."""
+        """Open a node link, buffering what the server sends into an outbox."""
         self.outbox[hello.node_id] = []
         self.service.register_node(
             credential=credential,
@@ -276,19 +276,19 @@ class Center:
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> Iterator[Center]:
-    """Return a center over a fresh store, closed at the end of the test."""
-    built = Center(tmp_path)
+def server(tmp_path: Path) -> Iterator[Server]:
+    """Return a server over a fresh store, closed at the end of the test."""
+    built = Server(tmp_path)
     yield built
     built.close()
 
 
 def _two_joined_nodes(
-    center: Center, *, tenants: tuple[str, str]
+    server: Server, *, tenants: tuple[str, str]
 ) -> tuple[JoinedNode, JoinedNode]:
     """Join two nodes, one invite each, into the tenants named."""
     first, second = tenants
-    return center.join_node(tenant=first), center.join_node(tenant=second)
+    return server.join_node(tenant=first), server.join_node(tenant=second)
 
 
 def _types(outbox: list[Envelope]) -> list[str]:
@@ -296,16 +296,16 @@ def _types(outbox: list[Envelope]) -> list[str]:
     return [envelope.type for envelope in outbox]
 
 
-def _impersonate(center: Center, attacker: JoinedNode, victim: JoinedNode) -> None:
+def _impersonate(server: Server, attacker: JoinedNode, victim: JoinedNode) -> None:
     """Dial in as `attacker` claiming every id of `victim`, into a fresh outbox.
 
-    This is the reproduced attack: a real credential the center minted, a hello
+    This is the reproduced attack: a real credential the server minted, a hello
     naming somebody else, and none of the victim's key material. The outbox is
     opened first so a caller can assert afterwards that nothing was ever sent
     into it.
     """
-    center.outbox["attacker"] = []
-    center.service.register_node(
+    server.outbox["attacker"] = []
+    server.service.register_node(
         credential=attacker.credential,
         hello=attacker.hello(
             node_id=victim.node_id,
@@ -313,8 +313,8 @@ def _impersonate(center: Center, attacker: JoinedNode, victim: JoinedNode) -> No
             device_key_id=victim.device_key_id,
             provider_id=victim.provider_id,
         ),
-        enqueue=center.sink("attacker"),
-        now=center.moment(),
+        enqueue=server.sink("attacker"),
+        now=server.moment(),
     )
 
 
@@ -324,7 +324,7 @@ def _impersonate(center: Center, attacker: JoinedNode, victim: JoinedNode) -> No
 
 
 def test_a_node_token_cannot_claim_another_nodes_device_identity(
-    center: Center,
+    server: Server,
 ) -> None:
     """A's real token plus B's device, device key and provider is refused.
 
@@ -333,14 +333,14 @@ def test_a_node_token_cannot_claim_another_nodes_device_identity(
     first refusal keeps A's node id and claims only B's device half; the second
     is the attack exactly as reproduced, claiming B's node id as well.
     """
-    alice, bob = _two_joined_nodes(center, tenants=("friends", "friends"))
+    alice, bob = _two_joined_nodes(server, tenants=("friends", "friends"))
     assert alice.credential.tenant_id == bob.credential.tenant_id
-    center.outbox["attacker"] = []
-    enqueue = center.sink("attacker")
+    server.outbox["attacker"] = []
+    enqueue = server.sink("attacker")
 
     # Claiming B's device while still naming A's own node id...
     with pytest.raises(IdentityBindingError, match="is bound to device"):
-        center.service.register_node(
+        server.service.register_node(
             credential=alice.credential,
             hello=alice.hello(
                 device_id=bob.device_id,
@@ -348,39 +348,39 @@ def test_a_node_token_cannot_claim_another_nodes_device_identity(
                 provider_id=bob.provider_id,
             ),
             enqueue=enqueue,
-            now=center.moment(),
+            now=server.moment(),
         )
-    assert center.outbox["attacker"] == [], "a refused hello is answered with nothing"
+    assert server.outbox["attacker"] == [], "a refused hello is answered with nothing"
 
     # ...and the attack exactly as reproduced, claiming B's node id as well.
     with pytest.raises(IdentityBindingError):
-        _impersonate(center, alice, bob)
-    assert center.outbox["attacker"] == []
-    assert center.store.get_node(bob.node_id) is None
+        _impersonate(server, alice, bob)
+    assert server.outbox["attacker"] == []
+    assert server.store.get_node(bob.node_id) is None
 
 
-def test_a_node_token_cannot_claim_another_nodes_node_id(center: Center) -> None:
+def test_a_node_token_cannot_claim_another_nodes_node_id(server: Server) -> None:
     """A's token with A's own device but B's node id is refused too.
 
     The node id is not a free label: it keys the live-connection table and every
     dispatch, so claiming B's is how a trusted hello becomes a hijacked link and
     a stolen task feed.
     """
-    alice, bob = _two_joined_nodes(center, tenants=("friends", "friends"))
+    alice, bob = _two_joined_nodes(server, tenants=("friends", "friends"))
 
     attacker: list[Envelope] = []
     with pytest.raises(IdentityBindingError, match="speaks for node"):
-        center.service.register_node(
+        server.service.register_node(
             credential=alice.credential,
             hello=alice.hello(node_id=bob.node_id),
             enqueue=attacker.append,
-            now=center.moment(),
+            now=server.moment(),
         )
     assert attacker == []
 
 
 def test_impersonation_is_refused_across_tenants_as_well_as_within_one(
-    center: Center,
+    server: Server,
 ) -> None:
     """A tenant boundary is not what stops this, so neither may be the fix.
 
@@ -389,16 +389,16 @@ def test_impersonation_is_refused_across_tenants_as_well_as_within_one(
     credential, never from the tenant, so the answer must be the same both ways.
     """
     for tenants in (("friends", "friends"), (TENANT, OTHER_TENANT)):
-        alice, bob = _two_joined_nodes(center, tenants=tenants)
+        alice, bob = _two_joined_nodes(server, tenants=tenants)
         assert (alice.credential.tenant_id == bob.credential.tenant_id) == (
             tenants[0] == tenants[1]
         )
         with pytest.raises(IdentityBindingError):
-            _impersonate(center, alice, bob)
+            _impersonate(server, alice, bob)
 
 
 def test_a_refused_hello_leaves_every_other_node_exactly_as_it_was(
-    center: Center,
+    server: Server,
 ) -> None:
     """The victim's record, its link and an uninvolved third node all survive.
 
@@ -407,29 +407,29 @@ def test_a_refused_hello_leaves_every_other_node_exactly_as_it_was(
     reaches the victim's own sink, which is precisely what a displaced enqueue
     would have stolen.
     """
-    alice, bob = _two_joined_nodes(center, tenants=("friends", "friends"))
-    carol = center.join_node()
-    center.register(bob.credential, bob.hello())
+    alice, bob = _two_joined_nodes(server, tenants=("friends", "friends"))
+    carol = server.join_node()
+    server.register(bob.credential, bob.hello())
     # Carol is connected but not sharing, so the dispatch below has exactly one
     # candidate and "the offer still reaches the victim" cannot be decided by
     # which of two random node ids sorts first.
-    center.register(carol.credential, carol.hello(share_enabled=False))
-    bob_before: NodeRecord | None = center.store.get_node(bob.node_id)
-    carol_before: NodeRecord | None = center.store.get_node(carol.node_id)
+    server.register(carol.credential, carol.hello(share_enabled=False))
+    bob_before: NodeRecord | None = server.store.get_node(bob.node_id)
+    carol_before: NodeRecord | None = server.store.get_node(carol.node_id)
     assert bob_before is not None and bob_before.connected
-    center.take(bob.node_id)
+    server.take(bob.node_id)
 
     with pytest.raises(IdentityBindingError):
-        _impersonate(center, alice, bob)
+        _impersonate(server, alice, bob)
 
-    assert center.store.get_node(bob.node_id) == bob_before
-    assert center.store.get_node(carol.node_id) == carol_before
-    assert center.outbox["attacker"] == []
-    assert center.outbox[bob.node_id] == [], "the victim was told nothing new"
+    assert server.store.get_node(bob.node_id) == bob_before
+    assert server.store.get_node(carol.node_id) == carol_before
+    assert server.outbox["attacker"] == []
+    assert server.outbox[bob.node_id] == [], "the victim was told nothing new"
 
-    center.admit("R-still-bobs", "idem-still-bobs")
-    assert [offer.resource_id for offer in center.offers(bob.node_id)] == [bob.node_id]
-    assert center.outbox["attacker"] == []
+    server.admit("R-still-bobs", "idem-still-bobs")
+    assert [offer.resource_id for offer in server.offers(bob.node_id)] == [bob.node_id]
+    assert server.outbox["attacker"] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -438,7 +438,7 @@ def test_a_refused_hello_leaves_every_other_node_exactly_as_it_was(
 
 
 def test_an_invited_node_connects_reconnects_and_receives_work(
-    center: Center,
+    server: Server,
 ) -> None:
     """A token plus its own identity is accepted, again and again.
 
@@ -447,18 +447,18 @@ def test_an_invited_node_connects_reconnects_and_receives_work(
     its credential has to make impersonation impossible without making a node's
     own re-handshake suspicious.
     """
-    alice = center.join_node()
+    alice = server.join_node()
 
-    center.register(alice.credential, alice.hello())
-    assert _types(center.take(alice.node_id)) == ["hello.ack"]
+    server.register(alice.credential, alice.hello())
+    assert _types(server.take(alice.node_id)) == ["hello.ack"]
 
-    center.register(alice.credential, alice.hello())
-    assert _types(center.take(alice.node_id)) == ["hello.ack"]
-    record = center.store.get_node(alice.node_id)
+    server.register(alice.credential, alice.hello())
+    assert _types(server.take(alice.node_id)) == ["hello.ack"]
+    record = server.store.get_node(alice.node_id)
     assert record is not None and record.connected and record.share_enabled
 
-    center.admit("R-alice", "idem-alice")
-    assert [offer.resource_id for offer in center.offers(alice.node_id)] == [
+    server.admit("R-alice", "idem-alice")
+    assert [offer.resource_id for offer in server.offers(alice.node_id)] == [
         alice.node_id
     ]
 
@@ -468,7 +468,7 @@ def test_an_invited_node_connects_reconnects_and_receives_work(
 # --------------------------------------------------------------------------- #
 
 
-def test_a_pre_registered_node_dials_as_its_own_subject(center: Center) -> None:
+def test_a_pre_registered_node_dials_as_its_own_subject(server: Server) -> None:
     """The hand-written ``credentials[]`` route still works, and still gets work.
 
     An operator-provisioned credential names no device, so the constraint that
@@ -476,7 +476,7 @@ def test_a_pre_registered_node_dials_as_its_own_subject(center: Center) -> None:
     sample dials with the credential's own subject as its ``node_id`` and with a
     device the operator registered in ``providers[]``.
     """
-    credential = center.provision_node(LEGACY_SUBJECT, LEGACY_TOKEN)
+    credential = server.provision_node(LEGACY_SUBJECT, LEGACY_TOKEN)
     hello = _legacy_hello()
     assert (hello.node_id, hello.device_id, hello.provider_id) == (
         LEGACY_SUBJECT,
@@ -484,48 +484,48 @@ def test_a_pre_registered_node_dials_as_its_own_subject(center: Center) -> None:
         LEGACY_DEVICE[2],
     )
 
-    center.register(credential, hello)
-    assert _types(center.take(LEGACY_SUBJECT)) == ["hello.ack"]
-    assert center.store.get_node(LEGACY_SUBJECT) is not None
+    server.register(credential, hello)
+    assert _types(server.take(LEGACY_SUBJECT)) == ["hello.ack"]
+    assert server.store.get_node(LEGACY_SUBJECT) is not None
 
-    center.admit("R-legacy", "idem-legacy")
-    assert [offer.resource_id for offer in center.offers(LEGACY_SUBJECT)] == [
+    server.admit("R-legacy", "idem-legacy")
+    assert [offer.resource_id for offer in server.offers(LEGACY_SUBJECT)] == [
         LEGACY_SUBJECT
     ]
 
 
 def test_a_pre_registered_credential_cannot_take_another_node_id(
-    center: Center,
+    server: Server,
 ) -> None:
     """Two provisioned credentials are two nodes, not one node and a spare token.
 
     The missing device column is not a licence: whatever else a hello claims,
     its ``node_id`` has to be the subject the operator bound that token to.
     """
-    first = center.provision_node(LEGACY_SUBJECT, LEGACY_TOKEN)
-    second = center.provision_node("node-B", "node-token-second")
-    center.register(first, _legacy_hello())
-    before = center.store.get_node(LEGACY_SUBJECT)
-    center.take(LEGACY_SUBJECT)
+    first = server.provision_node(LEGACY_SUBJECT, LEGACY_TOKEN)
+    second = server.provision_node("node-B", "node-token-second")
+    server.register(first, _legacy_hello())
+    before = server.store.get_node(LEGACY_SUBJECT)
+    server.take(LEGACY_SUBJECT)
 
     attacker: list[Envelope] = []
     with pytest.raises(IdentityBindingError, match="speaks for node"):
-        center.service.register_node(
+        server.service.register_node(
             credential=second,
             hello=_legacy_hello(node_id=LEGACY_SUBJECT),
             enqueue=attacker.append,
-            now=center.moment(),
+            now=server.moment(),
         )
 
     assert attacker == []
-    assert center.store.get_node(LEGACY_SUBJECT) == before
-    assert center.outbox[LEGACY_SUBJECT] == []
+    assert server.store.get_node(LEGACY_SUBJECT) == before
+    assert server.outbox[LEGACY_SUBJECT] == []
 
 
 def test_a_pre_registered_credential_cannot_claim_a_joined_nodes_device(
-    center: Center,
+    server: Server,
 ) -> None:
-    """A device the center bound to a credential belongs to that credential.
+    """A device the server bound to a credential belongs to that credential.
 
     The provisioned path has no device column to compare against, so without
     this rule a hand-written token could still dial as an invited node's device
@@ -533,12 +533,12 @@ def test_a_pre_registered_credential_cannot_claim_a_joined_nodes_device(
     check reads the binding the join wrote, and it leaves a device no credential
     owns (the operator's own ``providers[]`` entry) free for its node to claim.
     """
-    alice = center.join_node()
-    legacy = center.provision_node(LEGACY_SUBJECT, LEGACY_TOKEN)
+    alice = server.join_node()
+    legacy = server.provision_node(LEGACY_SUBJECT, LEGACY_TOKEN)
 
     attacker: list[Envelope] = []
     with pytest.raises(IdentityBindingError, match="may not dial as it"):
-        center.service.register_node(
+        server.service.register_node(
             credential=legacy,
             hello=_legacy_hello(
                 device_id=alice.device_id,
@@ -546,11 +546,11 @@ def test_a_pre_registered_credential_cannot_claim_a_joined_nodes_device(
                 provider_id=alice.provider_id,
             ),
             enqueue=attacker.append,
-            now=center.moment(),
+            now=server.moment(),
         )
 
     assert attacker == []
-    assert center.store.get_node(LEGACY_SUBJECT) is None
+    assert server.store.get_node(LEGACY_SUBJECT) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -563,10 +563,10 @@ def _hello_envelope(hello: NodeHello) -> Envelope:
     return Envelope(type="node.hello", payload=hello.to_payload())
 
 
-def _open_link(server: GatewayServer, token: str) -> ClientConnection:
+def _open_link(transport: GatewayServer, token: str) -> ClientConnection:
     """Dial the node link with a bearer token and complete the handshake."""
     return ClientConnection.connect(
-        server.node_url, headers={"Authorization": f"Bearer {token}"}
+        transport.node_url, headers={"Authorization": f"Bearer {token}"}
     )
 
 
@@ -582,21 +582,21 @@ def test_a_real_node_link_refuses_an_impersonating_hello(tmp_path: Path) -> None
     `hello.ack`. B then reconnects on its own token, the legitimate path the
     refusal must not have broken.
     """
-    center = Center(tmp_path)
-    server = GatewayServer(center.service, config=center.config)
-    server.start()
+    server = Server(tmp_path)
+    transport = GatewayServer(server.service, config=server.config)
+    transport.start()
     try:
-        alice, bob = _two_joined_nodes(center, tenants=("friends", "friends"))
-        victim = _open_link(server, bob.token)
+        alice, bob = _two_joined_nodes(server, tenants=("friends", "friends"))
+        victim = _open_link(transport, bob.token)
         try:
             victim.send_text(_hello_envelope(bob.hello()).encode())
             ack = Envelope.decode(victim.recv_text(timeout=10.0))
             assert ack.type == "hello.ack"
             assert ack.payload["node_id"] == bob.node_id
-            assert server.connected_node_count == 1
-            bob_before = center.store.get_node(bob.node_id)
+            assert transport.connected_node_count == 1
+            bob_before = server.store.get_node(bob.node_id)
 
-            attacker = _open_link(server, alice.token)
+            attacker = _open_link(transport, alice.token)
             try:
                 attacker.send_text(
                     _hello_envelope(
@@ -618,18 +618,18 @@ def test_a_real_node_link_refuses_an_impersonating_hello(tmp_path: Path) -> None
                 attacker.close()
 
             # The refused hello bound nothing, displaced nothing, closed nothing.
-            assert server.connected_node_count == 1
-            assert center.store.get_node(bob.node_id) == bob_before
+            assert transport.connected_node_count == 1
+            assert server.store.get_node(bob.node_id) == bob_before
 
             # Work still reaches the victim over its own socket.
-            center.admit("R-real-socket", "idem-real-socket")
+            server.admit("R-real-socket", "idem-real-socket")
             offer = Envelope.decode(victim.recv_text(timeout=10.0))
             assert offer.type == "attempt.offer"
             assert AttemptOffer.from_payload(offer.payload).resource_id == bob.node_id
 
             # And the victim can still reconnect as itself, on the same link
             # object a connector would reopen with.
-            reopened = _open_link(server, bob.token)
+            reopened = _open_link(transport, bob.token)
             try:
                 reopened.send_text(_hello_envelope(bob.hello()).encode())
                 reconnect = Envelope.decode(reopened.recv_text(timeout=10.0))
@@ -639,8 +639,8 @@ def test_a_real_node_link_refuses_an_impersonating_hello(tmp_path: Path) -> None
         finally:
             victim.close()
     finally:
-        server.stop()
-        center.close()
+        transport.stop()
+        server.close()
 
 
 def test_a_real_node_link_accepts_the_identity_its_token_carries(
@@ -653,15 +653,15 @@ def test_a_real_node_link_accepts_the_identity_its_token_carries(
     node dialing as its device, and an operator-provisioned node dialing as its
     subject with a device from ``providers[]``.
     """
-    center = Center(tmp_path)
-    server = GatewayServer(center.service, config=center.config)
-    server.start()
+    server = Server(tmp_path)
+    transport = GatewayServer(server.service, config=server.config)
+    transport.start()
     try:
-        alice = center.join_node()
-        center.provision_node(LEGACY_SUBJECT, LEGACY_TOKEN)
+        alice = server.join_node()
+        server.provision_node(LEGACY_SUBJECT, LEGACY_TOKEN)
         links = ((alice.token, alice.hello()), (LEGACY_TOKEN, _legacy_hello()))
         for token, hello in links:
-            link = _open_link(server, token)
+            link = _open_link(transport, token)
             try:
                 link.send_text(_hello_envelope(hello).encode())
                 ack = Envelope.decode(link.recv_text(timeout=10.0))
@@ -669,8 +669,8 @@ def test_a_real_node_link_accepts_the_identity_its_token_carries(
                 assert ack.payload["node_id"] == hello.node_id
             finally:
                 link.close()
-        assert center.store.get_node(alice.node_id) is not None
-        assert center.store.get_node(LEGACY_SUBJECT) is not None
+        assert server.store.get_node(alice.node_id) is not None
+        assert server.store.get_node(LEGACY_SUBJECT) is not None
     finally:
-        server.stop()
-        center.close()
+        transport.stop()
+        server.close()

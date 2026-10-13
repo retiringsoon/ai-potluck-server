@@ -1,13 +1,13 @@
-"""G01 — the center restarts and its accounts, receipts and identities survive.
+"""G01 — the server restarts and its accounts, receipts and identities survive.
 
 What this file verifies (plan v0.3 §5.1 B G01)
 ------------------------------------------------
-The headline claim is that the center can be **closed and rebuilt from its
-SQLite file alone**: after a first center settles a request, a second center is
-built by `load_center` over the very same database — with a *fresh*
+The headline claim is that the server can be **closed and rebuilt from its
+SQLite file alone**: after a first server settles a request, a second server is
+built by `load_server` over the very same database — with a *fresh*
 `IdentityRegistry` and a *rebuilt* ledger, never the old in-memory objects — and
 it can still read the old receipt (with a verifiable inclusion proof), reconcile
-a request that was in flight when the center stopped, and settle a brand-new
+a request that was in flight when the server stopped, and settle a brand-new
 request without colliding with the receipt the first run issued.
 
 Each requirement is pinned by its own test:
@@ -26,7 +26,7 @@ Each requirement is pinned by its own test:
 * **G01·c** total supply is conserved across the restart and the old receipt is
   still readable with an inclusion proof that folds back to the stored root.
 * **G01·d** an invited (dynamically registered) identity still authenticates
-  after the restart, because `load_center` replays the ``identities`` rows and
+  after the restart, because `load_server` replays the ``identities`` rows and
   the one-time invite quota is not minted twice.
 * **G01·e** an in-flight request — accepted and with output committed, but with
   no final usage — survives as durable rows and is handled after the restart by
@@ -39,14 +39,14 @@ Each requirement is pinned by its own test:
 
 What this file canNOT prove
 ---------------------------
-* It does not prove the center is crash-safe *during* a settlement write — that
+* It does not prove the server is crash-safe *during* a settlement write — that
   is G02's territory (`tests/test_settlement_interruption.py`).
 * It does not prove anything about a real process restart: the store is closed
   and reopened in one process, so only the *durable* boundary is exercised, not
   socket teardown, worker threads, or the OS.
 * It does not make permit/acceptance durable. The tests assert the honest
   post-restart refusal; they do not claim a late report can be completed.
-* It relies on `load_center` as the rebuild entry point, so it pins that path
+* It relies on `load_server` as the rebuild entry point, so it pins that path
   (config provisioning + identity replay + ledger replay) and not a bespoke one.
 """
 
@@ -87,9 +87,9 @@ from aipotluck.wire import (
 )
 from conftest import Keyring
 
-from aipotluck_server.deploy import load_center
+from aipotluck_server.deploy import load_server
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, Credential
+from aipotluck_server.persistence import Credential, ServerStore
 
 #: The instant every test works from. It sits inside an authorization's validity
 #: window and after every key's registration time, so no test depends on the
@@ -270,11 +270,11 @@ def _authorization(
 
 
 # --------------------------------------------------------------------------
-# The center under test
+# The server under test
 # --------------------------------------------------------------------------
 
 
-class Center:
+class Server:
     """A real `GatewayService` over a real SQLite file, without an injected ledger.
 
     The ledger is deliberately *not* injected: the service rebuilds it from the
@@ -288,11 +288,11 @@ class Center:
         self.tmp_path = tmp_path
         self.keyring = Keyring()
         self.registry = self.keyring.registry
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=self.keyring.private_b64["settlement-key-1"],
@@ -310,7 +310,7 @@ class Center:
         self.store.close()
 
     def connect(self) -> None:
-        """Register the node link, appending everything the center sends to `received`."""
+        """Register the node link, appending everything the server sends to `received`."""
         self.service.register_node(
             credential=Credential(tenant_id="tenant-a", subject_id="node-A", role="node"),
             hello=_hello(),
@@ -330,7 +330,7 @@ class Center:
             invite_code=code,
             identity={"public_key_b64": public_b64, "display_name": None},
             device=None,
-            center_url="http://center.test",
+            server_url="http://server.test",
             now=BASE,
         )
         self.joined_private = load_private_key(private_b64)
@@ -438,20 +438,20 @@ class Center:
 
     # -- restart ------------------------------------------------------------
 
-    def write_center_json(self) -> Path:
-        """Write a `center.json` naming only the settlement and device keys.
+    def write_server_json(self) -> Path:
+        """Write a `server.json` naming only the settlement and device keys.
 
         The invited consumer is deliberately absent: it exists nowhere but the
-        ``identities`` table, so a rebuilt center can only know it by replaying
+        ``identities`` table, so a rebuilt server can only know it by replaying
         the store.
         """
-        path = self.tmp_path / "center.json"
+        path = self.tmp_path / "server.json"
         path.write_text(
             json.dumps(
                 {
                     "host": "127.0.0.1",
                     "port": 0,
-                    "database_path": str(self.tmp_path / "center.db"),
+                    "database_path": str(self.tmp_path / "server.db"),
                     "platform_id": "platform-1",
                     "settlement_key_id": "settlement-key-1",
                     "settlement_private_key_b64": self.keyring.private_b64[
@@ -479,13 +479,13 @@ class Center:
     def rebuild(self) -> Any:
         """Close the store and return a fresh deployment over the same database."""
         self.close()
-        return load_center(self.write_center_json())
+        return load_server(self.write_server_json())
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> Center:
-    """Return a center over a fresh store, closed at the end of the test."""
-    built = Center(tmp_path)
+def server(tmp_path: Path) -> Server:
+    """Return a server over a fresh store, closed at the end of the test."""
+    built = Server(tmp_path)
     try:
         yield built
     finally:
@@ -497,18 +497,18 @@ def center(tmp_path: Path) -> Center:
 # --------------------------------------------------------------------------
 
 
-def test_a_rebuilt_ledger_replays_the_log_entry_for_entry(center: Center) -> None:
-    """A second center's books equal the first's, built from the log alone.
+def test_a_rebuilt_ledger_replays_the_log_entry_for_entry(server: Server) -> None:
+    """A second server's books equal the first's, built from the log alone.
 
     This is the account-creation-completeness requirement, including the
     provider ``<provider>/pending`` account whose creation event must carry its
     ``account_kind`` or the rebuild cannot interpret it.
     """
-    center.connect()
-    joined = center.join("code-a")
-    credential = center.authenticate(center.service, joined.key_id)
-    _offer, _acceptance, document = center.settle(
-        center.service,
+    server.connect()
+    joined = server.join("code-a")
+    credential = server.authenticate(server.service, joined.key_id)
+    _offer, _acceptance, document = server.settle(
+        server.service,
         credential,
         request_id="req-1",
         messages=(user_message("first answer"),),
@@ -519,7 +519,7 @@ def test_a_rebuilt_ledger_replays_the_log_entry_for_entry(center: Center) -> Non
     # has nothing to open it from. This is the regression the G01 write-up names.
     account_events = [
         payload
-        for _seq, kind, payload in center.store.ledger_events()
+        for _seq, kind, payload in server.store.ledger_events()
         if kind == "account"
     ]
     assert account_events == [
@@ -528,20 +528,20 @@ def test_a_rebuilt_ledger_replays_the_log_entry_for_entry(center: Center) -> Non
 
     before_journals = [
         (journal.journal_id, journal.postings, journal.kind)
-        for journal in center.service.engine.ledger.journals()
+        for journal in server.service.engine.ledger.journals()
     ]
-    before_supply = center.service.engine.ledger.total_supply()
-    before_provider = center.service.balance("provider-A/pending")
-    before_consumer = center.service.balance(credential.subject_id)
-    old_ledger_id = id(center.service.engine.ledger)
-    old_registry_id = id(center.registry)
+    before_supply = server.service.engine.ledger.total_supply()
+    before_provider = server.service.balance("provider-A/pending")
+    before_consumer = server.service.balance(credential.subject_id)
+    old_ledger_id = id(server.service.engine.ledger)
+    old_registry_id = id(server.registry)
     # A key that exists only in the running registry, never in the store: a
-    # rebuilt center must not know it.
-    center.registry.register_key(
+    # rebuilt server must not know it.
+    server.registry.register_key(
         "throwaway-key", "throwaway", "consumer", generate_key_pair()[0], BASE
     )
 
-    deployment = center.rebuild()
+    deployment = server.rebuild()
     try:
         rebuilt = deployment.service
         assert id(rebuilt.engine.ledger) != old_ledger_id, (
@@ -567,7 +567,7 @@ def test_a_rebuilt_ledger_replays_the_log_entry_for_entry(center: Center) -> Non
         deployment.store.close()
 
 
-def test_a_log_row_missing_account_kind_fails_closed(center: Center) -> None:
+def test_a_log_row_missing_account_kind_fails_closed(server: Server) -> None:
     """A malformed replay row is refused with a domain error, not a ``KeyError``.
 
     A row an older build could have written — an issuance whose payload carries
@@ -575,14 +575,14 @@ def test_a_log_row_missing_account_kind_fails_closed(center: Center) -> None:
     because a bare ``KeyError`` escaping the rebuild would be indistinguishable
     from a bug in the reader.
     """
-    center.store.append_ledger_event(
+    server.store.append_ledger_event(
         "issue", {"account_id": "provider-A/pending", "amount": 5}, at=BASE
     )
     with pytest.raises(GatewayError, match="unknown account kind"):
         GatewayService(
-            config=center.config,
-            store=center.store,
-            registry=center.registry,
+            config=server.config,
+            store=server.store,
+            registry=server.registry,
             now=BASE,
         )
 
@@ -592,32 +592,32 @@ def test_a_log_row_missing_account_kind_fails_closed(center: Center) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_receipt_ids_are_unique_across_a_restart(center: Center) -> None:
+def test_receipt_ids_are_unique_across_a_restart(server: Server) -> None:
     """The rebuilt engine continues its numbering and never reissues an id."""
-    center.connect()
-    joined = center.join("code-b")
-    credential = center.authenticate(center.service, joined.key_id)
-    offer, acceptance, document = center.settle(
-        center.service,
+    server.connect()
+    joined = server.join("code-b")
+    credential = server.authenticate(server.service, joined.key_id)
+    offer, acceptance, document = server.settle(
+        server.service,
         credential,
         request_id="req-1",
         messages=(user_message("first answer"),),
     )
     first = document["settlement"]
     assert first["log_index"] == 0
-    assert center.service.balance("provider-A/pending") == 1_000
+    assert server.service.balance("provider-A/pending") == 1_000
 
-    deployment = center.rebuild()
+    deployment = server.rebuild()
     try:
         rebuilt = deployment.service
         rebuilt_credential = rebuilt.authenticate_signed_request(
-            **_auth_kwargs(center.joined_private, joined.key_id), now=BASE
+            **_auth_kwargs(server.joined_private, joined.key_id), now=BASE
         )
         # The node link is re-established (its callback lived only in memory).
         rebuilt.register_node(
             credential=Credential(tenant_id="tenant-a", subject_id="node-A", role="node"),
             hello=_hello(),
-            enqueue=center.received.append,
+            enqueue=server.received.append,
             now=BASE,
         )
 
@@ -630,7 +630,7 @@ def test_receipt_ids_are_unique_across_a_restart(center: Center) -> None:
         replies = rebuilt.handle_node_message(
             node_id="node-A",
             envelope=_usage_event(
-                center.keyring,
+                server.keyring,
                 request_id="req-1",
                 attempt_id=stored.attempt_id,
                 epoch=stored.dispatch_epoch,
@@ -645,7 +645,7 @@ def test_receipt_ids_are_unique_across_a_restart(center: Center) -> None:
 
         # A new request settles on the NEXT leaf, with a new receipt id and a
         # receipt-hash chain link that names the previous receipt.
-        _offer2, _acceptance2, document2 = center.settle(
+        _offer2, _acceptance2, document2 = server.settle(
             rebuilt,
             rebuilt_credential,
             request_id="req-2",
@@ -669,14 +669,14 @@ def test_receipt_ids_are_unique_across_a_restart(center: Center) -> None:
 
 
 def test_the_old_receipt_is_served_with_a_verifiable_inclusion_proof(
-    center: Center,
+    server: Server,
 ) -> None:
     """The rebuilt log serves the old receipt's proof, and the proof folds home."""
-    center.connect()
-    joined = center.join("code-proof")
-    credential = center.authenticate(center.service, joined.key_id)
-    _offer, _acceptance, document = center.settle(
-        center.service,
+    server.connect()
+    joined = server.join("code-proof")
+    credential = server.authenticate(server.service, joined.key_id)
+    _offer, _acceptance, document = server.settle(
+        server.service,
         credential,
         request_id="req-1",
         messages=(user_message("first answer"),),
@@ -684,11 +684,11 @@ def test_the_old_receipt_is_served_with_a_verifiable_inclusion_proof(
     receipt_id = document["settlement"]["receipt_id"]
     receipt_hash = document["settlement"]["receipt_hash"]
 
-    deployment = center.rebuild()
+    deployment = server.rebuild()
     try:
         rebuilt = deployment.service
         rebuilt_credential = rebuilt.authenticate_signed_request(
-            **_auth_kwargs(center.joined_private, joined.key_id), now=BASE
+            **_auth_kwargs(server.joined_private, joined.key_id), now=BASE
         )
         served = rebuilt.receipt_for(
             credential=rebuilt_credential, receipt_id=receipt_id
@@ -724,16 +724,16 @@ def test_the_old_receipt_is_served_with_a_verifiable_inclusion_proof(
 # --------------------------------------------------------------------------
 
 
-def test_an_invited_identity_still_authenticates_after_a_restart(center: Center) -> None:
+def test_an_invited_identity_still_authenticates_after_a_restart(server: Server) -> None:
     """The ``identities`` table is replayed, so the join survives the restart."""
-    joined = center.join("code-d")
+    joined = server.join("code-d")
 
-    deployment = center.rebuild()
+    deployment = server.rebuild()
     try:
         rebuilt = deployment.service
         assert deployment.store.get_identity(joined.key_id) is not None
         credential = rebuilt.authenticate_signed_request(
-            **_auth_kwargs(center.joined_private, joined.key_id), now=BASE
+            **_auth_kwargs(server.joined_private, joined.key_id), now=BASE
         )
         assert credential == Credential(
             tenant_id=joined.tenant_id,
@@ -754,44 +754,44 @@ def test_an_invited_identity_still_authenticates_after_a_restart(center: Center)
 
 
 def test_an_in_flight_request_survives_and_is_reconciled_as_unknown(
-    center: Center,
+    server: Server,
 ) -> None:
     """An accepted, output-committed, un-reported attempt is durable and handled.
 
-    After the restart the center cannot finish the old settlement — the permit
+    After the restart the server cannot finish the old settlement — the permit
     and acceptance live only in memory (G01·f) — so it asks the node what
     happened and records the answer as unknown, never as zero.
     """
-    center.connect()
-    joined = center.join("code-e")
-    credential = center.authenticate(center.service, joined.key_id)
+    server.connect()
+    joined = server.join("code-e")
+    credential = server.authenticate(server.service, joined.key_id)
     # Drive req-1 to a full settlement, so the log, the provider account and a
     # receipt all exist before the restart.
-    center.settle(
-        center.service,
+    server.settle(
+        server.service,
         credential,
         request_id="req-1",
         messages=(user_message("first answer"),),
     )
 
     # Admit req-2 and stop after the output commit: no usage.final ever arrives.
-    offer = center.admit(
-        center.service,
+    offer = server.admit(
+        server.service,
         credential,
         request_id="req-2",
         messages=(user_message("in flight"),),
     )
-    acceptance = center.acceptance_hash(offer)
-    center.accept(center.service, offer, acceptance)
-    center.service.handle_node_message(
+    acceptance = server.acceptance_hash(offer)
+    server.accept(server.service, offer, acceptance)
+    server.service.handle_node_message(
         node_id="node-A", envelope=_delta(offer, 1, "partial"), now=BASE
     )
 
-    deployment = center.rebuild()
+    deployment = server.rebuild()
     try:
         rebuilt = deployment.service
         rebuilt_credential = rebuilt.authenticate_signed_request(
-            **_auth_kwargs(center.joined_private, joined.key_id), now=BASE
+            **_auth_kwargs(server.joined_private, joined.key_id), now=BASE
         )
 
         # The durable rows survive: attempt, output commit, readable status.
@@ -807,7 +807,7 @@ def test_an_in_flight_request_survives_and_is_reconciled_as_unknown(
 
         # G01·f: the offer terms and the node's acceptance are gone. A late
         # acceptance is refused rather than trusted against terms the rebuilt
-        # center can no longer recompute.
+        # server can no longer recompute.
         with pytest.raises(GatewayError, match="no permit context"):
             rebuilt.handle_node_message(
                 node_id="node-A", envelope=_accept(offer, acceptance), now=BASE
@@ -818,7 +818,7 @@ def test_an_in_flight_request_survives_and_is_reconciled_as_unknown(
             rebuilt.handle_node_message(
                 node_id="node-A",
                 envelope=_usage_event(
-                    center.keyring,
+                    server.keyring,
                     request_id="req-2",
                     attempt_id=offer.attempt_id,
                     epoch=offer.epoch,
@@ -834,12 +834,12 @@ def test_an_in_flight_request_survives_and_is_reconciled_as_unknown(
         assert deployment.store.get_settlement("req-2", 1) is None
         assert deployment.store.log_size() == 1
 
-        # Reconcile on the live path: the node reconnects, the center probes the
+        # Reconcile on the live path: the node reconnects, the server probes the
         # silent attempt, and the node answers "unknown".
         rebuilt.register_node(
             credential=Credential(tenant_id="tenant-a", subject_id="node-A", role="node"),
             hello=_hello(),
-            enqueue=center.received.append,
+            enqueue=server.received.append,
             now=BASE,
         )
         pairs = rebuilt.tick(now=QUIET)
@@ -882,8 +882,8 @@ def test_an_in_flight_request_survives_and_is_reconciled_as_unknown(
         deployment.store.close()
 
 
-def test_the_rebuilt_center_does_not_reuse_the_first_runs_memory_objects(
-    center: Center,
+def test_the_rebuilt_server_does_not_reuse_the_first_runs_memory_objects(
+    server: Server,
 ) -> None:
     """The rebuild is from durable state, so nothing in-memory is carried over.
 
@@ -891,13 +891,13 @@ def test_the_rebuilt_center_does_not_reuse_the_first_runs_memory_objects(
     service's ledger, log and settlement engine are all newly constructed, and a
     key that was only ever in the running registry is gone.
     """
-    center.connect()
-    joined = center.join("code-fresh")
-    center.authenticate(center.service, joined.key_id)
-    old_log_id = id(center.service.log)
-    old_engine_id = id(center.service.engine)
+    server.connect()
+    joined = server.join("code-fresh")
+    server.authenticate(server.service, joined.key_id)
+    old_log_id = id(server.service.log)
+    old_engine_id = id(server.service.engine)
 
-    deployment = center.rebuild()
+    deployment = server.rebuild()
     try:
         rebuilt = deployment.service
         assert id(rebuilt.log) != old_log_id
@@ -906,7 +906,7 @@ def test_the_rebuilt_center_does_not_reuse_the_first_runs_memory_objects(
         # the point: only in-memory state — the registry's copy aside from the
         # replay, the offer map, the node callbacks — is lost.
         rebuilt.authenticate_signed_request(
-            **_auth_kwargs(center.joined_private, joined.key_id), now=BASE
+            **_auth_kwargs(server.joined_private, joined.key_id), now=BASE
         )
     finally:
         deployment.store.close()

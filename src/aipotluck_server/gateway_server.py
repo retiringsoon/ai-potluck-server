@@ -1,6 +1,6 @@
-"""HTTP/SSE/WebSocket transport for the center gateway.
+"""HTTP/SSE/WebSocket transport for the server gateway.
 
-This module is the *transport half* of the center: it terminates HTTPS for
+This module is the *transport half* of the server: it terminates HTTPS for
 consumers, serves the consumer event stream over SSE, and accepts the single
 outbound WebSocket that each contribution node dials. It owns no domain
 decision. It never decides whether a request may run, how much it costs, or
@@ -132,7 +132,7 @@ from aipotluck.wire import (
 )
 
 from .errors import ApiKeyRateLimited, ApiKeyUnavailable, ModelUnavailable, QueueFull
-from .persistence import ApiKeyRecord, CenterStore, Credential, NodeRecord, StoredEvent
+from .persistence import ApiKeyRecord, Credential, NodeRecord, ServerStore, StoredEvent
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +197,7 @@ _SERVER_POLL_INTERVAL_S = 0.05
 _WS_POLICY_VIOLATION = 1008
 
 #: The close code a node link uses when its outbound queue overflows: the peer
-#: is asked to reconnect and resynchronise rather than slow the center down.
+#: is asked to reconnect and resynchronise rather than slow the server down.
 _WS_TRY_AGAIN_LATER = 1013
 
 _T = TypeVar("_T")
@@ -257,8 +257,8 @@ class GatewayServiceProtocol(Protocol):
     """
 
     @property
-    def store(self) -> CenterStore:
-        """The center's durable store, used here only to resolve credentials."""
+    def store(self) -> ServerStore:
+        """The server's durable store, used here only to resolve credentials."""
         ...
 
     @property
@@ -301,7 +301,7 @@ class GatewayServiceProtocol(Protocol):
 
         The second admission path: the spend is authorized by the platform's own
         signature over the terms it is admitting, because the caller proved it
-        holds a key the center issued rather than a signature it produced. The
+        holds a key the server issued rather than a signature it produced. The
         request it produces is otherwise indistinguishable from a signed one, and
         runs the same dispatch, metering and settlement.
         """
@@ -343,7 +343,7 @@ class GatewayServiceProtocol(Protocol):
         ...
 
     def node_attempts(self, *, credential: Credential) -> dict[str, Any]:
-        """Return the attempts the center dispatched to the calling node."""
+        """Return the attempts the server dispatched to the calling node."""
         ...
 
     def register_node(
@@ -377,7 +377,7 @@ class GatewayServiceProtocol(Protocol):
         invite_code: str,
         identity: dict[str, Any],
         device: dict[str, Any] | None,
-        center_url: str,
+        server_url: str,
         now: dt.datetime | None = ...,
     ) -> Any:
         """Redeem an invite and register the joiner's identity."""
@@ -417,7 +417,7 @@ _STATUS_BY_ERROR: tuple[tuple[type[PotluckError], int, str], ...] = (
     (SettlementError, 409, "conflict"),
     (InsufficientFundsError, 402, "insufficient_funds"),
     # `no_nodes` is the code the platform's own consumer client already maps to a
-    # "nothing can run this" refusal, so the center names the condition the way
+    # "nothing can run this" refusal, so the server names the condition the way
     # its client reads it rather than as a generic bad request.
     (ModelUnavailable, 404, "no_nodes"),
     (QueueFull, 503, "queue_full"),
@@ -475,9 +475,9 @@ _ROUTE_ROLES: dict[str, str] = {
 OPENAI_REQUEST_DEADLINE_MS = 1_800_000
 
 #: The wait window rides a little past the request's own deadline, so the
-#: center's deadline — which ends the request and records why — fires first and
+#: server's deadline — which ends the request and records why — fires first and
 #: the answer names a request the caller can still verify, instead of the
-#: transport giving up on work the center is still doing.
+#: transport giving up on work the server is still doing.
 OPENAI_WAIT_GRACE_FACTOR = 1.1
 OPENAI_WAIT_GRACE_S = 10.0
 
@@ -503,7 +503,7 @@ OPENAI_MODEL_OWNER = "ai-potluck"
 #: up, so the mapping is part of the contract rather than a presentation detail.
 #:
 #: Two values here are this platform's own, and `docs/openai-endpoint.md` says so:
-#: ``not_supported``, for an endpoint this center has decided not to implement —
+#: ``not_supported``, for an endpoint this server has decided not to implement —
 #: borrowing `invalid_request_error` would suggest a different request could
 #: succeed — and ``rate_limit_error`` for a per-key ceiling, where OpenAI's own
 #: rate-limit errors name the dimension exceeded (`requests`, `tokens`) rather
@@ -839,7 +839,7 @@ class _OpenAiChatRequest:
     unchanged; ``parameters`` is the subset of the body the platform has decided
     to forward, in the canonical-safe encoding the wire carries. Every other
     field is ignored rather than refused: a client that sends something this
-    center has no opinion about has not made a bad request, and a body it cannot
+    server has no opinion about has not made a bad request, and a body it cannot
     honour is not a body it should reject.
     """
 
@@ -883,7 +883,7 @@ class _OpenAiChatRequest:
             canonicalize(parameters)
         except CanonicalizationError as exc:
             raise ProtocolError(
-                f"the request carries a value this center cannot forward: {exc}"
+                f"the request carries a value this server cannot forward: {exc}"
             ) from exc
         return cls(
             model=_require_body_str(body, "model"),
@@ -921,7 +921,7 @@ class _OpenAiWaitResult:
     """How one OpenAI-compatible wait for a terminal state ended.
 
     The outcomes are kept apart because they answer differently: a request that
-    failed is a `502`, one the center is still running when the window closes is
+    failed is a `502`, one the server is still running when the window closes is
     a `504` naming the request to check later, a service that could not be read
     at all is a `502` carrying its own detail, and a caller that hung up is
     nobody's error and gets no answer at all.
@@ -935,7 +935,7 @@ class _OpenAiWaitResult:
     error: str | None
     #: The answer rendered so far, complete only for a terminal success.
     content: str = ""
-    #: The center's own reason for a terminal state, when it recorded one.
+    #: The server's own reason for a terminal state, when it recorded one.
     billing_note: str | None = None
     #: Whether the caller hung up before the answer was rendered.
     abandoned: bool = False
@@ -950,7 +950,7 @@ def _openai_unfinished_message(
     """Explain a request this connection stopped waiting for.
 
     The request id is the point of the message: the work may still be running,
-    it is charged only if it settles, and the id is what the center's own books,
+    it is charged only if it settles, and the id is what the server's own books,
     and an operator's `verify receipt`, answer against.
     """
     state = "did not reach a terminal state" if status is None else f"ended as {status}"
@@ -958,22 +958,22 @@ def _openai_unfinished_message(
     return (
         f"request {request_id} {state} within "
         f"{int(wait_deadline_s)}s{note}; it may still be running and is "
-        "charged only if it settles. Quote this request id to the center's "
+        "charged only if it settles. Quote this request id to the server's "
         "operator, who can verify what it cost with `potluck-server verify "
         "receipt`."
     )
 
 
 def _openai_failed_message(billing_note: str | None, request_id: str) -> str:
-    """Explain a request the center ended in failure.
+    """Explain a request the server ended in failure.
 
-    The center's own `billing_note` is carried through rather than replaced by a
-    generic "upstream failure": the reason a request failed lives at the center,
+    The server's own `billing_note` is carried through rather than replaced by a
+    generic "upstream failure": the reason a request failed lives at the server,
     and hiding it is what makes an exhausted upstream quota look like an outage.
     """
     note = f": {billing_note}" if billing_note else ""
     return (
-        f"the center reported request {request_id} as FAILED{note}. Nothing was "
+        f"the server reported request {request_id} as FAILED{note}. Nothing was "
         "charged for a request that produced no answer; the receipt for one that "
         "did is verifiable by this request id."
     )
@@ -1018,7 +1018,7 @@ def _openai_completion_document(
 ) -> dict[str, Any]:
     """Render one ``chat.completion`` document.
 
-    `finish_reason` is ``stop`` because this answer is complete: the center only
+    `finish_reason` is ``stop`` because this answer is complete: the server only
     renders a completion for a request that reached its terminal success, and a
     request that was cut short is an error rather than a short answer.
     """
@@ -1058,7 +1058,7 @@ def _measurement_split(payload: dict[str, Any]) -> dict[str, int] | None:
 
 
 def _settled_tokens(status: dict[str, Any]) -> int | None:
-    """Return the token total the center billed for the request's winning attempt."""
+    """Return the token total the server billed for the request's winning attempt."""
     selected = status.get("selected_attempt_id")
     attempts = status.get("attempts")
     if not isinstance(attempts, list):
@@ -1074,7 +1074,7 @@ def _settled_tokens(status: dict[str, Any]) -> int | None:
 def _openai_usage(status: dict[str, Any], split: dict[str, int] | None) -> dict[str, int]:
     """Render the settlement's token counts as an OpenAI ``usage`` block.
 
-    ``total_tokens`` is what the center actually billed — the settled total on
+    ``total_tokens`` is what the server actually billed — the settled total on
     the winning attempt's own row — rather than a sum of the two halves, so the
     number a caller reads is the number the receipt behind it names. The split
     comes from the node's final measurement, and stays zero when it reported
@@ -1098,7 +1098,7 @@ def _openai_model_documents(records: list[NodeRecord]) -> dict[str, dict[str, An
     a client picks a model from, and advertising one nobody will run turns a
     typo into a request that waits for its deadline.
 
-    ``created`` is the instant the pool last advertised the model. The center
+    ``created`` is the instant the pool last advertised the model. The server
     holds no model registration date, and a real timestamp it does have is more
     useful than a zero that only looks like one.
     """
@@ -2010,7 +2010,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 invite_code=invite_code,
                 identity=identity,
                 device=device,
-                center_url=self._gw.url,
+                server_url=self._gw.url,
             )
         )
         if result is None:
@@ -2156,7 +2156,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
 
         The service contract has no node-listing method, so the operations view
         reads the registrations the service itself maintains through
-        `CenterStore.connected_nodes`. The credential is still required: this is
+        `ServerStore.connected_nodes`. The credential is still required: this is
         an authenticated view, not a public one.
         """
         del credential
@@ -2677,7 +2677,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         """Send an error in OpenAI's shape, or close if a response has started.
 
         The `request_id` rides along in the body *and* in an ``x-request-id``
-        header whenever the center has one, because the two answers a caller
+        header whenever the server has one, because the two answers a caller
         cannot act on are "it failed" and "it might still be running": a request
         that outlived this connection is still on the books, still settleable,
         and still verifiable by the id printed here.
@@ -2686,7 +2686,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             status: The HTTP status to answer with.
             code: The machine-readable code, mapped to OpenAI's `type`.
             message: Explanation, redacted against the presented key.
-            request_id: The center's request id, when one exists.
+            request_id: The server's request id, when one exists.
             headers: Extra response headers.
         """
         if self._answered:
@@ -2736,7 +2736,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             The key record, or `None` after a `401` has been sent. One answer
             covers a missing header, another scheme, an unknown key, a revoked
             key, an expired one and one whose subject was revoked: the response
-            cannot be used to probe which keys the center has issued.
+            cannot be used to probe which keys the server has issued.
         """
         token = _bearer_token(self.headers.get("Authorization"))
         if token is None:
@@ -2817,7 +2817,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
     def _handle_openai_unsupported(self, endpoint: str) -> None:
         """Answer `404` for an OpenAI endpoint this platform does not implement.
 
-        Named rather than left unrouted: a tool pointed at this center and asking
+        Named rather than left unrouted: a tool pointed at this server and asking
         for embeddings is told that the platform serves chat completions and the
         model list, instead of reading a generic `404` as a wrong base URL and
         retrying every path it can think of.
@@ -2837,7 +2837,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         self._openai_fail(
             404,
             "not_supported",
-            f"this center does not implement /openai/v1/{endpoint}; it serves "
+            f"this server does not implement /openai/v1/{endpoint}; it serves "
             "POST /openai/v1/chat/completions and GET /openai/v1/models",
         )
         self._log_openai_request(
@@ -2852,7 +2852,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
     def _handle_openai_models(self, model_id: str | None) -> None:
         """Serve ``GET /openai/v1/models`` and ``GET /openai/v1/models/{id}``.
 
-        The list is aggregated from the registrations the center actually holds,
+        The list is aggregated from the registrations the server actually holds,
         so it names what the pool can run right now rather than a catalogue
         somebody maintained. That is also why an unknown id is a `404` naming the
         models that do exist: a client that picks from this list and a client that
@@ -2883,7 +2883,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                     404,
                     "model_not_found",
                     f"no connected contribution node runs model {model_id!r}; the "
-                    f"models this center can serve are {sorted(models)}",
+                    f"models this server can serve are {sorted(models)}",
                 )
                 self._log_openai_request(
                     endpoint="openai_models",
@@ -2921,7 +2921,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
 
         One admitted request, rendered either as a single ``chat.completion`` or
         as an SSE stream of ``chat.completion.chunk`` frames. The two differ only
-        in how the same stored events are handed back: both wait for the center's
+        in how the same stored events are handed back: both wait for the server's
         own terminal state inside the derived wait window, and both report the
         settled token counts, so a caller cannot get a different bill for asking
         for a stream.
@@ -3060,7 +3060,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         """Emit the one structured line this request is represented by.
 
         A single canonical JSON document per request, so an operator can grep a
-        center's log for one key, one subject or one model and read the token
+        server's log for one key, one subject or one model and read the token
         counts and the outcome without reconstructing them from the books. The
         key is named by its id and never by its value: the plaintext is
         credential material, and a log is exactly where such material must not
@@ -3106,10 +3106,10 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
     ) -> _OpenAiWaitResult:
         """Poll one request to a terminal state, rendering increments as they commit.
 
-        The center's event store is the source of truth and the cursor is tracked
+        The server's event store is the source of truth and the cursor is tracked
         here, so an increment is rendered exactly once however many polls it takes
         to notice it, and a request that produced its whole answer before the
-        first poll is rendered exactly once too. Only events the center committed
+        first poll is rendered exactly once too. Only events the server committed
         as this request's output are read: a superseded attempt's deltas are
         refused at commit time, so nothing here can splice two answers.
 
@@ -3215,7 +3215,7 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
     ) -> None:
         """Answer with one ``chat.completion`` once the request is terminal.
 
-        The whole answer is held until the center reports it complete, which is
+        The whole answer is held until the server reports it complete, which is
         what `stream: false` promises: calling this streaming would be a lie
         about how the answer was delivered.
 
@@ -3416,7 +3416,7 @@ class _Tuning:
 
 
 class GatewayServer:
-    """The center's HTTP, SSE and WebSocket front door.
+    """The server's HTTP, SSE and WebSocket front door.
 
     Construct it with the domain service, start it, and it holds the port; it
     owns no domain decision of its own. `stop` is the one method that must be

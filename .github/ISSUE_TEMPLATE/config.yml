@@ -2,7 +2,7 @@ blank_issues_enabled: false
 contact_links:
   - name: Questions & ideas
     url: https://github.com/retiringsoon/ai-potluck-server/discussions
-    about: Ask anything before filing an issue — center operators are especially welcome
+    about: Ask anything before filing an issue — server operators are especially welcome
   - name: Roadmap discussion
     url: https://github.com/retiringsoon/ai-potluck/discussions/categories/roadmap
     about: Weigh in on what ships next (the roadmap lives in the client repo, docs/ROADMAP.md)

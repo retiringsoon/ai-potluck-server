@@ -6,7 +6,7 @@ apply to agents too.
 
 ## What this repo is
 
-ai-potluck-server is the center of an AI potluck network: one process over
+ai-potluck-server is the server of an AI potluck network: one process over
 one embedded SQLite database, running the HTTP/WebSocket/SSE gateway, the
 settlement books (ledger, transparency log, receipts), and the operator CLI
 `potluck-server`. It routes, meters, and settles — it never sees an upstream
@@ -18,23 +18,23 @@ Dependency direction is one-way: **verification primitives (canonical JSON,
 Ed25519 signing, metering, ledger replay, transparency proofs) live in the
 client package; the accounting gateway here depends on `aipotluck` and imports
 those primitives to keep its own books**, so a client can verify a receipt
-without trusting the center. Never make the client import from this package.
+without trusting the server. Never make the client import from this package.
 
 ## Layout map (`src/aipotluck_server/`)
 
 | Module | Purpose |
 | --- | --- |
-| `gateway_service.py` | Center domain logic: admission, dispatch, events, settlement — touches no socket and no disk directly |
+| `gateway_service.py` | Server domain logic: admission, dispatch, events, settlement — touches no socket and no disk directly |
 | `gateway_server.py` | Transport half: terminates HTTPS/SSE for consumers and WSS for contribution nodes |
-| `persistence.py` | Durable center store; keeps the whole world replayable (attempt winners, books, checkpoints) |
-| `deploy.py` | `center.json` schema, provisioning, and inspection |
-| `reconcile.py` | Operator-side reconciliation: read the center's own books |
+| `persistence.py` | Durable server store; keeps the whole world replayable (attempt winners, books, checkpoints) |
+| `deploy.py` | `server.json` schema, provisioning, and inspection |
+| `reconcile.py` | Operator-side reconciliation: read the server's own books |
 | `cli.py` | `potluck-server` entry point (`serve`, `admin`, `verify`); `__main__.py` mirrors it |
 
-Also: `tests/` (center suite + cross-package integration paths),
+Also: `tests/` (server suite + cross-package integration paths),
 `scripts/release_gate.sh` (end-to-end install-and-run gate for both packages).
 Operator deployment docs live in the client repo:
-[center-deployment.md](https://github.com/retiringsoon/ai-potluck/blob/dev/docs/center-deployment.md).
+[server-deployment.md](https://github.com/retiringsoon/ai-potluck/blob/dev/docs/server-deployment.md).
 
 ## Build / test / verify
 
@@ -56,7 +56,7 @@ sibling client checkout to be clean, so run it against committed work.
 
 1. **Signing semantics.** Ed25519 domain separation and canonical JSON
    (RFC 8785) — defined in the client package, consumed here — are the trust
-   root. The center must never fork, re-implement, or reinterpret them; if
+   root. The server must never fork, re-implement, or reinterpret them; if
    they need to change, that is a protocol change in ai-potluck first.
 2. **The books are the product.** Metering, settlement, the ledger, and the
    transparency log: any change must ship behavior-level tests (observable
@@ -64,7 +64,7 @@ sibling client checkout to be clean, so run it against committed work.
    not implementation details). Restart and interruption paths must stay
    neither-double-charged nor silently-free.
 3. **Fail loud.** Config loading and initialization must never swallow
-   errors: reject unknown `center.json` keys, raise on missing required
+   errors: reject unknown `server.json` keys, raise on missing required
    fields, and never paper over problems with `config.get(key, default)`. A
    wrong config must fail at startup with an actionable message, not
    misbehave at runtime.

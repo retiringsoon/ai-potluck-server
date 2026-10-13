@@ -1,11 +1,11 @@
-"""Center-side failures the shared protocol hierarchy does not name.
+"""Server-side failures the shared protocol hierarchy does not name.
 
 `aipotluck.errors` owns the vocabulary both packages speak — a signature that
 does not verify, an account that cannot cover a charge, a record that conflicts
-— and every failure the center raises is one of those, so a caller can handle
+— and every failure the server raises is one of those, so a caller can handle
 the platform's answers without knowing which package raised them.
 
-Two conditions belong to the center alone, because they exist only on the
+Two conditions belong to the server alone, because they exist only on the
 admission path that authenticates a caller with an operator-issued API key
 rather than with a signature it produced. They live here rather than in the
 domain module so the transport can map them to a status without importing the
@@ -33,9 +33,9 @@ class ApiKeyUnavailable(PotluckError):
 class ApiKeyRateLimited(PotluckError):
     """Raised when an API key exceeds its concurrency ceiling or request rate.
 
-    The endpoint is shared by every key the center has issued, so one key — a
+    The endpoint is shared by every key the server has issued, so one key — a
     leaked one, or a client stuck in a retry loop — must not be able to occupy
-    the center's dispatch or drown out the subjects sharing it. Distinct from an
+    the server's dispatch or drown out the subjects sharing it. Distinct from an
     exhausted quota, which is about money rather than about load.
     """
 
@@ -49,7 +49,7 @@ class ModelUnavailable(PotluckError):
     own consumer client refuses the same way, before it creates a request it
     knows cannot start.
 
-    This is the *model* refusal and not the *capacity* one. A center that serves
+    This is the *model* refusal and not the *capacity* one. A server that serves
     the model but has nothing free this instant does not raise it: that request
     waits in the dispatch queue, because a busy pool is a condition that ends and
     an unserved model is not.
@@ -57,11 +57,11 @@ class ModelUnavailable(PotluckError):
 
 
 class QueueFull(PotluckError):
-    """Raised when the center's dispatch queue is already at its bound.
+    """Raised when the server's dispatch queue is already at its bound.
 
     The queue exists so a request that nothing can dispatch this instant waits
     instead of being refused; the bound exists so waiting cannot grow without
-    limit. This is the answer when the two meet: the center is holding as much
+    limit. This is the answer when the two meet: the server is holding as much
     unfinished work as its operator agreed it would hold, so the honest response
     is "retry later" rather than a promise it cannot keep.
 

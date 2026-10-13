@@ -1,7 +1,7 @@
-"""Two-sided reconciliation, operator side: read the center's own books.
+"""Two-sided reconciliation, operator side: read the server's own books.
 
 The platform's trust claim is that nobody can quietly rewrite history, because
-each party keeps its own record of the same event. The center holds receipts,
+each party keeps its own record of the same event. The server holds receipts,
 settlements, ledger journals and a Merkle transparency log; any one of those
 can be lost or edited on its own. Making the disagreement *visible* is what
 this module does. It never freezes an account, never writes a row, and never
@@ -10,19 +10,19 @@ person decides what to do.
 
 Two views live here, both the operator's:
 
-`verify_receipt_at_center`
+`verify_receipt_at_server`
     One receipt through `aipotluck.verify.verify_offline`'s five dimensions,
-    read from the center's own store, which is the only view that holds the
+    read from the server's own store, which is the only view that holds the
     signed usage report, so every dimension is assessable.
 
-`reconcile_center`
+`reconcile_server`
     Every invariant tying ``attempts``, ``settlements``, ``receipts``,
     ``log_leaves`` and the ledger replay log together, checked in both
     directions, because a record that points at a missing neighbour and a
     neighbour that points at a missing record are different defects with
     different culprits.
 
-The consumer and contributor views (`verify_receipt_from_center`,
+The consumer and contributor views (`verify_receipt_from_server`,
 `reconcile_node`) and the shared verdict shapes (`Difference`,
 `ReceiptVerification`) live in :mod:`aipotluck.reconcile` in the client
 package; this module imports them, so one spelling of a verdict covers both
@@ -30,7 +30,7 @@ sides.
 
 Every function here is read-only. Nothing opens a write transaction; callers
 pass in stores they opened themselves and close them. A caller reading
-somebody else's database opens it with `CenterStore.open_existing`, so a path
+somebody else's database opens it with `ServerStore.open_existing`, so a path
 that names nothing is refused rather than created: an empty database holds no
 rows, and no rows report no differences.
 """
@@ -54,22 +54,22 @@ from aipotluck.verify import VerificationInput, verify_offline
 from .gateway_service import derive_allocation_contract
 from .persistence import (
     AttemptRecord,
-    CenterStore,
     LogLeafRecord,
     ReceiptRecord,
     RequestRecord,
+    ServerStore,
     SettlementRecord,
 )
 
 # --------------------------------------------------------------------------
-# Receipt verification, operator side: read the center's own store
+# Receipt verification, operator side: read the server's own store
 # --------------------------------------------------------------------------
 
 
-def verify_receipt_at_center(
-    *, store: CenterStore, registry: IdentityRegistry, receipt_id: str
+def verify_receipt_at_server(
+    *, store: ServerStore, registry: IdentityRegistry, receipt_id: str
 ) -> ReceiptVerification:
-    """Verify one receipt against the center store that issued it.
+    """Verify one receipt against the server store that issued it.
 
     Everything the five dimensions need is re-derived from durable rows rather
     than taken from an in-memory book: the log is rebuilt from ``log_leaves``,
@@ -85,7 +85,7 @@ def verify_receipt_at_center(
     what a consumer holding an older checkpoint is for.
 
     Args:
-        store: The center's store, opened read-only by the caller.
+        store: The server's store, opened read-only by the caller.
         registry: The trusted keys, holding at least the settlement key and any
             device key whose usage report is checked here.
         receipt_id: The receipt to verify.
@@ -99,9 +99,9 @@ def verify_receipt_at_center(
     if stored is None:
         return ReceiptVerification(
             receipt_id=receipt_id,
-            source="center-store",
+            source="server-store",
             findings=(
-                f"receipt {receipt_id} is not in the center's receipts table, so the "
+                f"receipt {receipt_id} is not in the server's receipts table, so the "
                 "charge it would have proved has no record here",
             ),
         )
@@ -109,7 +109,7 @@ def verify_receipt_at_center(
     record = _stored_receipt_record(stored, findings)
     if record is None:
         return ReceiptVerification(
-            receipt_id=receipt_id, source="center-store", findings=tuple(findings)
+            receipt_id=receipt_id, source="server-store", findings=tuple(findings)
         )
     if record.hash != stored.receipt_hash:
         findings.append(
@@ -162,14 +162,14 @@ def verify_receipt_at_center(
             inclusion_proofs={} if proof is None else {record.hash: proof},
             leaf_bytes={} if leaf_bytes is None else {record.hash: leaf_bytes},
             trusted_root=log.root() if log is not None and log.size() else None,
-            # The center side promises exactly one receipt: the one named. The
-            # whole-account cross-check is `reconcile_center`, which sees every
+            # The server side promises exactly one receipt: the one named. The
+            # whole-account cross-check is `reconcile_server`, which sees every
             # receipt at once; repeating it here would only restate it.
             expected_receipt_ids=(receipt_id,),
         )
     )
     return ReceiptVerification(
-        receipt_id=receipt_id, source="center-store", report=report, findings=tuple(findings)
+        receipt_id=receipt_id, source="server-store", report=report, findings=tuple(findings)
     )
 
 
@@ -214,7 +214,7 @@ def _log_from_leaves(leaves: Sequence[LogLeafRecord]) -> tuple[MerkleLog | None,
     the stored ones. When they do not — a lost, duplicated or re-indexed leaf —
     this returns no log at all rather than a compacted one. Compacting would fold
     the surviving leaves into a shorter tree and then serve a proof over it, and
-    that proof would vouch for a history the center is not actually serving:
+    that proof would vouch for a history the server is not actually serving:
     exactly what `GatewayService._rebuild_log` refuses to do for the same reason.
     Returning nothing makes `ledger_included` fail on the receipt whose leaf is
     missing, which names the loss instead of hiding it behind a valid-looking
@@ -268,7 +268,7 @@ def _proof_at(
 
 
 
-def _winner_attempt(store: CenterStore, record: SignedRecord) -> AttemptRecord | None:
+def _winner_attempt(store: ServerStore, record: SignedRecord) -> AttemptRecord | None:
     """Return the attempt a receipt names as its winner, if the store holds it."""
     attempt_id = record.payload.get("winner_attempt_id")
     if not isinstance(attempt_id, str) or not attempt_id:
@@ -276,11 +276,11 @@ def _winner_attempt(store: CenterStore, record: SignedRecord) -> AttemptRecord |
     return store.get_attempt(attempt_id)
 
 
-def _journal_for_receipt(store: CenterStore, record: SignedRecord) -> Journal | None:
+def _journal_for_receipt(store: ServerStore, record: SignedRecord) -> Journal | None:
     """Return the ledger journal a receipt names, replayed from the store's log.
 
     Args:
-        store: The center's store.
+        store: The server's store.
         record: The receipt's signed record, whose payload names the journal.
 
     Returns:
@@ -329,17 +329,17 @@ def _journal_from_payload(payload: Mapping[str, Any]) -> Journal | None:
 
 
 def _usage_reports_for(
-    store: CenterStore, record: SignedRecord, winner: AttemptRecord | None
+    store: ServerStore, record: SignedRecord, winner: AttemptRecord | None
 ) -> tuple[SignedRecord, ...]:
-    """Return the signed usage reports the center stored for a receipt's attempt.
+    """Return the signed usage reports the server stored for a receipt's attempt.
 
     The report is what makes `metering_provenance` assessable at all, and the
-    center keeps it in the ``events`` table because settlement refuses an
+    server keeps it in the ``events`` table because settlement refuses an
     unsigned total. Reading it back is what lets an operator see the evidence
     level a receipt actually rests on rather than the level somebody claims.
 
     Args:
-        store: The center's store.
+        store: The server's store.
         record: The receipt's signed record.
         winner: The winning attempt, or `None` when the store no longer holds it.
 
@@ -387,16 +387,16 @@ def _unsigned_placeholder(body: Mapping[str, Any]) -> SignedRecord:
     )
 
 
-def _authorizations_for(store: CenterStore, record: SignedRecord) -> tuple[SignedRecord, ...]:
+def _authorizations_for(store: ServerStore, record: SignedRecord) -> tuple[SignedRecord, ...]:
     """Return the signed spend authorization behind a receipt's request.
 
     Args:
-        store: The center's store.
+        store: The server's store.
         record: The receipt's signed record.
 
     Returns:
         The authorization, or an empty tuple when the request's stored dispatch
-        inputs are gone — which `reconcile_center` reports separately.
+        inputs are gone — which `reconcile_server` reports separately.
     """
     request_id = record.payload.get("request_id")
     if not isinstance(request_id, str) or not request_id:
@@ -415,12 +415,12 @@ def _authorizations_for(store: CenterStore, record: SignedRecord) -> tuple[Signe
 
 
 # --------------------------------------------------------------------------
-# Center-side reconciliation: invariants across the store's own tables
+# Server-side reconciliation: invariants across the store's own tables
 # --------------------------------------------------------------------------
 
 
-def reconcile_center(*, store: CenterStore) -> list[Difference]:
-    """Cross-check every durable invariant a center's tables assert about each other.
+def reconcile_server(*, store: ServerStore) -> list[Difference]:
+    """Cross-check every durable invariant a server's tables assert about each other.
 
     This is the operator's inspection pass, and it reads only the store: no
     service, no in-memory book, no network. Each check runs in both directions
@@ -438,7 +438,7 @@ def reconcile_center(*, store: CenterStore) -> list[Difference]:
     with nothing to show for it.
 
     Args:
-        store: The center's store, opened read-only by the caller.
+        store: The server's store, opened read-only by the caller.
 
     Returns:
         The differences, ordered so the same database renders the same report.
@@ -460,7 +460,7 @@ def reconcile_center(*, store: CenterStore) -> list[Difference]:
     return sorted(differences, key=lambda item: (item.subject, item.kind))
 
 
-def _replayed_journals(store: CenterStore) -> dict[str, Journal]:
+def _replayed_journals(store: ServerStore) -> dict[str, Journal]:
     """Return every journal in the ledger replay log, keyed by journal id."""
     journals: dict[str, Journal] = {}
     for _seq, kind, payload in store.ledger_events():
@@ -485,7 +485,7 @@ def _settlement_by_unit(settlements: Sequence[SettlementRecord]) -> dict[str, Se
 def _check_settled_attempts(
     attempts: Sequence[AttemptRecord], settlements: Sequence[SettlementRecord]
 ) -> list[Difference]:
-    """Report an attempt the center marked settled with no settlement behind it."""
+    """Report an attempt the server marked settled with no settlement behind it."""
     differences: list[Difference] = []
     by_unit = _settlement_by_unit(settlements)
     for attempt in attempts:
@@ -566,7 +566,7 @@ def _check_receipts(
     leaves: Sequence[LogLeafRecord],
     requests: Mapping[str, RequestRecord],
     journals: Mapping[str, Journal],
-    store: CenterStore,
+    store: ServerStore,
 ) -> list[Difference]:
     """Report everything a receipt must have behind it, and every way it can lie."""
     differences: list[Difference] = []
@@ -660,7 +660,7 @@ def _check_receipts(
 
 
 def _check_receipt_payload(
-    stored: ReceiptRecord, journals: Mapping[str, Journal], store: CenterStore
+    stored: ReceiptRecord, journals: Mapping[str, Journal], store: ServerStore
 ) -> list[Difference]:
     """Report a receipt whose body disagrees with its hash, its attempt or its journal.
 

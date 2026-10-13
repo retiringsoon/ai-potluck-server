@@ -6,7 +6,7 @@ What each test pins, and why:
   resumable state: the wizard's secrets arrive later, from a file or the
   environment, never a command line (a value on ``ps`` is not a secret).
 * The invite path must need **no token anybody copies**. ``join --node``
-  receives the node's platform credential from the center and saves it 0600;
+  receives the node's platform credential from the server and saves it 0600;
   the wizard reads it back. An operator-provisioned token still overrides it,
   and losing it fails with the recovery path named rather than a dead prompt.
 * The shipped defaults must agree with each other, or the first request of an
@@ -18,7 +18,7 @@ What each test pins, and why:
   exists behind an explicit flag *and* a confirmation; a non-interactive
   refusal must have sent nothing.
 * ``share pause``/``resume`` must reach a **running** node through its config
-  file: the center stops offering, an in-flight task finishes normally, and
+  file: the server stops offering, an in-flight task finishes normally, and
   resume re-accepts without a restart. The negative path (a malformed config
   file) must keep the last good policy rather than silently pausing or
   unpausing a node.
@@ -56,7 +56,7 @@ from conftest import Keyring, signed_authorization
 
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore
+from aipotluck_server.persistence import ServerStore
 
 BASE = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
 REGISTERED_AT = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
@@ -193,17 +193,17 @@ class _RecordingUpstream:
         self.thread.join(timeout=5)
 
 
-class _Center:
+class _Server:
     """A real gateway with a consumer invite, a node invite and funded accounts."""
 
     def __init__(self, tmp_path: Path, keyring: Keyring, *, quota: int = 100_000) -> None:
         self.tmp_path = tmp_path
         self.keyring = keyring
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
@@ -244,16 +244,16 @@ class _Center:
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> Any:
-    """Provide a real center, torn down afterwards."""
+def server(tmp_path: Path) -> Any:
+    """Provide a real server, torn down afterwards."""
     keyring = Keyring()
-    harness = _Center(tmp_path, keyring)
+    harness = _Server(tmp_path, keyring)
     yield harness
     harness.stop()
 
 
 def _join_node_stopped(
-    center: _Center, identity: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, identity: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Run `join --node --no-setup` with the secrets held in the environment."""
     monkeypatch.setenv(UPSTREAM_KEY_ENV_NAME, UPSTREAM_KEY)
@@ -262,8 +262,8 @@ def _join_node_stopped(
         main(
             [
                 "join",
-                "--center",
-                center.url,
+                "--server",
+                server.url,
                 "--invite",
                 "invite-node-wizard",
                 "--node",
@@ -282,15 +282,15 @@ def _join_node_stopped(
 
 
 def test_join_node_derives_the_identity_and_stops_at_a_resumable_state(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The node identity is derived by the center; the wizard can resume later."""
+    """The node identity is derived by the server; the wizard can resume later."""
     identity = tmp_path / "node-identity"
     out = _Recorder()
     err = _Recorder()
     monkeypatch.setattr("sys.stdout", out)
     monkeypatch.setattr("sys.stderr", err)
-    _join_node_stopped(center, identity, monkeypatch)
+    _join_node_stopped(server, identity, monkeypatch)
 
     config = json.loads((identity / "config.json").read_text(encoding="utf-8"))
     assert config["role"] == "node"
@@ -341,11 +341,11 @@ def _run_share_setup(
 
 
 def test_wizard_writes_a_conservative_0600_config_and_reports_the_failed_upstream(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A dead upstream fails the self-check with a remedy; config is still safe."""
     identity = tmp_path / "node-identity"
-    _join_node_stopped(center, identity, monkeypatch)
+    _join_node_stopped(server, identity, monkeypatch)
 
     out = _Recorder()
     err = _Recorder()
@@ -381,12 +381,12 @@ def test_wizard_writes_a_conservative_0600_config_and_reports_the_failed_upstrea
         assert secret not in err.text()
 
 
-def test_wizard_self_check_passes_when_upstream_and_center_are_reachable(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_wizard_self_check_passes_when_upstream_and_server_are_reachable(
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With a reachable upstream, all three checks pass and the CLI says so."""
     identity = tmp_path / "node-identity"
-    _join_node_stopped(center, identity, monkeypatch)
+    _join_node_stopped(server, identity, monkeypatch)
     hold = _TcpHold()
     try:
         monkeypatch.setenv(UPSTREAM_KEY_ENV_NAME, UPSTREAM_KEY)
@@ -418,16 +418,16 @@ def test_wizard_self_check_passes_when_upstream_and_center_are_reachable(
     assert (
         "TCP only, no credential sent" in out.text()
     ), "the TCP check must say it is credential-free"
-    assert "center reachable" in out.text()
+    assert "server reachable" in out.text()
     assert "[step 3] ready" in out.text()
 
 
 def test_default_self_check_sends_nothing_and_live_probe_needs_confirmation(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The default check is credential-free; the live probe is gated twice."""
     identity = tmp_path / "node-identity"
-    _join_node_stopped(center, identity, monkeypatch)
+    _join_node_stopped(server, identity, monkeypatch)
     upstream = _RecordingUpstream()
     try:
         # Default: TCP-only. Nothing billable, nothing credential-bearing.
@@ -498,11 +498,11 @@ def test_default_self_check_sends_nothing_and_live_probe_needs_confirmation(
 
 
 def test_share_status_pause_and_resume_flip_the_switch_redacted(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """pause/resume edit node.json only, and status never prints a secret."""
     identity = tmp_path / "node-identity"
-    _join_node_stopped(center, identity, monkeypatch)
+    _join_node_stopped(server, identity, monkeypatch)
     upstream = _RecordingUpstream()
     try:
         monkeypatch.setenv(UPSTREAM_KEY_ENV_NAME, UPSTREAM_KEY)
@@ -579,17 +579,17 @@ def test_share_pause_without_a_config_explains_what_to_run(
 # --------------------------------------------------------------------------
 
 
-class _Centered:
+class _Harness:
     """The e2e harness: a funded consumer, a node credential, real HTTP."""
 
     def __init__(self, tmp_path: Path, keyring: Keyring) -> None:
         self.keyring = keyring
         self.tmp_path = tmp_path
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=keyring.private_b64["settlement-key-1"],
@@ -712,12 +712,12 @@ class _GatedAdapter(FakeUpstreamAdapter):
 
 
 def _wait_until_share_registered(
-    center: _Centered, *, enabled: bool, what: str
+    server: _Harness, *, enabled: bool, what: str
 ) -> None:
-    """Wait until the center's node record advertises the given share state."""
+    """Wait until the server's node record advertises the given share state."""
     _wait_until(
         lambda: (
-            (record := center.store.get_node("node-A")) is not None
+            (record := server.store.get_node("node-A")) is not None
             and record.connected
             and record.share_enabled is enabled
         ),
@@ -728,7 +728,7 @@ def _wait_until_share_registered(
 def test_pause_reaches_a_running_node_without_a_restart(tmp_path: Path) -> None:
     """pause stops new offers, the in-flight task finishes, resume re-accepts."""
     keyring = Keyring()
-    center = _Centered(tmp_path, keyring)
+    server = _Harness(tmp_path, keyring)
     node_json = tmp_path / "node.json"
     node_json.write_text(
         json.dumps(
@@ -755,7 +755,7 @@ def test_pause_reaches_a_running_node_without_a_restart(tmp_path: Path) -> None:
     )
     adapter = _GatedAdapter(upstream=upstream, model=MODEL)
     config = ConnectorConfig(
-        center_url=f"ws://127.0.0.1:{center.port}/v1/node-link",
+        server_url=f"ws://127.0.0.1:{server.port}/v1/node-link",
         node_id="node-A",
         device_id="device-A",
         device_key_id="device-key-A",
@@ -777,50 +777,50 @@ def test_pause_reaches_a_running_node_without_a_restart(tmp_path: Path) -> None:
     thread.start()
     try:
         _wait_until(
-            lambda: bool(center.store.connected_nodes()), what="the node to register"
+            lambda: bool(server.store.connected_nodes()), what="the node to register"
         )
 
         # 1. An in-flight task is executing when the pause lands.
-        document = center.admit("R-wiz-1", "idem-wiz-1")
+        document = server.admit("R-wiz-1", "idem-wiz-1")
         request_id = document["request_id"]
         _wait_until(lambda: adapter.entered.is_set(), what="the upstream call to start")
         assert (
             main(["share", "pause", "--config", str(node_json)]) == 0
         ), "share pause failed"
 
-        # The pause reaches the center through the polled file, not a restart:
+        # The pause reaches the server through the polled file, not a restart:
         # the node stays connected the whole time.
-        _wait_until_share_registered(center, enabled=False, what="the pause to register")
+        _wait_until_share_registered(server, enabled=False, what="the pause to register")
 
         # 2. The in-flight task finishes normally and settles.
         adapter.gate.set()
         _wait_until(
-            lambda: center.status_of(request_id).get("settlement") is not None,
+            lambda: server.status_of(request_id).get("settlement") is not None,
             what="the in-flight request to settle despite the pause",
         )
-        assert center.status_of(request_id)["status"] == "SUCCEEDED"
+        assert server.status_of(request_id)["status"] == "SUCCEEDED"
         assert upstream.call_count == 1
 
         # 3. No new work while paused.
-        document = center.admit("R-wiz-2", "idem-wiz-2")
+        document = server.admit("R-wiz-2", "idem-wiz-2")
         paused_id = document["request_id"]
         _assert_absent_for(
-            lambda: center.store.attempts_for_request(paused_id),
+            lambda: server.store.attempts_for_request(paused_id),
             duration=1.5,
             what="an attempt offered to a paused node",
         )
-        assert center.status_of(paused_id)["status"] == "ROUTING"
+        assert server.status_of(paused_id)["status"] == "ROUTING"
         assert upstream.call_count == 1
 
         # 4. Resume re-accepts without a restart.
         assert main(["share", "resume", "--config", str(node_json)]) == 0
-        _wait_until_share_registered(center, enabled=True, what="the resume to register")
+        _wait_until_share_registered(server, enabled=True, what="the resume to register")
         _wait_until(
-            lambda: bool(center.store.attempts_for_request(paused_id)),
+            lambda: bool(server.store.attempts_for_request(paused_id)),
             what="the resumed node to take the queued request",
         )
         _wait_until(
-            lambda: center.status_of(paused_id)["status"] == "SUCCEEDED",
+            lambda: server.status_of(paused_id)["status"] == "SUCCEEDED",
             what="the resumed request to finish",
         )
         assert upstream.call_count == 2
@@ -829,7 +829,7 @@ def test_pause_reaches_a_running_node_without_a_restart(tmp_path: Path) -> None:
         connector.stop()
         thread.join(timeout=5)
         store.close()
-        center.stop()
+        server.stop()
 
 
 # --------------------------------------------------------------------------
@@ -841,7 +841,7 @@ def _connector_for(tmp_path: Path, node_json: Path) -> tuple[Connector, NodeStor
     """Build an unstarted connector whose policy file is `node_json`."""
     keyring = Keyring()
     config = ConnectorConfig(
-        center_url="ws://127.0.0.1:1/v1/node-link",
+        server_url="ws://127.0.0.1:1/v1/node-link",
         node_id="node-A",
         device_id="device-A",
         device_key_id="device-key-A",
@@ -929,7 +929,7 @@ def _write_upstream_key_file(tmp_path: Path) -> Path:
 
 
 def _join_node_by_invite(
-    center: _Center,
+    server: _Server,
     identity: Path,
     *,
     endpoint: str,
@@ -940,7 +940,7 @@ def _join_node_by_invite(
     """Run `join --node` with every input except a platform token.
 
     Neither ``--node-token-file`` nor ``AIPOTLUCK_NODE_TOKEN`` is set, and stdin is
-    not a terminal, so if the center does not hand the node its own credential
+    not a terminal, so if the server does not hand the node its own credential
     this command has nowhere to get one — which is exactly the property under
     test. The pre-fix build stopped here and asked for a token no invite flow
     could produce.
@@ -949,8 +949,8 @@ def _join_node_by_invite(
     monkeypatch.delenv(UPSTREAM_KEY_ENV_NAME, raising=False)
     argv = [
         "join",
-        "--center",
-        center.url,
+        "--server",
+        server.url,
         "--invite",
         "invite-node-wizard",
         "--node",
@@ -1013,15 +1013,15 @@ def _stop_share_run(
 
 
 def test_invited_node_needs_no_token_and_serves_a_routed_ask(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The P0-1 acceptance: invite → join → share run → a routed ask, zero tokens.
 
-    Nothing here is provisioned by hand. The center's ``credentials[]`` is empty
-    (the `_Center` fixture mints invites and nothing else), no token is passed to
+    Nothing here is provisioned by hand. The server's ``credentials[]`` is empty
+    (the `_Server` fixture mints invites and nothing else), no token is passed to
     any command, no JSON is edited, and the consumer's ``ask`` omits ``--model``
     and ``--max-charge`` — so both sides run on their shipped defaults. What has
-    to happen is that the center issues the node its own link credential during
+    to happen is that the server issues the node its own link credential during
     the join, the wizard writes it into node.json, the node's upgrade is
     accepted, and the first request is executed by it.
     """
@@ -1036,7 +1036,7 @@ def test_invited_node_needs_no_token_and_serves_a_routed_ask(
     started: list[Connector] = []
     try:
         code = _join_node_by_invite(
-            center,
+            server,
             node_dir,
             endpoint=f"{upstream.url}/chat/completions",
             monkeypatch=monkeypatch,
@@ -1046,7 +1046,7 @@ def test_invited_node_needs_no_token_and_serves_a_routed_ask(
         node_path = node_dir / "node.json"
         assert "[step 3] ready" in out.text(), out.text()
 
-        # The center issued the token and the CLI saved it 0600, never printing
+        # The server issued the token and the CLI saved it 0600, never printing
         # it. node.json's token is that same value: nothing was copied by hand.
         token_path = node_dir / "node_token.json"
         assert (token_path.stat().st_mode & 0o777) == 0o600
@@ -1059,10 +1059,10 @@ def test_invited_node_needs_no_token_and_serves_a_routed_ask(
 
         thread, started, codes = _start_share_run(monkeypatch, node_path)
         _wait_until(
-            lambda: bool(center.store.connected_nodes()),
+            lambda: bool(server.store.connected_nodes()),
             what="the invited node's hello to be acknowledged",
         )
-        record = center.store.connected_nodes()[0]
+        record = server.store.connected_nodes()[0]
         config_document = json.loads((node_dir / "config.json").read_text(encoding="utf-8"))
         assert record.node_id == node_document["node_id"]
         assert record.provider_id == config_document["provider_id"]
@@ -1074,8 +1074,8 @@ def test_invited_node_needs_no_token_and_serves_a_routed_ask(
             main(
                 [
                     "join",
-                    "--center",
-                    center.url,
+                    "--server",
+                    server.url,
                     "--invite",
                     "invite-consumer-wizard",
                     "--config-dir",
@@ -1096,7 +1096,7 @@ def test_invited_node_needs_no_token_and_serves_a_routed_ask(
 
 
 def test_wizard_uses_the_token_join_saved(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`share setup` on its own reads the token back; it does not ask for one."""
     upstream = _RecordingUpstream()
@@ -1109,7 +1109,7 @@ def test_wizard_uses_the_token_join_saved(
     try:
         assert (
             _join_node_by_invite(
-                center,
+                server,
                 identity,
                 endpoint=f"{upstream.url}/chat/completions",
                 monkeypatch=monkeypatch,
@@ -1145,11 +1145,11 @@ def test_wizard_uses_the_token_join_saved(
 
 
 def test_wizard_token_file_overrides_the_saved_token(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The operator-pre-registration route still works, and still wins.
 
-    ``--node-token-file``/``AIPOTLUCK_NODE_TOKEN`` exist for a center whose
+    ``--node-token-file``/``AIPOTLUCK_NODE_TOKEN`` exist for a server whose
     operator provisioned ``credentials[]`` by hand. An explicit instruction has
     to outrank the token ``join`` saved, or it would override nothing.
     """
@@ -1159,7 +1159,7 @@ def test_wizard_token_file_overrides_the_saved_token(
     try:
         assert (
             _join_node_by_invite(
-                center,
+                server,
                 identity,
                 endpoint=f"{hold.url}/v1/chat/completions",
                 monkeypatch=monkeypatch,
@@ -1205,11 +1205,11 @@ def test_wizard_token_file_overrides_the_saved_token(
 
 
 def test_wizard_with_no_token_anywhere_names_both_ways_out(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A lost token is a dead end only if the error does not name the exit.
 
-    The center keeps a digest, so it cannot show the token again; the recovery
+    The server keeps a digest, so it cannot show the token again; the recovery
     path is a revoke plus a fresh invite. That has to be in the message, because
     the alternative is a contributor staring at a prompt they cannot fill in.
     """
@@ -1221,7 +1221,7 @@ def test_wizard_with_no_token_anywhere_names_both_ways_out(
     try:
         assert (
             _join_node_by_invite(
-                center,
+                server,
                 identity,
                 endpoint=f"{hold.url}/v1/chat/completions",
                 monkeypatch=monkeypatch,
@@ -1257,11 +1257,11 @@ def test_wizard_with_no_token_anywhere_names_both_ways_out(
 
 
 def test_rejoin_keeps_the_saved_token_usable(
-    center: _Center, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    server: _Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Re-joining is idempotent all the way down to the credential.
 
-    A second `join --node` must not mint a second token (the center could not
+    A second `join --node` must not mint a second token (the server could not
     reproduce the first anyway), must not spend another invite use, must not drop
     the device binding it derived the first time, and must leave the token the
     node already holds working — proved here by that node actually connecting
@@ -1280,21 +1280,21 @@ def test_rejoin_keeps_the_saved_token_usable(
             "key_file": key_file,
             "setup": False,
         }
-        assert _join_node_by_invite(center, identity, **kwargs) == 0
+        assert _join_node_by_invite(server, identity, **kwargs) == 0
         token_bytes = (identity / "node_token.json").read_bytes()
         config_bytes = (identity / "config.json").read_bytes()
         saved = loads_strict(token_bytes.decode("utf-8"))["node_token"]
 
-        assert _join_node_by_invite(center, identity, **kwargs) == 0
+        assert _join_node_by_invite(server, identity, **kwargs) == 0
 
         # No new token, no new invite use, no lost device binding.
         assert (identity / "node_token.json").read_bytes() == token_bytes
         assert json.loads((identity / "config.json").read_text(encoding="utf-8")) == (
             json.loads(config_bytes.decode("utf-8"))
         )
-        assert center.store.get_invite("invite-node-wizard").used_count == 1
+        assert server.store.get_invite("invite-node-wizard").used_count == 1
         assert (
-            center.store.resolve_credential(str(saved), dt.datetime.now(dt.UTC))
+            server.store.resolve_credential(str(saved), dt.datetime.now(dt.UTC))
             is not None
         ), "the token saved by the first join stopped resolving after a re-join"
 
@@ -1318,7 +1318,7 @@ def test_rejoin_keeps_the_saved_token_usable(
         )
         thread, started, _codes = _start_share_run(monkeypatch, identity / "node.json")
         _wait_until(
-            lambda: bool(center.store.connected_nodes()),
+            lambda: bool(server.store.connected_nodes()),
             what="the re-joined node to connect with its original token",
         )
     finally:

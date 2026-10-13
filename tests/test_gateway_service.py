@@ -1,4 +1,4 @@
-"""What the center decides, before any credit moves.
+"""What the server decides, before any credit moves.
 
 Every test drives `GatewayService` directly, with an `enqueue` callback standing
 in for a socket, so the rules that guard admission, dispatch, node messages and
@@ -74,7 +74,7 @@ from aipotluck_server.gateway_service import (
     GatewayService,
     derive_allocation_contract,
 )
-from aipotluck_server.persistence import CenterStore, Credential
+from aipotluck_server.persistence import Credential, ServerStore
 
 #: The wall-clock budget the OpenAI-compatible surface admits a request with, used
 #: here as the default a key with no window of its own has to keep.
@@ -293,14 +293,14 @@ class Harness:
             REGISTERED_AT,
         )
         self.ledger = _funded_ledger()
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         # `config` is the queue policy a test wants to probe, passed straight
         # through: the defaults are the shipped ones, so a test that does not name
         # them is testing what an operator who wrote no queue field gets.
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id=self.platform_key_id,
             settlement_private_key_b64=private_b64,
@@ -494,7 +494,7 @@ def test_a_replayed_key_under_a_fresh_request_id_is_a_conflict(harness: Harness)
     and gets a fresh ``request_id``, so the payload digest agrees and the store
     hands back the *first* request. Answering that with the first request's id
     would report a dispatch the caller never asked for; answering it as an internal
-    failure would tell the caller the center broke and invite it to retry the very
+    failure would tell the caller the server broke and invite it to retry the very
     request that failed. A conflict is the honest answer, and it names both ids so
     the caller can act on either.
     """
@@ -755,7 +755,7 @@ def test_register_node_answers_hello_with_the_heartbeat_interval(
 
 
 def test_hello_ack_reports_resume_for_an_offer_left_behind(harness: Harness) -> None:
-    """A reconnect learns what to do with an attempt the center still holds."""
+    """A reconnect learns what to do with an attempt the server still holds."""
     harness.connect()
     harness.admit(harness.authorization(request_id="R-1"))
 
@@ -895,7 +895,7 @@ def test_a_paused_node_is_not_offered_work(harness: Harness) -> None:
 
 
 def test_accept_with_the_issued_permit_hash_returns_execute(harness: Harness) -> None:
-    """The center starts work; the node's acceptance alone never does."""
+    """The server starts work; the node's acceptance alone never does."""
     harness.connect()
     harness.admit(harness.authorization(request_id="R-1"))
     offer = harness.sole_offer("node-A")
@@ -911,7 +911,7 @@ def test_accept_with_the_issued_permit_hash_returns_execute(harness: Harness) ->
 
 
 def test_accept_with_a_wrong_permit_hash_fails_the_attempt(harness: Harness) -> None:
-    """Echoing terms the center never offered abandons the attempt."""
+    """Echoing terms the server never offered abandons the attempt."""
     harness.connect()
     harness.admit(harness.authorization(request_id="R-1"))
     offer = harness.sole_offer("node-A")
@@ -942,7 +942,7 @@ def test_a_repeat_accept_is_idempotent_and_a_term_change_is_not(
 
     The acceptance digest legitimately changes between re-asks, because it
     covers the instant the node accepted. What must stay fixed is the offer the
-    node is accepting, which the center re-derives and compares.
+    node is accepting, which the server re-derives and compares.
     """
     harness.connect()
     harness.admit(harness.authorization(request_id="R-1"))
@@ -1013,7 +1013,7 @@ def test_a_refusal_puts_the_request_back_in_the_queue_instead_of_ending_it(
     assert "overloaded" in document["billing_note"]
     assert harness.store.count_budget_attempts("R-1") == 0
 
-    # The node freed up. The center asks it again once the re-offer backoff has
+    # The node freed up. The server asks it again once the re-offer backoff has
     # passed, and the same budget of one attempt still covers the work.
     harness.take("node-A")
     harness.tick(BASE + dt.timedelta(seconds=QUEUE_REOFFER_BACKOFF_S + 1))
@@ -1022,7 +1022,7 @@ def test_a_refusal_puts_the_request_back_in_the_queue_instead_of_ending_it(
     assert harness.status("R-1")["status"] == "RUNNING"
 
 
-def test_a_center_that_holds_no_queue_still_fails_a_request_nothing_took(
+def test_a_server_that_holds_no_queue_still_fails_a_request_nothing_took(
     tmp_path: Path,
 ) -> None:
     """``queue_enabled=false`` keeps the old answer: refused, with the reason.
@@ -1235,7 +1235,7 @@ def test_usage_announcing_a_total_its_report_does_not_measure_is_refused(
 
 
 def test_usage_with_a_foreign_permit_hash_is_refused(harness: Harness) -> None:
-    """A report is bound to the terms the center actually issued."""
+    """A report is bound to the terms the server actually issued."""
     harness.connect()
     harness.admit(harness.authorization(request_id="R-1"))
     offer = harness.sole_offer("node-A")
@@ -1249,7 +1249,7 @@ def test_usage_with_a_foreign_permit_hash_is_refused(harness: Harness) -> None:
         permit_hash="not-the-issued-permit",
     )
 
-    with pytest.raises(ProtocolError, match="the center issued"):
+    with pytest.raises(ProtocolError, match="the server issued"):
         harness.service.handle_node_message(
             node_id="node-A", envelope=event, now=BASE
         )
@@ -1489,7 +1489,7 @@ def _routing_row_without_inputs(
 ) -> None:
     """Write a ROUTING request row with no dispatch inputs behind it.
 
-    The shape production held: a center whose database could not store a
+    The shape production held: a server whose database could not store a
     conversation created the row, could not store what the row needs to be
     dispatched, and then told the caller the request had no inputs. It is written
     straight to the store because no admission path produces it any more, and the
@@ -1512,7 +1512,7 @@ def _routing_row_without_inputs(
     harness.store.set_request_status(request_id, "ROUTING", at=at)
 
 
-def _store_inputs_the_center_cannot_read_back(harness: Harness, request_id: str) -> None:
+def _store_inputs_the_server_cannot_read_back(harness: Harness, request_id: str) -> None:
     """Write a dispatch input whose authorization is not a signed record.
 
     A row the store holds and this build cannot parse, which is a genuine offer
@@ -1571,8 +1571,8 @@ def test_a_request_with_nothing_to_dispatch_is_ended_rather_than_offered_again(
 
     Raising instead left the row in ROUTING, where it held its API key's
     concurrency slot forever and aborted the tick round that would have expired
-    it — so one such row also kept every other overdue request on the center
-    alive, for as long as the center ran.
+    it — so one such row also kept every other overdue request on the server
+    alive, for as long as the server ran.
     """
     harness.connect()
     _routing_row_without_inputs(harness, "R-poison")
@@ -1586,13 +1586,13 @@ def test_a_request_with_nothing_to_dispatch_is_ended_rather_than_offered_again(
     assert harness.offers("node-A") == []
 
 
-def test_a_request_an_earlier_center_stored_as_a_prompt_is_ended_too(
+def test_a_request_an_earlier_server_stored_as_a_prompt_is_ended_too(
     harness: Harness, tmp_path: Path
 ) -> None:
     """A legacy row is ended with the report that explains it, not offered forever."""
     harness.connect()
     _routing_row_without_inputs(harness, "R-legacy")
-    connection = sqlite3.connect(tmp_path / "center.db")
+    connection = sqlite3.connect(tmp_path / "server.db")
     try:
         connection.execute(
             "INSERT INTO request_inputs (request_id, messages_json, model,"
@@ -1608,7 +1608,7 @@ def test_a_request_an_earlier_center_stored_as_a_prompt_is_ended_too(
     record = harness.store.get_request("R-legacy")
     assert record is not None
     assert record.status == "FAILED"
-    assert "earlier center version" in (record.billing_note or "")
+    assert "earlier server version" in (record.billing_note or "")
 
 
 def test_one_undispatchable_request_does_not_stop_the_round_for_the_others(
@@ -1648,11 +1648,11 @@ def test_an_offer_that_fails_is_reported_and_the_round_continues(
 ) -> None:
     """A failure one request cannot survive is logged, not raised out of the tick.
 
-    `tick` is the center's only timer and its caller swallows whatever escapes and
+    `tick` is the server's only timer and its caller swallows whatever escapes and
     retries on the next interval, so an exception out of one offer used to cancel
     the whole round, repeatedly, forever.
     """
-    _store_inputs_the_center_cannot_read_back(harness, "R-bad")
+    _store_inputs_the_server_cannot_read_back(harness, "R-bad")
     harness.admit(
         harness.authorization(request_id="R-overdue"),
         idempotency_key="idem-overdue",
@@ -1736,7 +1736,7 @@ def test_an_admission_that_cannot_store_its_inputs_ends_the_request_it_created(
     nothing failed to run, and the note says what did happen.
     """
     harness.connect()
-    _break_the_request_inputs_table(tmp_path / "center.db")
+    _break_the_request_inputs_table(tmp_path / "server.db")
 
     with pytest.raises(PotluckError, match="could not be stored"):
         harness.admit(harness.authorization(request_id="R-1"))
@@ -1809,7 +1809,7 @@ def test_an_unknown_request_read_is_a_state_error(harness: Harness) -> None:
 
 
 def test_an_unknown_receipt_is_a_gateway_error(harness: Harness) -> None:
-    """A receipt this center never issued is not silently invented."""
+    """A receipt this server never issued is not silently invented."""
     with pytest.raises(GatewayError, match="never issued"):
         harness.service.receipt_for(credential=CONSUMER, receipt_id="R-nope")
 
@@ -2014,7 +2014,7 @@ def test_restart_forgets_offer_context_but_keeps_the_attempt_row(
 
     The attempt row and the request's status survive, which is what lets a
     consumer still read what happened; what is gone is the permit hash and the
-    authorization, so the center refuses to trust a late acceptance against a
+    authorization, so the server refuses to trust a late acceptance against a
     hash it can no longer recompute.
     """
     harness.connect()
@@ -2058,7 +2058,7 @@ def test_construction_refuses_a_non_contiguous_log(
 
 
 def test_the_lock_is_released_before_a_node_callback_runs(harness: Harness) -> None:
-    """A slow node must not stall the center: admission runs while the sink blocks.
+    """A slow node must not stall the server: admission runs while the sink blocks.
 
     The sink blocks on the first offer. If delivery held the service lock, the
     concurrent status read below would hang and the test would time out, which is
@@ -2382,7 +2382,7 @@ def test_a_request_that_named_no_session_is_aggregated_nowhere(
 def test_a_session_identifier_the_wire_refuses_is_refused_at_admission(
     harness: Harness, session_id: str
 ) -> None:
-    """The center applies the wire's own rule rather than inventing a second one.
+    """The server applies the wire's own rule rather than inventing a second one.
 
     Refused rather than dropped: a caller that named a session and was silently
     given none would read an aggregate for a run it never joined.
@@ -2406,7 +2406,7 @@ def test_a_key_minted_with_its_own_deadline_gives_its_requests_that_window(
 
     A long agent turn needs a long budget, and the key is where an operator
     records that. What has to be true is that the longer window is the one written
-    to the request row and signed into the authorization — a deadline the center
+    to the request row and signed into the authorization — a deadline the server
     ignored would expire a turn it had promised to wait for.
     """
     harness.connect()
@@ -2547,7 +2547,7 @@ def test_a_request_dispatched_straight_from_admission_never_joins_the_queue(
 def test_the_queue_is_offered_oldest_first(tmp_path: Path) -> None:
     """First come, first served — as far as a best-effort ordering can promise.
 
-    Three requests wait for one node. When it arrives the center offers the oldest
+    Three requests wait for one node. When it arrives the server offers the oldest
     one, and only that one: the position is not a guarantee about the future, but
     the order the dispatch loop reads in is the order the requests arrived in.
     """
@@ -2563,7 +2563,7 @@ def test_the_queue_is_offered_oldest_first(tmp_path: Path) -> None:
 
         harness.tick(BASE + dt.timedelta(seconds=10))
 
-        # The center places no per-node cap of its own — a node declines what its
+        # The server places no per-node cap of its own — a node declines what its
         # local policy will not take — so what first-come-first-served means here
         # is the order the offers go out in, and that order is arrival order.
         assert [offer.request_id for offer in harness.offers("node-A")] == [
@@ -2577,10 +2577,10 @@ def test_the_queue_is_offered_oldest_first(tmp_path: Path) -> None:
 
 
 def test_admission_is_refused_once_the_queue_is_at_its_bound(tmp_path: Path) -> None:
-    """The bound is what keeps a wait from becoming a promise the center cannot keep.
+    """The bound is what keeps a wait from becoming a promise the server cannot keep.
 
     With every slot taken, admitting another request would be agreeing to hold work
-    the center has already agreed to hold too much of. The refusal names the bound
+    the server has already agreed to hold too much of. The refusal names the bound
     and the fact that nothing can dispatch, so a caller knows to back off rather
     than to re-authenticate or change its model.
     """
@@ -2642,11 +2642,11 @@ def test_a_waiting_request_still_expires_at_its_own_deadline(harness: Harness) -
     assert harness.ledger.balance("consumer-X") == 100_000
 
 
-def test_a_center_that_holds_no_queue_refuses_at_admission(tmp_path: Path) -> None:
+def test_a_server_that_holds_no_queue_refuses_at_admission(tmp_path: Path) -> None:
     """``queue_enabled=false`` is the operator's other choice, and it is a real one.
 
-    A center that sheds load answers immediately and creates nothing, so a caller's
-    own backoff decides what happens next instead of the center's memory.
+    A server that sheds load answers immediately and creates nothing, so a caller's
+    own backoff decides what happens next instead of the server's memory.
     """
     harness = Harness(tmp_path, queue_enabled=False)
     try:
@@ -2686,7 +2686,7 @@ def test_a_waiting_request_survives_a_restart_and_is_still_offered(
 ) -> None:
     """The queue is durable state, not a scheduler's in-memory list.
 
-    A center interrupted while requests waited must come back holding them, because
+    A server interrupted while requests waited must come back holding them, because
     the alternative is a restart that silently drops work it told callers it was
     holding — and the request row, its deadline and its stored inputs are exactly
     what makes that recoverable.

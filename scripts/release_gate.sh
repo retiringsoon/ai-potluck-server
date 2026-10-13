@@ -6,7 +6,7 @@
 # Why this exists: the P0-3 defect was a `dist/` wheel built hours behind HEAD,
 # so it did not even accept the arguments the review's smoke passed. The F04
 # defect was subtler and worse: the gate installed the package with `uv` instead
-# of running `install.sh`, pre-registered the node's credential in `center.json`
+# of running `install.sh`, pre-registered the node's credential in `server.json`
 # by hand, passed `--node-token-file`, and pinned `--model` and `--max-charge` —
 # so it proved a path no user takes and missed every defect hiding in the default
 # one. A check that only proves "the code imports" cannot catch either; the
@@ -20,7 +20,7 @@
 # What a pass proves, in order:
 #   1. the real `install.sh` installs into a fresh prefix, and the CLI it
 #      produced imports the installed package rather than this source tree;
-#   2. a fresh center with *zero* hand-written credentials starts;
+#   2. a fresh server with *zero* hand-written credentials starts;
 #   3. a contribution node joins with an invite only — no `--node-token-file`, no
 #      identity fields — and the token `join` saved is what `share run` uses;
 #   4. a consumer joins with an invite only and asks with the *default* model and
@@ -28,7 +28,7 @@
 #   5. the streaming ask printed its first increment while it was still running
 #      (not merely an answer in the final stdout), and the buffered ask is
 #      verified separately through its own waiting notice;
-#   6. the same identity asks again, asks again after the center restarts, and
+#   6. the same identity asks again, asks again after the server restarts, and
 #      the three asks leave three distinct receipts — the restart was neither
 #      charged twice nor settled as free;
 #   7. an API key minted for the joined consumer answers
@@ -39,12 +39,12 @@
 #      defect only an API-key admission can reach;
 #   8. the receipt verifies on both sides, and both reconciliations agree. After
 #      a restart the node side may name exactly one class of difference: an offer
-#      the node never accepted, which the center holds as FAILED with the
+#      the node never accepted, which the server holds as FAILED with the
 #      settlement HELD and no receipt. Anything else — a *settled* attempt the
 #      node has no record of, above all — fails the gate.
 #
 # What it never does: it never touches a real upstream or a real key (the smoke
-# uses `sk-smoke-*` fakes, a throwaway center and scripts/dev_fake_upstream.py),
+# uses `sk-smoke-*` fakes, a throwaway server and scripts/dev_fake_upstream.py),
 # never moves an existing installation aside, and never leaves a process or a
 # work directory behind. A failing run keeps only redacted logs and prints the
 # path to them.
@@ -155,21 +155,21 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/potluck-release-gate.XXXXXX")
 # path comparison and log line reads better without a doubled separator in it.
 WORK=$(CDPATH= cd -- "$WORK" && pwd)
 mkdir -p "$WORK/logs"
-CENTER_PID=""
+SERVER_PID=""
 UPSTREAM_PID=""
 NODE_PID=""
 
 cleanup() {
     rc=$?
     trap - EXIT INT TERM
-    for pid in "$NODE_PID" "$UPSTREAM_PID" "$CENTER_PID"; do
+    for pid in "$NODE_PID" "$UPSTREAM_PID" "$SERVER_PID"; do
         [ -n "$pid" ] || continue
         kill "$pid" 2>/dev/null || true
     done
     # Give the CLIs a moment to run their stop handlers, then force anything
     # still alive so the gate cannot leave a listener or a link behind.
     sleep 1
-    for pid in "$NODE_PID" "$UPSTREAM_PID" "$CENTER_PID"; do
+    for pid in "$NODE_PID" "$UPSTREAM_PID" "$SERVER_PID"; do
         [ -n "$pid" ] || continue
         kill -9 "$pid" 2>/dev/null || true
     done
@@ -190,7 +190,7 @@ NODE_INVITE=""
 CONSUMER_INVITE=""
 
 # Fail-closed redaction: the smoke only ever uses fake secrets and single-use
-# invite codes for a throwaway center, but a failure log must never become a
+# invite codes for a throwaway server, but a failure log must never become a
 # place a real one could accumulate if this script is reused.
 redact_log() {
     sed -e 's|[Bb]earer [A-Za-z0-9._~+/-]*|Bearer <redacted>|g' "$1" > "$1.redacted"
@@ -332,38 +332,38 @@ now_ms() {
 cd "$WORK"
 
 # --------------------------------------------------------------------------
-# The default path: fresh center, invite-only node, invite-only consumer
+# The default path: fresh server, invite-only node, invite-only consumer
 # --------------------------------------------------------------------------
 
-mkdir -p "$WORK/center" "$WORK/node" "$WORK/consumer"
+mkdir -p "$WORK/server" "$WORK/node" "$WORK/consumer"
 printf '%s\n' "$UPSTREAM_KEY" > "$WORK/upstream-key"
 chmod 600 "$WORK/upstream-key"
 
-step 'center keygen'
-"$POTLUCK" keygen --out "$WORK/center/settlement.key" \
+step 'server keygen'
+"$POTLUCK" keygen --out "$WORK/server/settlement.key" \
     >"$WORK/logs/keygen.log" 2>&1 </dev/null || fail 'keygen failed'
-SETTLEMENT_KEY=$(cat "$WORK/center/settlement.key")
-CENTER_JSON="$WORK/center/center.json"
+SETTLEMENT_KEY=$(cat "$WORK/server/settlement.key")
+SERVER_JSON="$WORK/server/server.json"
 
 # A free port is chosen once and written into the config, rather than letting
-# `serve` pick one per start: the consumer's saved identity holds the center URL,
+# `serve` pick one per start: the consumer's saved identity holds the server URL,
 # and the restart step below has to come back on the same address, exactly as an
 # operator's restart would.
-CENTER_PORT=$("$HOME_PY" -c \
+SERVER_PORT=$("$HOME_PY" -c \
     'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-[ -n "$CENTER_PORT" ] || fail 'could not reserve a port for the center'
-CENTER_URL="http://127.0.0.1:$CENTER_PORT"
+[ -n "$SERVER_PORT" ] || fail 'could not reserve a port for the server'
+SERVER_URL="http://127.0.0.1:$SERVER_PORT"
 
-step 'write a fresh center config with zero hand-written credentials'
+step 'write a fresh server config with zero hand-written credentials'
 # `credentials` is empty on purpose. The F04 defect was a node credential typed
-# into this file by the gate; the default path has the center mint the node's
+# into this file by the gate; the default path has the server mint the node's
 # token when it redeems the invite, and that is what is being proven here.
-cat > "$CENTER_JSON" <<JSON
+cat > "$SERVER_JSON" <<JSON
 {
   "host": "127.0.0.1",
-  "port": $CENTER_PORT,
-  "database_path": "$WORK/center/center.db",
-  "platform_id": "smoke-center",
+  "port": $SERVER_PORT,
+  "database_path": "$WORK/server/server.db",
+  "platform_id": "smoke-server",
   "settlement_key_id": "smoke-settlement-key",
   "settlement_private_key_b64": "$SETTLEMENT_KEY",
   "certfile": null,
@@ -373,21 +373,21 @@ cat > "$CENTER_JSON" <<JSON
   "consumer_floats": []
 }
 JSON
-chmod 600 "$CENTER_JSON"
+chmod 600 "$SERVER_JSON"
 
-start_center() {
+start_server() {
     # A separate log per start: `wait_for_line` looks for the serving line, and a
     # previous start's line still sitting in the same file would make a restart
     # that never came up look ready.
-    center_log=$1
-    "$POTLUCK_SERVER" serve --config "$CENTER_JSON" >>"$center_log" 2>&1 </dev/null &
-    CENTER_PID=$!
-    wait_for_line "$center_log" 'serving http' 30 "$CENTER_PID" \
-        || fail "the center did not start (see $(basename "$center_log"))"
+    server_log=$1
+    "$POTLUCK_SERVER" serve --config "$SERVER_JSON" >>"$server_log" 2>&1 </dev/null &
+    SERVER_PID=$!
+    wait_for_line "$server_log" 'serving http' 30 "$SERVER_PID" \
+        || fail "the server did not start (see $(basename "$server_log"))"
 }
 
-step "start the center ($CENTER_URL)"
-start_center "$WORK/logs/center.log"
+step "start the server ($SERVER_URL)"
+start_server "$WORK/logs/server.log"
 
 step 'start the local fake upstream'
 show "python scripts/dev_fake_upstream.py --port 0 --model $MODEL --key <upstream-key> --chunk-delay $CHUNK_DELAY"
@@ -409,18 +409,18 @@ REPLY_MARKER=$(sed -n 's/^REPLY_MARKER = "\(.*\)"/\1/p' "$CLIENT_ROOT/scripts/de
 FIRST_DELTA=${REPLY_MARKER%% *}
 
 step 'mint the node and consumer invites (the operator default path)'
-show "potluck-server admin invite --config center.json --role node --tenant $TENANT"
-NODE_INVITE=$("$POTLUCK_SERVER" admin invite --config "$CENTER_JSON" --role node --tenant "$TENANT" \
+show "potluck-server admin invite --config server.json --role node --tenant $TENANT"
+NODE_INVITE=$("$POTLUCK_SERVER" admin invite --config "$SERVER_JSON" --role node --tenant "$TENANT" \
     2>>"$WORK/logs/invite.log" </dev/null) || fail 'minting the node invite failed'
-show "potluck-server admin invite --config center.json --role consumer --tenant $TENANT"
-CONSUMER_INVITE=$("$POTLUCK_SERVER" admin invite --config "$CENTER_JSON" --role consumer \
+show "potluck-server admin invite --config server.json --role consumer --tenant $TENANT"
+CONSUMER_INVITE=$("$POTLUCK_SERVER" admin invite --config "$SERVER_JSON" --role consumer \
     --tenant "$TENANT" 2>>"$WORK/logs/invite.log" </dev/null) \
     || fail 'minting the consumer invite failed'
 [ -n "$NODE_INVITE" ] && [ -n "$CONSUMER_INVITE" ] || fail 'an invite came back empty'
 
 step 'node joins with the invite only (no token file, no identity fields)'
-show "potluck join --node --center $CENTER_URL --invite <invite> --config-dir node --upstream-endpoint $UPSTREAM_URL --upstream-model $MODEL --upstream-key-file upstream-key"
-if ! "$POTLUCK" join --node --center "$CENTER_URL" --invite "$NODE_INVITE" \
+show "potluck join --node --server $SERVER_URL --invite <invite> --config-dir node --upstream-endpoint $UPSTREAM_URL --upstream-model $MODEL --upstream-key-file upstream-key"
+if ! "$POTLUCK" join --node --server "$SERVER_URL" --invite "$NODE_INVITE" \
         --config-dir "$WORK/node" \
         --upstream-endpoint "$UPSTREAM_URL" \
         --upstream-model "$MODEL" \
@@ -431,7 +431,7 @@ if ! "$POTLUCK" join --node --center "$CENTER_URL" --invite "$NODE_INVITE" \
 fi
 NODE_TOKEN_FILE="$WORK/node/node_token.json"
 [ -f "$NODE_TOKEN_FILE" ] \
-    || fail 'join did not save the node token the center issued (no node_token.json)'
+    || fail 'join did not save the node token the server issued (no node_token.json)'
 TOKEN_MODE=$(ls -l "$NODE_TOKEN_FILE" | awk '{print $1}')
 case "$TOKEN_MODE" in
     *------*) : ;;
@@ -449,8 +449,8 @@ wait_for_line "$WORK/logs/node.log" 'connecting to' 30 "$NODE_PID" \
     || fail 'share run did not start the node link'
 
 step 'consumer joins with the invite only'
-show "potluck join --center $CENTER_URL --invite <invite> --config-dir consumer"
-if ! "$POTLUCK" join --center "$CENTER_URL" --invite "$CONSUMER_INVITE" \
+show "potluck join --server $SERVER_URL --invite <invite> --config-dir consumer"
+if ! "$POTLUCK" join --server "$SERVER_URL" --invite "$CONSUMER_INVITE" \
         --config-dir "$WORK/consumer" \
         >"$WORK/logs/consumer-join.log" 2>&1 </dev/null; then
     tail -30 "$WORK/logs/consumer-join.log" >&2
@@ -555,39 +555,39 @@ grep -qF 'waiting for generation' "$WORK/logs/ask-buffered.err" \
 # Before anything is disturbed, the two sides have to agree exactly
 # --------------------------------------------------------------------------
 
-step 'reconcile the node against the center (nothing has restarted yet)'
+step 'reconcile the node against the server (nothing has restarted yet)'
 show 'potluck share reconcile --config node/node.json'
 "$POTLUCK" share reconcile --config "$WORK/node/node.json" \
     >"$WORK/logs/reconcile-node.log" 2>&1 </dev/null \
     || { tail -20 "$WORK/logs/reconcile-node.log" >&2
          fail 'share reconcile reported a difference before any restart'; }
 
-step 'reconcile the center against itself'
-show 'potluck-server admin reconcile --config center.json'
-"$POTLUCK_SERVER" admin reconcile --config "$CENTER_JSON" \
-    >"$WORK/logs/reconcile-center.log" 2>&1 </dev/null \
-    || { tail -20 "$WORK/logs/reconcile-center.log" >&2
-         fail 'admin reconcile reported a difference inside the center books'; }
+step 'reconcile the server against itself'
+show 'potluck-server admin reconcile --config server.json'
+"$POTLUCK_SERVER" admin reconcile --config "$SERVER_JSON" \
+    >"$WORK/logs/reconcile-server.log" 2>&1 </dev/null \
+    || { tail -20 "$WORK/logs/reconcile-server.log" >&2
+         fail 'admin reconcile reported a difference inside the server books'; }
 
 # --------------------------------------------------------------------------
-# The center restarts; the same identities keep working
+# The server restarts; the same identities keep working
 # --------------------------------------------------------------------------
 
-step 'restart the center on the same address'
-OLD_CENTER_PID=$CENTER_PID
-CENTER_PID=""
-kill "$OLD_CENTER_PID" 2>/dev/null || true
+step 'restart the server on the same address'
+OLD_SERVER_PID=$SERVER_PID
+SERVER_PID=""
+kill "$OLD_SERVER_PID" 2>/dev/null || true
 ticks=0
-while [ "$ticks" -lt 100 ] && kill -0 "$OLD_CENTER_PID" 2>/dev/null; do
+while [ "$ticks" -lt 100 ] && kill -0 "$OLD_SERVER_PID" 2>/dev/null; do
     ticks=$((ticks + 1))
     sleep 0.1
 done
-kill -9 "$OLD_CENTER_PID" 2>/dev/null || true
+kill -9 "$OLD_SERVER_PID" 2>/dev/null || true
 # Reap only this child: a bare `wait` would block on the node and the upstream,
 # which are both supposed to still be running.
-wait "$OLD_CENTER_PID" 2>/dev/null || true
-printf 'release_gate.sh:     center stopped; the node link has to reconnect on its own\n'
-start_center "$WORK/logs/center-restart.log"
+wait "$OLD_SERVER_PID" 2>/dev/null || true
+printf 'release_gate.sh:     server stopped; the node link has to reconnect on its own\n'
+start_server "$WORK/logs/server-restart.log"
 
 step 'ask again after the restart, same identity, same defaults'
 run_stream_ask "$WORK/logs/ask-restart.out" "$WORK/logs/ask-restart.err" 'after-restart smoke'
@@ -598,7 +598,7 @@ RESTART_RECEIPT_ID=$(receipt_of "$WORK/logs/ask-restart.out")
 [ -n "$RESTART_RECEIPT_ID" ] || fail 'could not read the receipt id from the after-restart ask'
 
 step 'three asks, three distinct receipts: the restart was not charged twice'
-# A restart can leave the center holding an offer the node never accepted. The
+# A restart can leave the server holding an offer the node never accepted. The
 # retry then produces the answer *and* a receipt of its own, so the proof that
 # nobody paid twice is that each successful ask has its own receipt id.
 BUFFERED_RECEIPT_ID=$(receipt_of "$WORK/logs/ask-buffered.out")
@@ -618,7 +618,7 @@ fi
 # Everything above drives the platform's own surface on a signed request. The
 # OpenAI-compatible endpoint admits on an API key instead, through the second
 # admission path, and a defect only that path can reach is invisible to a gate
-# that never mints a key: a center whose store could not hold a conversation
+# that never mints a key: a server whose store could not hold a conversation
 # answered every POST /openai/v1/chat/completions with a 502 naming a request
 # that "has no stored dispatch inputs", and left each of those requests in
 # ROUTING forever, holding its key's concurrency slot. So the gate mints a key,
@@ -626,7 +626,7 @@ fi
 # and verifies the receipt each request settled into.
 
 cat > "$WORK/openai_smoke.py" <<'PY'
-"""One chat completion against the center's OpenAI-compatible endpoint.
+"""One chat completion against the server's OpenAI-compatible endpoint.
 
 Standard library only: the gate's prefix installs the two packages and nothing
 else, and what has to be proved is the wire contract — the status, the answer, the
@@ -641,7 +641,7 @@ import os
 import sys
 import urllib.parse
 
-base = urllib.parse.urlsplit(os.environ["CENTER_URL"])
+base = urllib.parse.urlsplit(os.environ["SERVER_URL"])
 key = sys.stdin.readline().strip()
 mode = os.environ["MODE"]
 stream = mode == "stream"
@@ -715,15 +715,15 @@ print(f"{mode}: {frames or 1} frame(s), {usage['total_tokens']} tokens settled")
 print(request_id)
 PY
 
-# The receipt a request settled into, read from the center's own books: the
+# The receipt a request settled into, read from the server's own books: the
 # endpoint answers with a request id, and `service_unit_id` is that request.
 receipt_for_request() {
-    "$HOME_PY" - "$WORK/center/center.db" "$1" <<'PY'
+    "$HOME_PY" - "$WORK/server/server.db" "$1" <<'PY'
 import sys
 
-from aipotluck_server.persistence import CenterStore
+from aipotluck_server.persistence import ServerStore
 
-store = CenterStore.open_existing(sys.argv[1])
+store = ServerStore.open_existing(sys.argv[1])
 try:
     for settlement in store.settlements():
         if settlement.service_unit_id == sys.argv[2]:
@@ -743,7 +743,7 @@ run_openai_completion() {
     question=$2
     err=$3
     printf '%s\n' "$API_KEY" \
-        | MODE="$mode" QUESTION="$question" CENTER_URL="$CENTER_URL" MODEL="$MODEL" \
+        | MODE="$mode" QUESTION="$question" SERVER_URL="$SERVER_URL" MODEL="$MODEL" \
             REPLY_MARKER="$REPLY_MARKER" "$HOME_PY" "$WORK/openai_smoke.py" 2>"$err"
 }
 
@@ -763,9 +763,9 @@ CONSUMER_SUBJECT=$("$HOME_PY" -c \
     'import json, pathlib; print(json.loads(pathlib.Path("consumer/config.json").read_text())["subject_id"])' \
     </dev/null)
 [ -n "$CONSUMER_SUBJECT" ] || fail 'could not read the joined consumer subject id'
-show "potluck-server admin api-key --config center.json --subject $CONSUMER_SUBJECT --quota $API_KEY_QUOTA"
+show "potluck-server admin api-key --config server.json --subject $CONSUMER_SUBJECT --quota $API_KEY_QUOTA"
 # stdout carries the plaintext and nothing else; it is captured, never logged.
-API_KEY=$("$POTLUCK_SERVER" admin api-key --config "$CENTER_JSON" \
+API_KEY=$("$POTLUCK_SERVER" admin api-key --config "$SERVER_JSON" \
     --subject "$CONSUMER_SUBJECT" --quota "$API_KEY_QUOTA" --name 'release gate' \
     2>"$WORK/logs/api-key.err" </dev/null) \
     || { tail -20 "$WORK/logs/api-key.err" >&2; fail 'minting an API key failed'; }
@@ -803,8 +803,8 @@ for OPENAI_REQUEST in "$OPENAI_BUFFERED_REQUEST" "$OPENAI_STREAM_REQUEST"; do
     OPENAI_RECEIPT=$(receipt_for_request "$OPENAI_REQUEST" </dev/null)
     [ -n "$OPENAI_RECEIPT" ] \
         || fail "the API-key request $OPENAI_REQUEST settled into no receipt"
-    show "potluck-server verify receipt --config center.json --receipt-id $OPENAI_RECEIPT"
-    "$POTLUCK_SERVER" verify receipt --config "$CENTER_JSON" --receipt-id "$OPENAI_RECEIPT" \
+    show "potluck-server verify receipt --config server.json --receipt-id $OPENAI_RECEIPT"
+    "$POTLUCK_SERVER" verify receipt --config "$SERVER_JSON" --receipt-id "$OPENAI_RECEIPT" \
         >"$WORK/logs/verify-api-key-$OPENAI_RECEIPT.log" 2>&1 </dev/null \
         || { tail -20 "$WORK/logs/verify-api-key-$OPENAI_RECEIPT.log" >&2
              fail "the receipt $OPENAI_RECEIPT for $OPENAI_REQUEST did not verify"; }
@@ -823,13 +823,13 @@ show "potluck verify receipt --config-dir consumer --receipt-id $RECEIPT_ID"
 grep -qF 'signature_valid' "$WORK/logs/verify-consumer.log" \
     || fail 'the consumer-side verification printed no dimensions'
 
-step "verify $RESTART_RECEIPT_ID as the operator (against the center database)"
-show "potluck-server verify receipt --config center.json --receipt-id $RESTART_RECEIPT_ID"
-"$POTLUCK_SERVER" verify receipt --config "$CENTER_JSON" --receipt-id "$RESTART_RECEIPT_ID" \
+step "verify $RESTART_RECEIPT_ID as the operator (against the server database)"
+show "potluck-server verify receipt --config server.json --receipt-id $RESTART_RECEIPT_ID"
+"$POTLUCK_SERVER" verify receipt --config "$SERVER_JSON" --receipt-id "$RESTART_RECEIPT_ID" \
     >"$WORK/logs/verify-operator.log" 2>&1 </dev/null \
     || fail 'the operator-side receipt verification reported a contradiction'
 
-step 'reconcile the node against the center after the restart'
+step 'reconcile the node against the server after the restart'
 show 'potluck share reconcile --config node/node.json --json'
 RECONCILE_RC=0
 "$POTLUCK" share reconcile --config "$WORK/node/node.json" --json \
@@ -837,11 +837,11 @@ RECONCILE_RC=0
     </dev/null || RECONCILE_RC=$?
 cat "$WORK/logs/reconcile-node-restart.json"
 if [ "$RECONCILE_RC" = 0 ]; then
-    printf 'release_gate.sh:     node and center agree\n'
+    printf 'release_gate.sh:     node and server agree\n'
 elif [ "$RECONCILE_RC" = 1 ]; then
     # One shape of difference is the restart window itself and is *correct*
-    # behaviour: the center dispatched an offer into a link that had just gone,
-    # the node never accepted it, so the center marked that attempt FAILED with
+    # behaviour: the server dispatched an offer into a link that had just gone,
+    # the node never accepted it, so the server marked that attempt FAILED with
     # the settlement HELD and no receipt, and the retry delivered the answer.
     # `share reconcile` naming it is the honest report, not a defect — what would
     # be a defect is a *settled* attempt the node has no record of, which is what
@@ -853,7 +853,7 @@ elif [ "$RECONCILE_RC" = 1 ]; then
         | grep -o 'status=FAILED usage_tokens=[^ ]* settlement=HELD receipt=<none>' \
         | wc -l | tr -d ' ')
     if [ "$TOTAL" = 0 ] || [ "$TOTAL" != "$MISSING" ] || [ "$MISSING" != "$UNSETTLED" ]; then
-        fail 'after the restart the node and center disagree about something that is not an unaccepted, unsettled offer'
+        fail 'after the restart the node and server disagree about something that is not an unaccepted, unsettled offer'
     fi
     printf 'release_gate.sh:     %s difference(s), all of them the restart window: an offer the node never accepted, FAILED with the settlement HELD and no receipt, so nothing was charged for it\n' \
         "$TOTAL"
@@ -861,11 +861,11 @@ else
     fail "share reconcile exited $RECONCILE_RC"
 fi
 
-step 'reconcile the center against itself again'
-show 'potluck-server admin reconcile --config center.json'
-"$POTLUCK_SERVER" admin reconcile --config "$CENTER_JSON" \
-    >"$WORK/logs/reconcile-center-restart.log" 2>&1 </dev/null \
-    || { tail -20 "$WORK/logs/reconcile-center-restart.log" >&2
+step 'reconcile the server against itself again'
+show 'potluck-server admin reconcile --config server.json'
+"$POTLUCK_SERVER" admin reconcile --config "$SERVER_JSON" \
+    >"$WORK/logs/reconcile-server-restart.log" 2>&1 </dev/null \
+    || { tail -20 "$WORK/logs/reconcile-server-restart.log" >&2
          fail 'admin reconcile reported a difference after the restart'; }
 
 # --------------------------------------------------------------------------
@@ -874,9 +874,9 @@ show 'potluck-server admin reconcile --config center.json'
 
 printf 'release_gate.sh: PASS potluck %s at %s\n' "$VERSION" "$SHORT_SHA"
 printf 'release_gate.sh: install.sh into a fresh prefix; the installed package is what ran\n'
-printf 'release_gate.sh: fresh center (no hand-written credentials) + invite-only node and consumer\n'
+printf 'release_gate.sh: fresh server (no hand-written credentials) + invite-only node and consumer\n'
 printf 'release_gate.sh: default-model/default-charge asks: streaming (first increment before completion), buffered, repeat, after restart\n'
 printf 'release_gate.sh: an API key answered /openai/v1/chat/completions buffered and streaming against the real node: %s %s\n' \
     "$OPENAI_BUFFERED_REQUEST" "$OPENAI_STREAM_REQUEST"
-printf 'release_gate.sh: receipts %s %s %s distinct; verified on both sides; node and center reconcile clean\n' \
+printf 'release_gate.sh: receipts %s %s %s distinct; verified on both sides; node and server reconcile clean\n' \
     "$RECEIPT_ID" "$BUFFERED_RECEIPT_ID" "$RESTART_RECEIPT_ID"

@@ -51,7 +51,7 @@ from conftest import Keyring, signed_authorization
 from aipotluck_server.cli import main as server_main
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, Credential
+from aipotluck_server.persistence import Credential, ServerStore
 
 #: The instant every service-level test works from. It is also the
 #: authorization window's midpoint (``conftest.SETTLEMENT_AT``), so a signed
@@ -81,7 +81,7 @@ def _funded_ledger() -> Ledger:
     return book
 
 
-class _Center:
+class _Server:
     """A real service over a real store; a real loopback server when asked.
 
     The settlement key comes from ``Keyring``, which already registers it, so a
@@ -92,12 +92,12 @@ class _Center:
         self.tmp_path = tmp_path
         self.keyring = Keyring()
         self.registry = self.keyring.registry
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.ledger = _funded_ledger()
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id=SETTLEMENT_KEY_ID,
             settlement_private_key_b64=self.keyring.private_b64[SETTLEMENT_KEY_ID],
@@ -156,14 +156,14 @@ class _Center:
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> Any:
-    """A service-level center over a fresh store, closed at the end."""
-    built = _Center(tmp_path)
+def server(tmp_path: Path) -> Any:
+    """A service-level server over a fresh store, closed at the end."""
+    built = _Server(tmp_path)
     yield built
     built.close()
 
 
-def _join_node(center: _Center, code: str = "code-node", *, now: dt.datetime = BASE) -> Any:
+def _join_node(server: _Server, code: str = "code-node", *, now: dt.datetime = BASE) -> Any:
     """Join a node through a real invite; return its ``JoinResult`` and private keys.
 
     The join mints the node identity row (``owner_id == subject_id``), the
@@ -173,14 +173,14 @@ def _join_node(center: _Center, code: str = "code-node", *, now: dt.datetime = B
     """
     node_public, node_private = generate_key_pair()
     device_public, device_private = generate_key_pair()
-    center.store.add_invite(
+    server.store.add_invite(
         code, "node", "auto", max_uses=1, created_at=now, quota_milli_credits=0
     )
-    result = center.service.join(
+    result = server.service.join(
         invite_code=code,
         identity={"public_key_b64": node_public},
         device={"public_key_b64": device_public},
-        center_url="http://center.test",
+        server_url="http://server.test",
         now=now,
     )
     return result, node_private, device_private
@@ -201,23 +201,23 @@ def _node_hello(result: Any) -> NodeHello:
     )
 
 
-def _connect_node(center: _Center, result: Any, sink: Any) -> None:
+def _connect_node(server: _Server, result: Any, sink: Any) -> None:
     """Register the joined node's link, authenticating with its real credential."""
-    credential = center.store.resolve_credential(str(result.node_token), BASE)
+    credential = server.store.resolve_credential(str(result.node_token), BASE)
     assert credential is not None
-    center.service.register_node(
+    server.service.register_node(
         credential=credential, hello=_node_hello(result), enqueue=sink, now=BASE
     )
 
 
-def _admit(center: _Center, request_id: str, idempotency_key: str) -> None:
+def _admit(server: _Server, request_id: str, idempotency_key: str) -> None:
     """Admit one consumer request, which dispatches immediately to a live node."""
-    center.service.admit_request(
+    server.service.admit_request(
         credential=CONSUMER,
         idempotency_key=idempotency_key,
         messages=MESSAGES,
         authorization=signed_authorization(
-            center.keyring, request_id=request_id, messages=MESSAGES, model=MODEL
+            server.keyring, request_id=request_id, messages=MESSAGES, model=MODEL
         ),
         model=MODEL,
         max_charge_milli_credits=20_000,
@@ -232,61 +232,61 @@ def _admit(center: _Center, request_id: str, idempotency_key: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_revoking_the_node_identity_key_withdraws_its_link_token(center: _Center) -> None:
+def test_revoking_the_node_identity_key_withdraws_its_link_token(server: _Server) -> None:
     """The node's own key governs its token, not only the credential row."""
-    result, _, _ = _join_node(center)
-    assert center.store.resolve_credential(str(result.node_token), BASE) is not None
+    result, _, _ = _join_node(server)
+    assert server.store.resolve_credential(str(result.node_token), BASE) is not None
 
-    center.store.revoke_identity(result.key_id, BASE)
+    server.store.revoke_identity(result.key_id, BASE)
 
-    assert center.store.resolve_credential(str(result.node_token), BASE) is None
+    assert server.store.resolve_credential(str(result.node_token), BASE) is None
     # History is preserved, not deleted: a past signature still verifies.
-    row = center.store.get_identity(result.key_id)
+    row = server.store.get_identity(result.key_id)
     assert row is not None and row.revoked_at is not None
 
 
-def test_revoking_the_device_key_withdraws_the_node_link_token(center: _Center) -> None:
+def test_revoking_the_device_key_withdraws_the_node_link_token(server: _Server) -> None:
     """Revoking the device key alone is enough to kill the link token."""
-    result, _, _ = _join_node(center)
-    assert center.store.resolve_credential(str(result.node_token), BASE) is not None
+    result, _, _ = _join_node(server)
+    assert server.store.resolve_credential(str(result.node_token), BASE) is not None
 
-    center.store.revoke_identity(result.device_key_id, BASE)
+    server.store.revoke_identity(result.device_key_id, BASE)
 
-    assert center.store.resolve_credential(str(result.node_token), BASE) is None
-    assert center.store.identity_revoked(result.device_id, BASE) is True
+    assert server.store.resolve_credential(str(result.node_token), BASE) is None
+    assert server.store.identity_revoked(result.device_id, BASE) is True
 
 
-def test_a_token_still_resolves_before_the_revocation_instant(center: _Center) -> None:
+def test_a_token_still_resolves_before_the_revocation_instant(server: _Server) -> None:
     """Revocation closes a window; it does not rewrite the token's whole past."""
-    result, _, _ = _join_node(center)
+    result, _, _ = _join_node(server)
     revoke_at = BASE + dt.timedelta(minutes=1)
-    center.store.revoke_identity(result.device_key_id, revoke_at)
+    server.store.revoke_identity(result.device_key_id, revoke_at)
 
     # Resolving strictly before the revocation still yields the credential...
-    assert center.store.resolve_credential(str(result.node_token), BASE) is not None
+    assert server.store.resolve_credential(str(result.node_token), BASE) is not None
     # ...and at or after it, the token is gone.
-    assert center.store.resolve_credential(str(result.node_token), revoke_at) is None
+    assert server.store.resolve_credential(str(result.node_token), revoke_at) is None
 
 
 def test_repeated_revocation_is_an_idempotent_no_op_that_keeps_the_first_instant(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """A second revoke reports the truth and never moves the recorded instant."""
-    result, _, _ = _join_node(center)
+    result, _, _ = _join_node(server)
 
-    assert center.store.revoke_identity(result.key_id, BASE) is True
-    first = center.store.get_identity(result.key_id).revoked_at
+    assert server.store.revoke_identity(result.key_id, BASE) is True
+    first = server.store.get_identity(result.key_id).revoked_at
     later = BASE + dt.timedelta(seconds=30)
-    assert center.store.revoke_identity(result.key_id, later) is False
+    assert server.store.revoke_identity(result.key_id, later) is False
 
-    assert center.store.get_identity(result.key_id).revoked_at == first
-    assert center.store.resolve_credential(str(result.node_token), later) is None
+    assert server.store.get_identity(result.key_id).revoked_at == first
+    assert server.store.resolve_credential(str(result.node_token), later) is None
 
 
-def test_revoking_an_unknown_key_raises(center: _Center) -> None:
+def test_revoking_an_unknown_key_raises(server: _Server) -> None:
     """Revoking a key nobody joined is a clean, named failure."""
     with pytest.raises(StateTransitionError):
-        center.store.revoke_identity("key-ghost", BASE)
+        server.store.revoke_identity("key-ghost", BASE)
 
 
 # --------------------------------------------------------------------------
@@ -295,36 +295,36 @@ def test_revoking_an_unknown_key_raises(center: _Center) -> None:
 
 
 def test_an_already_connected_node_is_offered_nothing_after_its_device_is_revoked(
-    center: _Center,
+    server: _Server,
 ) -> None:
-    """Revocation bites dispatch on the running center, not only the next dial."""
-    result, _, _ = _join_node(center)
+    """Revocation bites dispatch on the running server, not only the next dial."""
+    result, _, _ = _join_node(server)
     received: list[Envelope] = []
-    _connect_node(center, result, received.append)
+    _connect_node(server, result, received.append)
 
-    _admit(center, "R-1", "idem-1")
+    _admit(server, "R-1", "idem-1")
     assert any(e.type == "attempt.offer" for e in received), "a live node gets work"
     received.clear()
 
     # The device key is revoked while the session stays connected.
-    center.store.revoke_identity(result.device_key_id, BASE)
+    server.store.revoke_identity(result.device_key_id, BASE)
 
-    _admit(center, "R-2", "idem-2")
+    _admit(server, "R-2", "idem-2")
     assert not any(e.type == "attempt.offer" for e in received), (
         "a node whose device key was revoked must be offered no new work"
     )
 
 
-def test_revocation_survives_a_center_restart(tmp_path: Path) -> None:
+def test_revocation_survives_a_server_restart(tmp_path: Path) -> None:
     """The store, not memory, governs: a fresh process keeps the refusal."""
-    center = _Center(tmp_path)
-    result, _, _ = _join_node(center)
+    server = _Server(tmp_path)
+    result, _, _ = _join_node(server)
     token = str(result.node_token)
     device_id = result.device_id
-    center.store.revoke_identity(result.device_key_id, BASE)
-    center.close()
+    server.store.revoke_identity(result.device_key_id, BASE)
+    server.close()
 
-    reopened = CenterStore.open(tmp_path / "center.db")
+    reopened = ServerStore.open(tmp_path / "server.db")
     try:
         assert reopened.resolve_credential(token, BASE) is None
         assert reopened.identity_revoked(device_id, BASE) is True
@@ -389,13 +389,13 @@ def _final_usage_event(
     )
 
 
-def _drive_to_in_flight(center: _Center, result: Any, device_private: str) -> tuple[
+def _drive_to_in_flight(server: _Server, result: Any, device_private: str) -> tuple[
     AttemptOffer, Envelope
 ]:
     """Accept an attempt on the joined node and return its offer and late report."""
     received: list[Envelope] = []
-    _connect_node(center, result, received.append)
-    _admit(center, "R-1", "idem-1")
+    _connect_node(server, result, received.append)
+    _admit(server, "R-1", "idem-1")
     offer = next(
         AttemptOffer.from_payload(e.payload) for e in received if e.type == "attempt.offer"
     )
@@ -408,7 +408,7 @@ def _drive_to_in_flight(center: _Center, result: Any, device_private: str) -> tu
         adapter_name=ADAPTER,
         accepted_at=BASE,
     )
-    center.service.handle_node_message(
+    server.service.handle_node_message(
         node_id=result.device_id,
         envelope=Envelope(
             type="attempt.accept",
@@ -423,50 +423,50 @@ def _drive_to_in_flight(center: _Center, result: Any, device_private: str) -> tu
 
 
 def test_a_late_usage_report_from_a_revoked_device_ends_the_request_with_a_named_result(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """The report is refused, and the request terminates instead of hanging."""
-    result, _, device_private = _join_node(center)
-    offer, usage_event = _drive_to_in_flight(center, result, device_private)
+    result, _, device_private = _join_node(server)
+    offer, usage_event = _drive_to_in_flight(server, result, device_private)
 
     # The device is revoked while its attempt is in flight.
-    center.store.revoke_identity(result.device_key_id, BASE)
+    server.store.revoke_identity(result.device_key_id, BASE)
 
     with pytest.raises(KeyRevokedError):
-        center.service.handle_node_message(
+        server.service.handle_node_message(
             node_id=result.device_id, envelope=usage_event, now=BASE
         )
 
-    request = center.store.get_request(offer.request_id)
+    request = server.store.get_request(offer.request_id)
     assert request is not None
     assert request.status == "FAILED"
     assert request.billing_note is not None and "revoked" in request.billing_note
-    attempt = center.store.get_attempt(offer.attempt_id)
+    attempt = server.store.get_attempt(offer.attempt_id)
     assert attempt is not None
     assert attempt.status == "OUTCOME_UNKNOWN"
     # Usage is held unknown (to be confirmed), never recorded as a free zero.
     assert attempt.usage_status == "UNKNOWN"
     assert attempt.usage_tokens is None
-    assert center.store.get_settlement(offer.request_id, 1) is None
+    assert server.store.get_settlement(offer.request_id, 1) is None
 
 
 def test_a_repeated_late_report_from_a_revoked_device_stays_terminal(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """A retried report — or one replayed after a restart — changes nothing."""
-    result, _, device_private = _join_node(center)
-    offer, usage_event = _drive_to_in_flight(center, result, device_private)
-    center.store.revoke_identity(result.device_key_id, BASE)
+    result, _, device_private = _join_node(server)
+    offer, usage_event = _drive_to_in_flight(server, result, device_private)
+    server.store.revoke_identity(result.device_key_id, BASE)
 
     for _ in range(2):
         with pytest.raises(KeyRevokedError):
-            center.service.handle_node_message(
+            server.service.handle_node_message(
                 node_id=result.device_id, envelope=usage_event, now=BASE
             )
 
-    request = center.store.get_request(offer.request_id)
+    request = server.store.get_request(offer.request_id)
     assert request is not None and request.status == "FAILED"
-    assert center.store.get_settlement(offer.request_id, 1) is None
+    assert server.store.get_settlement(offer.request_id, 1) is None
 
 
 # --------------------------------------------------------------------------
@@ -475,20 +475,20 @@ def test_a_repeated_late_report_from_a_revoked_device_stays_terminal(
 
 
 def test_a_fresh_invite_mints_a_working_token_the_old_one_never_reclaims(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """Re-joining with new material recovers; the revoked token stays dead."""
-    first, _, _ = _join_node(center, code="code-first")
-    center.store.revoke_identity(first.key_id, BASE)
-    center.store.revoke_identity(first.device_key_id, BASE)
-    assert center.store.resolve_credential(str(first.node_token), BASE) is None
+    first, _, _ = _join_node(server, code="code-first")
+    server.store.revoke_identity(first.key_id, BASE)
+    server.store.revoke_identity(first.device_key_id, BASE)
+    assert server.store.resolve_credential(str(first.node_token), BASE) is None
 
-    second, _, _ = _join_node(center, code="code-second")
+    second, _, _ = _join_node(server, code="code-second")
     assert str(second.node_token) != str(first.node_token)
-    revived = center.store.resolve_credential(str(second.node_token), BASE)
+    revived = server.store.resolve_credential(str(second.node_token), BASE)
     assert revived is not None and revived.role == "node"
     # The old credential did not come back to life because somebody re-joined.
-    assert center.store.resolve_credential(str(first.node_token), BASE) is None
+    assert server.store.resolve_credential(str(first.node_token), BASE) is None
 
 
 # --------------------------------------------------------------------------
@@ -500,13 +500,13 @@ def test_admin_revoke_key_is_idempotent_and_reports_clearly(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Drive the operator command twice, then at a key nobody joined."""
-    center = _Center(tmp_path)
+    server = _Server(tmp_path)
     wall = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
     try:
-        result, _, _ = _join_node(center, now=wall)
-        config = tmp_path / "center-admin.json"
+        result, _, _ = _join_node(server, now=wall)
+        config = tmp_path / "server-admin.json"
         config.write_text(
-            json.dumps({"database_path": str(tmp_path / "center.db")}), encoding="utf-8"
+            json.dumps({"database_path": str(tmp_path / "server.db")}), encoding="utf-8"
         )
         key_id = str(result.device_key_id)
 
@@ -526,12 +526,12 @@ def test_admin_revoke_key_is_idempotent_and_reports_clearly(
         err = capsys.readouterr().err
         assert "error" in err and "Traceback" not in err
 
-        # The command's write withdrew the token on the store the center reads.
+        # The command's write withdrew the token on the store the server reads.
         # Resolve at the wall clock the command stamped, not the join instant.
         now = dt.datetime.now(dt.UTC)
-        assert center.store.resolve_credential(str(result.node_token), now) is None
+        assert server.store.resolve_credential(str(result.node_token), now) is None
     finally:
-        center.close()
+        server.close()
 
 
 # --------------------------------------------------------------------------
@@ -541,13 +541,13 @@ def test_admin_revoke_key_is_idempotent_and_reports_clearly(
 
 def test_a_revoked_node_token_is_refused_on_a_real_websocket(tmp_path: Path) -> None:
     """Not just a direct call: the real handshake answers 401 after revocation."""
-    center = _Center(tmp_path, with_server=True)
+    server = _Server(tmp_path, with_server=True)
     wall = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1)
     try:
-        result, _, _ = _join_node(center, now=wall)
+        result, _, _ = _join_node(server, now=wall)
         token = str(result.node_token)
         headers = {"Authorization": f"Bearer {token}"}
-        url = f"ws://127.0.0.1:{center.port}/v1/node-link"
+        url = f"ws://127.0.0.1:{server.port}/v1/node-link"
 
         # Before revocation the token opens a real node link and is acknowledged.
         link = ClientConnection.connect(url, headers=headers, timeout=10)
@@ -559,23 +559,23 @@ def test_a_revoked_node_token_is_refused_on_a_real_websocket(tmp_path: Path) -> 
         finally:
             link.close()
         # The protected node route answers for the live token too.
-        assert center.get("/v1/node/attempts", token)[0] == 200
+        assert server.get("/v1/node/attempts", token)[0] == 200
 
         # Revoke the device key exactly as `admin revoke-key` does.
-        center.store.revoke_identity(result.device_key_id, dt.datetime.now(dt.UTC))
+        server.store.revoke_identity(result.device_key_id, dt.datetime.now(dt.UTC))
 
         # The same token is now refused at the real WebSocket upgrade...
         with pytest.raises(WebSocketProtocolError) as refused:
             ClientConnection.connect(url, headers=headers, timeout=10)
         assert "401" in str(refused.value)
         # ...and at the protected node route.
-        assert center.get("/v1/node/attempts", token)[0] == 401
+        assert server.get("/v1/node/attempts", token)[0] == 401
 
-        # A full center restart keeps the refusal: the store governs, not memory.
-        center.restart()
-        restarted = f"ws://127.0.0.1:{center.port}/v1/node-link"
+        # A full server restart keeps the refusal: the store governs, not memory.
+        server.restart()
+        restarted = f"ws://127.0.0.1:{server.port}/v1/node-link"
         with pytest.raises(WebSocketProtocolError) as after_restart:
             ClientConnection.connect(restarted, headers=headers, timeout=10)
         assert "401" in str(after_restart.value)
     finally:
-        center.close()
+        server.close()

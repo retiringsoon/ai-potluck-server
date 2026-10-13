@@ -4,7 +4,7 @@ The invite flow is the one place a stranger becomes an identity, so these tests
 probe it from every side the contract names: the store's atomic redemption
 rules, the unauthenticated ``POST /v1/join`` endpoint, the ``admin`` and ``join``
 commands, and — the property the feature exists for — a joined identity that
-still authenticates and can still settle after the center is rebuilt from its
+still authenticates and can still settle after the server is rebuilt from its
 SQLite file alone.
 
 The second half pins ``Authorization: AIPotluck-Sig``: the positive path, and
@@ -61,10 +61,10 @@ from aipotluck.wire import (
 from conftest import Keyring
 
 from aipotluck_server.cli import main as server_main
-from aipotluck_server.deploy import load_center
+from aipotluck_server.deploy import load_server
 from aipotluck_server.gateway_server import GatewayServer
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, Credential
+from aipotluck_server.persistence import Credential, ServerStore
 
 #: The instant every test works from; also the midpoint of an authorization's
 #: validity window, so a signed authorization is valid at it with no juggling.
@@ -94,11 +94,11 @@ class _Setup:
         self.tmp_path = tmp_path
         self.keyring = Keyring()
         self.registry = self.keyring.registry
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=self.keyring.private_b64["settlement-key-1"],
@@ -133,7 +133,7 @@ class _Setup:
                 "display_name": None,
             },
             device=device,
-            center_url="http://center.test",
+            server_url="http://server.test",
             now=now,
         )
 
@@ -402,7 +402,7 @@ def test_an_auto_invite_gives_the_joiner_a_private_derived_tenant(setup: _Setup)
     assert result.key_id == result.subject_id
     assert result.tenant_id == "t-" + result.subject_id.split("-", 1)[1]
     assert result.role == "consumer"
-    assert result.center_url == "http://center.test"
+    assert result.server_url == "http://server.test"
     assert setup.store.get_invite("code-auto").used_count == 1
     assert setup.store.get_identity("key-1") is None
 
@@ -554,7 +554,7 @@ def test_the_store_never_stores_the_plaintext_invite_code(setup: _Setup) -> None
     assert setup.store.get_invite(code).code_digest == canonical_digest(code)
     assert setup.store.get_invite("something-else") is None
     blob = b"".join(
-        path.read_bytes() for path in setup.tmp_path.glob("center.db*") if path.is_file()
+        path.read_bytes() for path in setup.tmp_path.glob("server.db*") if path.is_file()
     )
     assert code.encode() not in blob
 
@@ -591,7 +591,7 @@ def test_join_over_http_mints_an_identity_and_echoes_no_secret(setup: _Setup) ->
     assert document["subject_id"].startswith("consumer-")
     assert document["tenant_id"] == "t-" + document["subject_id"].split("-", 1)[1]
     assert document["role"] == "consumer"
-    assert document["center_url"].startswith("http://")
+    assert document["server_url"].startswith("http://")
     assert "code-http" not in json.dumps(document)
 
 
@@ -716,14 +716,14 @@ def test_a_tampered_signature_is_refused_over_http(setup: _Setup) -> None:
 # --------------------------------------------------------------------------
 
 
-def _center_config(tmp_path: Path) -> Path:
-    """Write the minimal center.json `admin` needs (just a database_path).
+def _server_config(tmp_path: Path) -> Path:
+    """Write the minimal server.json `admin` needs (just a database_path).
 
     It names the database the `setup` fixture already created, because an `admin`
-    command opens a center's database and never creates one.
+    command opens a server's database and never creates one.
     """
-    path = tmp_path / "center-admin.json"
-    path.write_text(json.dumps({"database_path": str(tmp_path / "center.db")}), encoding="utf-8")
+    path = tmp_path / "server-admin.json"
+    path.write_text(json.dumps({"database_path": str(tmp_path / "server.db")}), encoding="utf-8")
     return path
 
 
@@ -731,7 +731,7 @@ def test_admin_invite_prints_the_code_once_and_stores_only_its_digest(
     setup: _Setup, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The operator sees the code once; the store keeps only its digest."""
-    config = _center_config(tmp_path)
+    config = _server_config(tmp_path)
     assert server_main(["admin", "invite", "--config", str(config), "--role", "consumer"]) == 0
     captured = capsys.readouterr()
     code = captured.out.strip()
@@ -744,24 +744,24 @@ def test_admin_invite_prints_the_code_once_and_stores_only_its_digest(
     assert invite.tenant_scope == "auto"
     assert invite.used_count == 0
     blob = b"".join(
-        path.read_bytes() for path in tmp_path.glob("center.db*") if path.is_file()
+        path.read_bytes() for path in tmp_path.glob("server.db*") if path.is_file()
     )
     assert code.encode() not in blob
 
 
-def test_admin_invite_refuses_a_center_database_that_is_not_there(
+def test_admin_invite_refuses_a_server_database_that_is_not_there(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Only `serve` creates the center's database; `admin` opens the one there is.
+    """Only `serve` creates the server's database; `admin` opens the one there is.
 
     An invite minted into a database the minting itself created is an invite no
-    center will ever honour: the code is printed once, handed over out of band,
+    server will ever honour: the code is printed once, handed over out of band,
     and the join fails on an unknown code with nothing left to compare against.
     The refusal names the path so the operator sees which of the two it is — a
-    center that was never started here, or a ``database_path`` that is wrong.
+    server that was never started here, or a ``database_path`` that is wrong.
     """
-    database = tmp_path / "not-this-directory" / "center.db"
-    config = tmp_path / "center-typo.json"
+    database = tmp_path / "not-this-directory" / "server.db"
+    config = tmp_path / "server-typo.json"
     config.write_text(json.dumps({"database_path": str(database)}), encoding="utf-8")
 
     assert server_main(["admin", "invite", "--config", str(config), "--role", "consumer"]) == 1
@@ -779,7 +779,7 @@ def test_admin_invite_list_is_redacted(
 ) -> None:
     """The listing shows a digest prefix and never a usable code."""
     setup.mint("code-listed", tenant="tenant-listed")
-    config = _center_config(tmp_path)
+    config = _server_config(tmp_path)
 
     assert server_main(["admin", "invite-list", "--config", str(config)]) == 0
     out = capsys.readouterr().out
@@ -792,7 +792,7 @@ def test_admin_invite_list_is_redacted(
 def test_admin_revoke_key_stops_a_live_key(
     setup: _Setup, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`admin revoke-key` writes the store, and the running center honours it."""
+    """`admin revoke-key` writes the store, and the running server honours it."""
     setup.mint("code-revoke")
     public_b64, private_b64 = generate_key_pair()
     result = setup.join("code-revoke", subject_id="user-rv", key_id="key-rv",
@@ -805,7 +805,7 @@ def test_admin_revoke_key_stops_a_live_key(
         **_auth_kwargs(private_key, key_id, issued_at=BASE), now=BASE
     )
 
-    config = _center_config(tmp_path)
+    config = _server_config(tmp_path)
     assert server_main(["admin", "revoke-key", "--config", str(config), "--key-id", key_id]) == 0
     capsys.readouterr()
 
@@ -823,7 +823,7 @@ def test_admin_revoke_key_unknown_key_fails_cleanly(
     setup: _Setup, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Revoking a key nobody joined reports the failure without a traceback."""
-    config = _center_config(tmp_path)
+    config = _server_config(tmp_path)
     assert server_main(
         ["admin", "revoke-key", "--config", str(config), "--key-id", "key-ghost"]
     ) == 1
@@ -842,7 +842,7 @@ def test_cli_join_saves_a_0600_key_and_a_config_and_prints_no_private_key(
     server.start()
     try:
         assert main([
-            "join", "--center", server.url, "--invite", "code-cli",
+            "join", "--server", server.url, "--invite", "code-cli",
             "--config-dir", str(config_dir), "--subject-id", "user-cli",
         ]) == 0
     finally:
@@ -877,7 +877,7 @@ def test_cli_join_is_idempotent_on_rerun(
     server.start()
     try:
         argv = [
-            "join", "--center", server.url, "--invite", "code-idem",
+            "join", "--server", server.url, "--invite", "code-idem",
             "--config-dir", str(config_dir), "--subject-id", "user-idem",
         ]
         assert main(argv) == 0
@@ -905,7 +905,7 @@ def test_cli_join_after_exhaustion_fails_without_leaking_the_key(
     server.start()
     try:
         code = main([
-            "join", "--center", server.url, "--invite", "code-spent",
+            "join", "--server", server.url, "--invite", "code-spent",
             "--config-dir", str(second_dir), "--subject-id", "user-second",
         ])
     finally:
@@ -1056,15 +1056,15 @@ def test_a_joined_identity_survives_a_restart_and_can_settle_again(
 ) -> None:
     """The headline property: after a rebuild the joined key still works.
 
-    The first center joins an identity from an invite, admits and settles a
-    request with it, and then is closed. A second center is built by
-    `load_center` from the same ``center.db`` (and a ``center.json`` that names
+    The first server joins an identity from an invite, admits and settles a
+    request with it, and then is closed. A second server is built by
+    `load_server` from the same ``server.db`` (and a ``server.json`` that names
     only the settlement key and the provider device key — never the consumer),
     which replays the ``identities`` table into a fresh registry. The same key
     must still authenticate, the old receipt must still be readable, and a new
     request must still settle.
     """
-    # -- first center: join, settle, then close ----------------------------
+    # -- first server: join, settle, then close ----------------------------
     public_b64, private_b64 = generate_key_pair()
     setup.mint("code-restart")
     result = setup.join("code-restart", subject_id="user-joined", key_id="key-joined",
@@ -1089,13 +1089,13 @@ def test_a_joined_identity_survives_a_restart_and_can_settle_again(
     assert document["status"] == "SUCCEEDED"
     receipt_id = document["settlement"]["receipt_id"]
 
-    center_path = tmp_path / "center.json"
-    center_path.write_text(
+    server_path = tmp_path / "server.json"
+    server_path.write_text(
         json.dumps(
             {
                 "host": "127.0.0.1",
                 "port": 0,
-                "database_path": str(tmp_path / "center.db"),
+                "database_path": str(tmp_path / "server.db"),
                 "platform_id": "platform-1",
                 "settlement_key_id": "settlement-key-1",
                 "settlement_private_key_b64": setup.keyring.private_b64["settlement-key-1"],
@@ -1118,8 +1118,8 @@ def test_a_joined_identity_survives_a_restart_and_can_settle_again(
     )
     setup.close()
 
-    # -- second center: rebuilt from the same SQLite file ------------------
-    deployment = load_center(center_path)
+    # -- second server: rebuilt from the same SQLite file ------------------
+    deployment = load_server(server_path)
     try:
         rebuilt = deployment.service
 
@@ -1161,7 +1161,7 @@ def test_consume_invite_is_atomic_under_concurrency(tmp_path: Path) -> None:
     """Two concurrent redemptions of a one-use code admit exactly one."""
     import threading
 
-    store = CenterStore.open(tmp_path / "center.db")
+    store = ServerStore.open(tmp_path / "server.db")
     try:
         store.add_invite("code-race", "consumer", "auto", max_uses=1, created_at=BASE)
         outcomes: list[str] = []
@@ -1189,7 +1189,7 @@ def test_consume_invite_is_atomic_under_concurrency(tmp_path: Path) -> None:
 
 def test_consuming_an_unknown_code_raises(tmp_path: Path) -> None:
     """The atomic consume refuses a code that was never minted."""
-    store = CenterStore.open(tmp_path / "center.db")
+    store = ServerStore.open(tmp_path / "server.db")
     try:
         with pytest.raises(ProtocolError):
             store.consume_invite("code-ghost", at=BASE)

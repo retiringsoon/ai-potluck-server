@@ -1,11 +1,11 @@
-"""Command-line entry point for the center operator: ``potluck-server``.
+"""Command-line entry point for the server operator: ``potluck-server``.
 
-The commands that open a center's own store or run a center. The consumer and
+The commands that open a server's own store or run a server. The consumer and
 contributor commands (``join``, ``ask``, ``share`` and the rest) live in the
 ``ai-potluck`` package's ``potluck`` command; this CLI imports the shared
 presentation and signal helpers from there rather than growing second copies.
 
-* ``serve`` runs a center from ``center.json`` until SIGINT/SIGTERM. The
+* ``serve`` runs a server from ``server.json`` until SIGINT/SIGTERM. The
   startup lines name the bind URL, the node URL, and every provisioned
   provider. They carry no secret: the config's tokens are held by the store as
   digests, and the settlement private key never leaves the process.
@@ -16,15 +16,15 @@ presentation and signal helpers from there rather than growing second copies.
   OpenAI-compatible endpoint and prints the plaintext once; ``admin
   api-key-list`` shows every key with what it has spent, and ``admin
   api-key-revoke`` withdraws one.
-* ``admin session-list`` and ``admin session-show`` read the aggregate the center
+* ``admin session-list`` and ``admin session-show`` read the aggregate the server
   keeps per agent session — turns, tokens, milli-credits, the node that last
   served it — and ``session-show`` lists the receipts behind those totals so a
   summary can be checked against the records that back it.
-* ``admin reconcile`` cross-checks the center's own tables — attempts,
+* ``admin reconcile`` cross-checks the server's own tables — attempts,
   settlements, receipts, transparency-log leaves and the ledger replay log —
   in both directions, and names every record an invariant fails on.
 * ``verify receipt`` runs :mod:`aipotluck.verify`'s five-dimension offline
-  verification over one receipt against the center's own store, which also
+  verification over one receipt against the server's own store, which also
   holds the signed usage report, so every dimension is assessable.
 * ``version`` prints the package and protocol versions.
 
@@ -60,10 +60,10 @@ from aipotluck.errors import PotluckError
 from aipotluck.reconcile import ReceiptVerification
 from aipotluck.wire import SESSION_HEADER
 
-from .deploy import CenterInspection, load_center, load_center_for_inspection
+from .deploy import ServerInspection, load_server, load_server_for_inspection
 from .gateway_service import API_KEY_BYTES, API_KEY_PREFIX, MAX_DEADLINE_MS
-from .persistence import CenterStore
-from .reconcile import reconcile_center, verify_receipt_at_center
+from .persistence import ServerStore
+from .reconcile import reconcile_server, verify_receipt_at_server
 
 PROG = "potluck-server"
 
@@ -86,19 +86,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
-            "Operator tooling for an AI potluck center: run the gateway, mint "
-            "and revoke invites, reconcile the center's own tables, and verify "
-            "a receipt against the center's books."
+            "Operator tooling for an AI potluck server: run the gateway, mint "
+            "and revoke invites, reconcile the server's own tables, and verify "
+            "a receipt against the server's books."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     verify = subparsers.add_parser(
         "verify",
-        help="Verify one receipt against the center's books.",
+        help="Verify one receipt against the server's books.",
         description=(
             "The operator view of the five-dimension receipt verification. "
-            "`verify receipt` opens the center's own database read-only, where "
+            "`verify receipt` opens the server's own database read-only, where "
             "every dimension is assessable because the operator holds the "
             "signed usage report too. The consumer view that reads over HTTP "
             "under a joined identity is `potluck verify receipt --config-dir`."
@@ -115,7 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "allocation_valid, ledger_included and account_history_complete. "
             "They fail independently, and a single green light would otherwise "
             "read as proof the upstream really consumed the tokens.\n\n"
-            "The center's own database is opened read-only and every dimension "
+            "The server's own database is opened read-only and every dimension "
             "is assessable, because the operator holds the signed usage report "
             "too. Nothing is written and nothing is frozen. Exit 0 when no "
             "dimension reported a contradiction, 1 when one did; `unknown` is "
@@ -140,9 +140,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     serve = subparsers.add_parser(
         "serve",
-        help="Run a center gateway from its center.json until SIGINT/SIGTERM.",
+        help="Run a server gateway from its server.json until SIGINT/SIGTERM.",
         description=(
-            "Load, provision and start a center from its JSON configuration, "
+            "Load, provision and start a server from its JSON configuration, "
             "print the bind URL and the node URL, and serve until interrupted."
         ),
     )
@@ -151,16 +151,16 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
         metavar="PATH",
-        help="center.json produced for this deployment.",
+        help="server.json produced for this deployment.",
     )
     serve.set_defaults(handler=_cmd_serve)
 
 
     admin = subparsers.add_parser(
         "admin",
-        help="Operator actions on a center's store (invites, keys, revocation).",
+        help="Operator actions on a server's store (invites, keys, revocation).",
         description=(
-            "Offline operator actions that open the center's store directly. "
+            "Offline operator actions that open the server's store directly. "
             "None of them prints a secret twice: `invite` and `api-key` each "
             "print a fresh plaintext exactly once, and the listing and "
             "revocation views are redacted."
@@ -254,7 +254,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="SUBJECT_ID",
         help=(
             "The consumer this key speaks for: an identity an invite minted, or "
-            "a consumer credential provisioned in center.json. Its account is "
+            "a consumer credential provisioned in server.json. Its account is "
             "what the key spends."
         ),
     )
@@ -336,7 +336,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "session-list",
         help="List agent sessions with what each has cost.",
         description=(
-            "List every agent session the center has aggregated, most recently "
+            "List every agent session the server has aggregated, most recently "
             "active first: the subject it belongs to, how many requests it made, "
             "the tokens and milli-credits its settled turns added up to, the node "
             "that served its last one, and when it was last seen. The totals count "
@@ -350,7 +350,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         dest="subject_id",
         metavar="SUBJECT_ID",
-        help="Only this consumer's sessions, instead of every session in the center.",
+        help="Only this consumer's sessions, instead of every session in the server.",
     )
     session_list.set_defaults(handler=_cmd_admin_session_list)
 
@@ -388,9 +388,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     admin_reconcile = admin_sub.add_parser(
         "reconcile",
-        help="Cross-check the center's own tables and list every difference.",
+        help="Cross-check the server's own tables and list every difference.",
         description=(
-            "Open the center's database read-only and check every invariant that "
+            "Open the server's database read-only and check every invariant that "
             "ties attempts, settlements, receipts, transparency-log leaves and "
             "the ledger replay log together, in both directions: a settled "
             "attempt with no settlement row, a settlement whose receipt is gone, "
@@ -430,7 +430,7 @@ def _add_config_argument(parser: argparse.ArgumentParser) -> None:
         required=True,
         type=Path,
         metavar="PATH",
-        help="center.json whose database_path names the store to open.",
+        help="server.json whose database_path names the store to open.",
     )
 
 
@@ -461,7 +461,7 @@ def _configure_gateway_logging() -> None:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    """Run the ``serve`` subcommand: a center until SIGINT/SIGTERM.
+    """Run the ``serve`` subcommand: a server until SIGINT/SIGTERM.
 
     The startup lines name the bind URL, the node URL, and every provisioned
     provider. They carry no secret: the config's tokens are held by the store
@@ -469,10 +469,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     """
     config: Path = args.config
     _configure_gateway_logging()
-    deployment = load_center(config, start=True)
+    deployment = load_server(config, start=True)
     server = deployment.server
     print(
-        f"{PROG}: center {deployment.config.platform_id} serving {server.url} "
+        f"{PROG}: server {deployment.config.platform_id} serving {server.url} "
         f"(node link {server.node_url})"
     )
     for provider_id in deployment.provider_ids:
@@ -520,11 +520,11 @@ def _cmd_version(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
-def _load_center_store(config: Path) -> CenterStore:
-    """Open the store named by a ``center.json``'s ``database_path``.
+def _load_server_store(config: Path) -> ServerStore:
+    """Open the store named by a ``server.json``'s ``database_path``.
 
     The store must already exist. Every ``admin`` command acts on the database
-    of a center an operator deployed, and only ``potluck-server serve`` creates one: a
+    of a server an operator deployed, and only ``potluck-server serve`` creates one: a
     ``database_path`` that points at nothing — a moved database, a typo, the
     wrong machine — has to be reported, not turned into an empty database that
     ``admin reconcile`` would then find nothing wrong with.
@@ -534,14 +534,14 @@ def _load_center_store(config: Path) -> CenterStore:
             object, names no ``database_path``, or names a database that is not
             there.
     """
-    raw = read_text_file(config, what="center configuration")
+    raw = read_text_file(config, what="server configuration")
     document = canonical.loads_strict(raw)
     if not isinstance(document, dict):
-        raise PotluckError(f"center configuration {config} must be a JSON object")
+        raise PotluckError(f"server configuration {config} must be a JSON object")
     database_path = document.get("database_path")
     if not isinstance(database_path, str) or not database_path:
-        raise PotluckError(f"center configuration {config} names no database_path")
-    return CenterStore.open_existing(database_path)
+        raise PotluckError(f"server configuration {config} names no database_path")
+    return ServerStore.open_existing(database_path)
 
 
 def _parse_duration(text: str) -> dt.timedelta:
@@ -569,7 +569,7 @@ def _cmd_admin_invite(args: argparse.Namespace) -> int:
     now = dt.datetime.now(dt.UTC)
     expires_at = now + _parse_duration(args.expires_in)
     code = secrets.token_urlsafe(24)
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
         store.add_invite(
             code,
@@ -596,7 +596,7 @@ def _cmd_admin_invite(args: argparse.Namespace) -> int:
 
 def _cmd_admin_invite_list(args: argparse.Namespace) -> int:
     """Run ``admin invite-list``: a redacted view of every invite."""
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
         invites = store.list_invites()
     finally:
@@ -616,7 +616,7 @@ def _cmd_admin_revoke_key(args: argparse.Namespace) -> int:
 
     Revocation is written to the store, which the signature path *and* the
     bearer ``resolve_credential`` consult on every request, so it takes effect
-    on a running center without a restart and withdraws the identity's link
+    on a running server without a restart and withdraws the identity's link
     token as well as its signing key. Revoking the device key of a node also
     stops dispatch from offering that already-connected session new work.
 
@@ -624,7 +624,7 @@ def _cmd_admin_revoke_key(args: argparse.Namespace) -> int:
     preserved and the operator is told the key was already revoked, so driving
     a recovery checklist twice gives a clear, idempotent result.
     """
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
         newly_revoked = store.revoke_identity(args.key_id, dt.datetime.now(dt.UTC))
     finally:
@@ -644,14 +644,14 @@ def _cmd_admin_revoke_key(args: argparse.Namespace) -> int:
 def _cmd_admin_api_key(args: argparse.Namespace) -> int:
     """Run ``admin api-key``: mint a key, print it once, store only its digest.
 
-    The subject has to exist. A key minted for a name this center holds no
+    The subject has to exist. A key minted for a name this server holds no
     consumer for would authenticate happily and then fail at settlement, after a
     node had spent real tokens on the request, so the typo is reported here
     instead — where the only thing wasted is a command.
 
     Raises:
         PotluckError: If the quota would admit nothing, the deadline would admit
-            nothing either, or the subject is not a consumer this center knows.
+            nothing either, or the subject is not a consumer this server knows.
     """
     if args.quota < 1:
         raise PotluckError(
@@ -675,16 +675,16 @@ def _cmd_admin_api_key(args: argparse.Namespace) -> int:
         )
     now = dt.datetime.now(dt.UTC)
     expires_at = None if args.expires_in is None else now + _parse_duration(args.expires_in)
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
         binding = store.find_consumer_binding(args.subject_id)
         if binding is None:
             raise PotluckError(
-                f"no consumer {args.subject_id!r} in this center: an API key "
+                f"no consumer {args.subject_id!r} in this server: an API key "
                 "speaks for a consumer that already exists, so join one with an "
                 "invite first (`potluck-server admin invite --role consumer`, "
                 "then `potluck join`) or name a consumer credential from "
-                "center.json"
+                "server.json"
             )
         key_id = f"apikey-{secrets.token_hex(6)}"
         plaintext = API_KEY_PREFIX + secrets.token_urlsafe(API_KEY_BYTES)
@@ -714,7 +714,7 @@ def _cmd_admin_api_key(args: argparse.Namespace) -> int:
         f"(tenant {record.tenant_id}, quota {record.quota_milli_credits} "
         f"milli-credits, expires {expires}, per-request deadline {deadline}); "
         "shown once. Point a client at "
-        "base_url <center-url>/openai/v1 with this key as its API key.",
+        "base_url <server-url>/openai/v1 with this key as its API key.",
         file=sys.stderr,
     )
     return 0
@@ -723,12 +723,12 @@ def _cmd_admin_api_key(args: argparse.Namespace) -> int:
 def _cmd_admin_session_list(args: argparse.Namespace) -> int:
     """Run ``admin session-list``: every session aggregate, most recent first.
 
-    The listing is an operator view of the center's own books, so it prints what
+    The listing is an operator view of the server's own books, so it prints what
     the aggregate holds and nothing it would have to invent: a session whose
     turns have not settled yet shows zero tokens and zero credit, which is the
     truth about what has been billed rather than an estimate of what will be.
     """
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
         sessions = store.sessions(subject_id=args.subject_id)
     finally:
@@ -743,7 +743,7 @@ def _cmd_admin_session_list(args: argparse.Namespace) -> int:
             f"last_seen={record.last_seen_at.isoformat()}"
         )
     if not sessions:
-        scope = f"for subject {args.subject_id}" if args.subject_id else "in this center"
+        scope = f"for subject {args.subject_id}" if args.subject_id else "in this server"
         print(
             f"{PROG}: no agent session {scope}; a session exists once a request "
             "names one, which an OpenAI-compatible caller does with the "
@@ -764,7 +764,7 @@ def _cmd_admin_session_show(args: argparse.Namespace) -> int:
     Raises:
         PotluckError: If no session aggregate carries that identifier.
     """
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
         sessions = store.sessions(subject_id=args.subject_id, session_id=args.session_id)
         receipts = store.receipts_for_session(args.session_id)
@@ -772,7 +772,7 @@ def _cmd_admin_session_show(args: argparse.Namespace) -> int:
         store.close()
     if not sessions:
         raise PotluckError(
-            f"no agent session {args.session_id!r} in this center"
+            f"no agent session {args.session_id!r} in this server"
             + (
                 f" for subject {args.subject_id!r}"
                 if args.subject_id
@@ -801,7 +801,7 @@ def _cmd_admin_session_show(args: argparse.Namespace) -> int:
 
 def _cmd_admin_api_key_list(args: argparse.Namespace) -> int:
     """Run ``admin api-key-list``: every key, with what it has spent."""
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
         keys = store.list_api_keys()
     finally:
@@ -827,12 +827,12 @@ def _cmd_admin_api_key_revoke(args: argparse.Namespace) -> int:
 
     Revocation is written to the store, and the OpenAI-compatible surface
     re-reads the key's row on every request, so a revoked key stops working on a
-    center that is already running rather than at its next restart. What it
+    server that is already running rather than at its next restart. What it
     spent stays on the books: revoking a key withdraws access, not history.
 
     Repeating the command is a safe no-op, and says so.
     """
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
         newly_revoked = store.revoke_api_key(args.key_id, dt.datetime.now(dt.UTC))
     finally:
@@ -846,13 +846,13 @@ def _cmd_admin_api_key_revoke(args: argparse.Namespace) -> int:
 
 
 def _verify_receipt_from_store(config: Path, receipt_id: str) -> ReceiptVerification:
-    """Verify one receipt against the center store a ``center.json`` names.
+    """Verify one receipt against the server store a ``server.json`` names.
 
-    The store is opened through `load_center_for_inspection`, which builds the
-    trusted-key registry a running center would use and writes nothing: no
+    The store is opened through `load_server_for_inspection`, which builds the
+    trusted-key registry a running server would use and writes nothing: no
     credential is provisioned, no float is funded, no socket is bound, and no
     in-memory book is rebuilt. An operator can therefore point this at a live
-    center's database, and a defect in that database is reported instead of
+    server's database, and a defect in that database is reported instead of
     stopping the audit. A database that is not there is reported too rather than
     created, so "the whole store is gone" never reads as "this receipt is not in
     the receipt table".
@@ -861,9 +861,9 @@ def _verify_receipt_from_store(config: Path, receipt_id: str) -> ReceiptVerifica
         PotluckError: If the configuration is malformed, names no
             ``database_path``, or names a database file that does not exist.
     """
-    inspection: CenterInspection = load_center_for_inspection(config)
+    inspection: ServerInspection = load_server_for_inspection(config)
     try:
-        return verify_receipt_at_center(
+        return verify_receipt_at_server(
             store=inspection.store, registry=inspection.registry, receipt_id=receipt_id
         )
     finally:
@@ -874,7 +874,7 @@ def _verify_receipt_from_store(config: Path, receipt_id: str) -> ReceiptVerifica
 def _cmd_verify_receipt(args: argparse.Namespace) -> int:
     """Run ``verify receipt``: the five-dimension check over one receipt.
 
-    The operator view reads the center's own store, so ``--config`` is
+    The operator view reads the server's own store, so ``--config`` is
     required; the consumer view that reads over HTTP under a joined identity
     is ``potluck verify receipt --config-dir``.
 
@@ -892,24 +892,24 @@ def _cmd_verify_receipt(args: argparse.Namespace) -> int:
 
 
 def _cmd_admin_reconcile(args: argparse.Namespace) -> int:
-    """Run ``admin reconcile``: the center's tables cross-checked against each other.
+    """Run ``admin reconcile``: the server's tables cross-checked against each other.
 
     Opens the store the same way ``admin invite-list`` does and reads only. The
     point is to make a one-sided edit or loss visible: any single table can be
     changed on its own, but every invariant here is asserted by two tables at
     once, so the disagreement names the record and the direction it points.
 
-    A center database that is not there is refused instead of created, because
+    A server database that is not there is refused instead of created, because
     the whole-store form of a loss is the one this command exists to surface:
     an empty database holds no rows, so it would report no differences and exit
-    0 over a center that has nothing left.
+    0 over a server that has nothing left.
 
     Returns:
         0 when every invariant held, 1 when any difference stands.
     """
-    store = _load_center_store(args.config)
+    store = _load_server_store(args.config)
     try:
-        differences = reconcile_center(store=store)
+        differences = reconcile_server(store=store)
     finally:
         store.close()
     if args.json_output:

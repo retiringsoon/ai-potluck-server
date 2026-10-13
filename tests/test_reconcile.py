@@ -4,7 +4,7 @@ The bar is the release-readiness review's §3 acceptance line: after any one sid
 loses or edits a single record, a reconciliation command must name that record,
 and on a clean chain all three commands must exit 0. So the end-to-end tests here
 drive `aipotluck.cli.main` the way the installed console script does, against a
-real center on a real loopback socket with a real connector and a fake upstream —
+real server on a real loopback socket with a real connector and a fake upstream —
 no mocked transport and no hand-built books, because a reconciliation tool tested
 against fixtures proves only that it agrees with the fixtures.
 
@@ -16,17 +16,17 @@ Covered:
   so, instead of creating an empty database whose emptiness would read as "no
   differences";
 * a settlement correction — the receipt a node is shown for a settled attempt is
-  the latest revision, the same one the center side reconciles by;
-* a receipt edited in ``center.db`` — `verify receipt` fails the signature and
+  the latest revision, the same one the server side reconciles by;
+* a receipt edited in ``server.db`` — `verify receipt` fails the signature and
   names the receipt, `admin reconcile` names it too;
-* a receipt deleted from ``center.db`` — `verify receipt` reports the missing
+* a receipt deleted from ``server.db`` — `verify receipt` reports the missing
   record, `admin reconcile` names the settlement, the leaf and the request that
   lost it;
 * a transparency-log leaf dropped — `verify receipt` reports ``ledger_included``
   as ``fail``;
 * a node's own ``executions`` row edited or deleted — `share reconcile` names the
   attempt;
-* the center-side invariants and the node-side difference kinds in isolation, so
+* the server-side invariants and the node-side difference kinds in isolation, so
   a check that stops firing is caught by name instead of only by an end-to-end
   test going quietly green.
 
@@ -57,9 +57,9 @@ from aipotluck.metering import NormalizedUsage
 from aipotluck.reconcile import Difference
 
 from aipotluck_server.cli import main as server_main
-from aipotluck_server.deploy import CenterInspection, load_center, load_center_for_inspection
-from aipotluck_server.persistence import CenterStore, SettlementRecord
-from aipotluck_server.reconcile import reconcile_center
+from aipotluck_server.deploy import ServerInspection, load_server, load_server_for_inspection
+from aipotluck_server.persistence import ServerStore, SettlementRecord
+from aipotluck_server.reconcile import reconcile_server
 
 MODEL = "coding-pool"
 PROMPT = "write a haiku about reconciliation"
@@ -107,8 +107,8 @@ class Platform:
     """A whole platform on loopback, joined the way a real deployment joins.
 
     Built through the shipped commands rather than assembled from library calls:
-    ``keygen`` writes the settlement key, ``load_center`` starts the gateway,
-    ``join`` mints the consumer and node identities on the center and saves them
+    ``keygen`` writes the settlement key, ``load_server`` starts the gateway,
+    ``join`` mints the consumer and node identities on the server and saves them
     locally, and ``ask`` produces the receipt every test then reconciles. What
     the tests tamper with afterwards is therefore the same set of files and rows
     an operator would have.
@@ -116,13 +116,13 @@ class Platform:
 
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
-        self.center_dir = tmp_path / "center"
+        self.server_dir = tmp_path / "server"
         self.consumer_dir = tmp_path / "consumer"
         self.node_dir = tmp_path / "node"
-        for directory in (self.center_dir, self.consumer_dir, self.node_dir):
+        for directory in (self.server_dir, self.consumer_dir, self.node_dir):
             directory.mkdir(mode=0o700, parents=True)
-        self.center_json = self.center_dir / "center.json"
-        self.center_db = self.center_dir / "center.db"
+        self.server_json = self.server_dir / "server.json"
+        self.server_db = self.server_dir / "server.db"
         self.node_json = self.node_dir / "node.json"
         self.node_db = self.node_dir / "node.db"
         self.deployment: Any = None
@@ -134,19 +134,19 @@ class Platform:
     # -- setup ------------------------------------------------------------
 
     @property
-    def center_url(self) -> str:
-        """The center's bound HTTP URL."""
+    def server_url(self) -> str:
+        """The server's bound HTTP URL."""
         return str(self.deployment.server.url)
 
     @property
-    def store(self) -> CenterStore:
-        """The center's store, held open by the running gateway."""
+    def store(self) -> ServerStore:
+        """The server's store, held open by the running gateway."""
         return self.deployment.store
 
     def start(self) -> None:
         """Bring the whole platform up and join both parties."""
-        self._write_center_config()
-        self.deployment = load_center(self.center_json, start=True)
+        self._write_server_config()
+        self.deployment = load_server(self.server_json, start=True)
         now = dt.datetime.now(dt.UTC)
         self.store.add_invite(
             CONSUMER_INVITE, "consumer", "friends",
@@ -157,11 +157,11 @@ class Platform:
             max_uses=1, created_at=now, quota_milli_credits=0,
         )
         assert main([
-            "join", "--center", self.center_url, "--invite", CONSUMER_INVITE,
+            "join", "--server", self.server_url, "--invite", CONSUMER_INVITE,
             "--config-dir", str(self.consumer_dir),
         ]) == 0
         assert main([
-            "join", "--node", "--center", self.center_url, "--invite", NODE_INVITE,
+            "join", "--node", "--server", self.server_url, "--invite", NODE_INVITE,
             "--config-dir", str(self.node_dir), "--no-setup",
         ]) == 0
         self._write_node_config()
@@ -177,14 +177,14 @@ class Platform:
             self.deployment.server.stop()
             self.deployment.store.close()
 
-    def _write_center_config(self) -> None:
-        """Write a minimal ``center.json`` over a freshly generated settlement key."""
-        key_path = self.center_dir / "settlement.key"
+    def _write_server_config(self) -> None:
+        """Write a minimal ``server.json`` over a freshly generated settlement key."""
+        key_path = self.server_dir / "settlement.key"
         assert main(["keygen", "--out", str(key_path)]) == 0
         document = {
             "host": "127.0.0.1",
             "port": 0,
-            "database_path": str(self.center_db),
+            "database_path": str(self.server_db),
             "platform_id": "platform-reconcile-test",
             "settlement_key_id": SETTLEMENT_KEY_ID,
             "settlement_private_key_b64": key_path.read_text(encoding="utf-8").strip(),
@@ -197,8 +197,8 @@ class Platform:
         # The settlement private key is written by `keygen` at 0600 and this file
         # carries it, so the configuration gets the same mode: a test fixture is
         # still a file on disk holding key material.
-        self.center_json.write_text(canonicalize(document).decode("utf-8"), encoding="utf-8")
-        self.center_json.chmod(0o600)
+        self.server_json.write_text(canonicalize(document).decode("utf-8"), encoding="utf-8")
+        self.server_json.chmod(0o600)
 
     def _write_node_config(self) -> None:
         """Write ``node.json`` from what ``join --node`` saved, with a fake upstream.
@@ -207,15 +207,15 @@ class Platform:
         HTTP upstream to self-check against. The identity half is copied verbatim
         from what `join` saved — device id, device key id, provider id, device
         private key and the one-time node token — so the node that connects is
-        the node the center provisioned; only the adapter block differs, and a
+        the node the server provisioned; only the adapter block differs, and a
         ``fake`` adapter carries no credential at all.
         """
         identity = _read_json(self.node_dir / "config.json")
         keys = _read_json(self.node_dir / "key.json")
         token = _read_json(self.node_dir / "node_token.json")
-        parts = self.center_url.split("://", 1)[1]
+        parts = self.server_url.split("://", 1)[1]
         document = {
-            "center_url": f"ws://{parts}/v1/node-link",
+            "server_url": f"ws://{parts}/v1/node-link",
             "node_id": identity["device_id"],
             "device_id": identity["device_id"],
             "device_key_id": identity["device_key_id"],
@@ -320,7 +320,7 @@ def _subjects(differences: Sequence[Difference]) -> list[str]:
 
 
 def test_the_clean_chain_exits_zero_from_the_operator_side(settled: Platform) -> None:
-    """§3 acceptance: a clean center and a clean node reconcile without a difference.
+    """§3 acceptance: a clean server and a clean node reconcile without a difference.
 
     Driven through `main` rather than the reconcile library, because the
     acceptance criterion is about exit codes a person sees.
@@ -328,10 +328,10 @@ def test_the_clean_chain_exits_zero_from_the_operator_side(settled: Platform) ->
     receipt_id = settled.store.receipts()[-1].receipt_id
 
     assert server_main([
-        "verify", "receipt", "--config", str(settled.center_json),
+        "verify", "receipt", "--config", str(settled.server_json),
         "--receipt-id", receipt_id,
     ]) == 0
-    assert server_main(["admin", "reconcile", "--config", str(settled.center_json)]) == 0
+    assert server_main(["admin", "reconcile", "--config", str(settled.server_json)]) == 0
     assert main(["share", "reconcile", "--config", str(settled.node_json)]) == 0
 
 
@@ -346,7 +346,7 @@ def test_the_clean_chain_reports_all_five_dimensions_passing_from_the_store(
     """
     receipt_id = settled.store.receipts()[-1].receipt_id
     assert server_main([
-        "verify", "receipt", "--config", str(settled.center_json),
+        "verify", "receipt", "--config", str(settled.server_json),
         "--receipt-id", receipt_id,
     ]) == 0
     out = capsys.readouterr().out
@@ -393,13 +393,13 @@ def test_verify_receipt_json_mode_reports_the_same_verdicts(
     """``--json`` is the same verification, machine-readable and canonical."""
     receipt_id = settled.store.receipts()[-1].receipt_id
     assert server_main([
-        "verify", "receipt", "--config", str(settled.center_json),
+        "verify", "receipt", "--config", str(settled.server_json),
         "--receipt-id", receipt_id, "--json",
     ]) == 0
     document = loads_strict(capsys.readouterr().out.strip().encode("utf-8"))
     assert isinstance(document, dict)
     assert document["receipt_id"] == receipt_id
-    assert document["source"] == "center-store"
+    assert document["source"] == "server-store"
     assert document["failed"] is False
     assert document["all_pass"] is True
     verdicts = document["verdicts"]
@@ -414,7 +414,7 @@ def test_verify_receipt_json_mode_reports_the_same_verdicts(
 def test_share_reconcile_json_mode_lists_no_difference_on_a_clean_node(
     settled: Platform, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The node side reports one local execution and one matching center attempt."""
+    """The node side reports one local execution and one matching server attempt."""
     assert main(["share", "reconcile", "--config", str(settled.node_json), "--json"]) == 0
     document = loads_strict(capsys.readouterr().out.strip().encode("utf-8"))
     assert isinstance(document, dict)
@@ -435,21 +435,21 @@ def test_the_three_commands_leave_both_databases_untouched(settled: Platform) ->
     thing somebody is trying to trust.
     """
     receipt_id = settled.store.receipts()[-1].receipt_id
-    center_before = _database_digest(settled.center_db)
+    server_before = _database_digest(settled.server_db)
     node_before = _database_digest(settled.node_db)
 
     assert server_main([
-        "verify", "receipt", "--config", str(settled.center_json),
+        "verify", "receipt", "--config", str(settled.server_json),
         "--receipt-id", receipt_id,
     ]) == 0
     assert main([
         "verify", "receipt", "--config-dir", str(settled.consumer_dir),
         "--receipt-id", receipt_id,
     ]) == 0
-    assert server_main(["admin", "reconcile", "--config", str(settled.center_json)]) == 0
+    assert server_main(["admin", "reconcile", "--config", str(settled.server_json)]) == 0
     assert main(["share", "reconcile", "--config", str(settled.node_json)]) == 0
 
-    assert _database_digest(settled.center_db) == center_before
+    assert _database_digest(settled.server_db) == server_before
     assert _database_digest(settled.node_db) == node_before
 
 
@@ -458,15 +458,15 @@ def test_the_three_commands_leave_both_databases_untouched(settled: Platform) ->
 # ---------------------------------------------------------------------------
 
 
-def test_a_center_database_that_was_lost_is_reported_and_not_rebuilt(
+def test_a_server_database_that_was_lost_is_reported_and_not_rebuilt(
     settled: Platform, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The one loss an audit must never wash clean: the whole center database gone.
+    """The one loss an audit must never wash clean: the whole server database gone.
 
     ``sqlite3`` creates the file it is pointed at, so both operator commands used
     to open an empty database when ``database_path`` named nothing. An empty
     database holds no rows, so it holds no discrepancies either: `admin reconcile`
-    printed that both sides agree and exited 0 over a center with nothing left,
+    printed that both sides agree and exited 0 over a server with nothing left,
     and `verify receipt --config` reported a receipt as missing from the receipt
     table when in fact the whole store was. "The database is gone" and "the
     database is empty and clean" have to be different answers.
@@ -476,23 +476,23 @@ def test_a_center_database_that_was_lost_is_reported_and_not_rebuilt(
     the configured path names nothing.
     """
     receipt_id = settled.store.receipts()[-1].receipt_id
-    moved_aside = settled.center_db.parent / "center.db.moved-aside"
-    settled.center_db.rename(moved_aside)
+    moved_aside = settled.server_db.parent / "server.db.moved-aside"
+    settled.server_db.rename(moved_aside)
     try:
-        assert server_main(["admin", "reconcile", "--config", str(settled.center_json)]) == 1
+        assert server_main(["admin", "reconcile", "--config", str(settled.server_json)]) == 1
         assert server_main([
-            "verify", "receipt", "--config", str(settled.center_json),
+            "verify", "receipt", "--config", str(settled.server_json),
             "--receipt-id", receipt_id,
         ]) == 1
 
         error = capsys.readouterr().err
         assert error.count("does not exist") == 2, error
-        assert str(settled.center_db) in error
+        assert str(settled.server_db) in error
         assert "potluck serve" in error, "the message must say what to do next"
-        assert not settled.center_db.exists(), "a lost database must not be rebuilt"
+        assert not settled.server_db.exists(), "a lost database must not be rebuilt"
     finally:
-        if not settled.center_db.exists():
-            moved_aside.rename(settled.center_db)
+        if not settled.server_db.exists():
+            moved_aside.rename(settled.server_db)
 
 
 # ---------------------------------------------------------------------------
@@ -518,14 +518,14 @@ def test_an_edited_receipt_is_named_by_verify_receipt_and_by_admin_reconcile(
     assert isinstance(payload, dict)
     payload["billable_tokens"] = str(int(str(payload["billable_tokens"])) + 999)
     _execute(
-        settled.center_db,
+        settled.server_db,
         "UPDATE receipts SET receipt_json = ? WHERE receipt_id = ?",
         canonicalize(document).decode("utf-8"),
         receipt_id,
     )
 
     assert server_main([
-        "verify", "receipt", "--config", str(settled.center_json),
+        "verify", "receipt", "--config", str(settled.server_json),
         "--receipt-id", receipt_id,
     ]) == 1
     out = capsys.readouterr().out
@@ -533,7 +533,7 @@ def test_an_edited_receipt_is_named_by_verify_receipt_and_by_admin_reconcile(
     assert receipt_id in out
     assert "was edited" in out
 
-    assert server_main(["admin", "reconcile", "--config", str(settled.center_json)]) == 1
+    assert server_main(["admin", "reconcile", "--config", str(settled.server_json)]) == 1
     out = capsys.readouterr().out
     assert f"receipt {receipt_id}" in out
     assert "receipt_hash_mismatch" in out
@@ -550,17 +550,17 @@ def test_a_deleted_receipt_is_named_by_verify_receipt_and_by_admin_reconcile(
     rather than the settlement.
     """
     receipt_id = settled.store.receipts()[-1].receipt_id
-    _execute(settled.center_db, "DELETE FROM receipts WHERE receipt_id = ?", receipt_id)
+    _execute(settled.server_db, "DELETE FROM receipts WHERE receipt_id = ?", receipt_id)
 
     assert server_main([
-        "verify", "receipt", "--config", str(settled.center_json),
+        "verify", "receipt", "--config", str(settled.server_json),
         "--receipt-id", receipt_id,
     ]) == 1
     out = capsys.readouterr().out
     assert receipt_id in out
-    assert "not in the center's receipts table" in out
+    assert "not in the server's receipts table" in out
 
-    assert server_main(["admin", "reconcile", "--config", str(settled.center_json)]) == 1
+    assert server_main(["admin", "reconcile", "--config", str(settled.server_json)]) == 1
     out = capsys.readouterr().out
     assert receipt_id in out
     assert "settlement_without_receipt" in out
@@ -584,10 +584,10 @@ def test_a_dropped_log_leaf_fails_ledger_included(
     verdict must be ``fail`` and not ``unknown``.
     """
     receipt_id = settled.store.receipts()[-1].receipt_id
-    _execute(settled.center_db, "DELETE FROM log_leaves WHERE log_index = 0")
+    _execute(settled.server_db, "DELETE FROM log_leaves WHERE log_index = 0")
 
     assert server_main([
-        "verify", "receipt", "--config", str(settled.center_json),
+        "verify", "receipt", "--config", str(settled.server_json),
         "--receipt-id", receipt_id,
     ]) == 1
     out = capsys.readouterr().out
@@ -595,8 +595,8 @@ def test_a_dropped_log_leaf_fails_ledger_included(
     assert receipt_id in out
     assert "no inclusion proof" in out
 
-    # The center-side cross-check sees the same loss from the other direction.
-    assert server_main(["admin", "reconcile", "--config", str(settled.center_json)]) == 1
+    # The server-side cross-check sees the same loss from the other direction.
+    assert server_main(["admin", "reconcile", "--config", str(settled.server_json)]) == 1
     out = capsys.readouterr().out
     assert "receipt_without_log_leaf" in out
 
@@ -611,17 +611,17 @@ def test_a_leaf_moved_to_another_index_fails_ledger_included(
     and the leaf now sitting there is a different commitment.
     """
     receipt_id = settled.store.receipts()[-1].receipt_id
-    _execute(settled.center_db, "UPDATE log_leaves SET log_index = 7 WHERE log_index = 0")
+    _execute(settled.server_db, "UPDATE log_leaves SET log_index = 7 WHERE log_index = 0")
 
     assert server_main([
-        "verify", "receipt", "--config", str(settled.center_json),
+        "verify", "receipt", "--config", str(settled.server_json),
         "--receipt-id", receipt_id,
     ]) == 1
     out = capsys.readouterr().out
     assert "ledger_included           : fail" in out
     assert receipt_id in out
 
-    assert server_main(["admin", "reconcile", "--config", str(settled.center_json)]) == 1
+    assert server_main(["admin", "reconcile", "--config", str(settled.server_json)]) == 1
     out = capsys.readouterr().out
     assert "log_gap" in out
     assert "receipt_log_index_mismatch" in out
@@ -639,7 +639,7 @@ def test_an_edited_node_execution_is_named_by_share_reconcile(
     """A contributor's edited local row is named by attempt, with both sides shown.
 
     The state is flipped from ``SUBMITTED`` to ``FAILED``: the node's own record
-    then says the attempt failed while the center says it completed and settled,
+    then says the attempt failed while the server says it completed and settled,
     which is the disagreement a contributor needs to see before arguing about a
     payment.
     """
@@ -662,7 +662,7 @@ def test_a_deleted_node_execution_is_named_by_share_reconcile(
 ) -> None:
     """A node that lost its own record of an attempt is told which attempt.
 
-    The other direction from the edit above: the center still has the attempt and
+    The other direction from the edit above: the server still has the attempt and
     settled it, and this machine has no row for it at all.
     """
     attempt_id = _only_attempt_id(settled)
@@ -677,7 +677,7 @@ def test_a_deleted_node_execution_is_named_by_share_reconcile(
 def test_an_edited_upstream_call_count_is_named_by_share_reconcile(
     settled: Platform, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A local claim of two upstream calls is reported even though the center cannot see it.
+    """A local claim of two upstream calls is reported even though the server cannot see it.
 
     `begin_execution` exists so a reconnect cannot issue a second upstream call,
     so a count above one means either that guarantee broke or the row was edited.
@@ -699,7 +699,7 @@ def test_an_edited_upstream_call_count_is_named_by_share_reconcile(
 def test_a_node_record_claiming_zero_upstream_calls_is_named(
     settled: Platform, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A center that bills for a call this node never made is a named difference."""
+    """A server that bills for a call this node never made is a named difference."""
     attempt_id = _only_attempt_id(settled)
     _execute(
         settled.node_db, "UPDATE executions SET upstream_calls = 0 WHERE attempt_id = ?",
@@ -734,18 +734,18 @@ def test_share_reconcile_never_prints_the_node_token(
 
 
 def _only_attempt_id(platform: Platform) -> str:
-    """Return the single attempt the center dispatched to this node."""
+    """Return the single attempt the server dispatched to this node."""
     attempts = platform.store.attempts()
     assert len(attempts) == 1, "the harness settles exactly one request"
     return attempts[0].attempt_id
 
 
 # ---------------------------------------------------------------------------
-# The consumer side sees a center-side loss too
+# The consumer side sees a server-side loss too
 # ---------------------------------------------------------------------------
 
 
-def test_a_consumer_reading_a_receipt_the_center_lost_is_told(
+def test_a_consumer_reading_a_receipt_the_server_lost_is_told(
     settled: Platform, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The HTTP path reports a missing receipt as a failure, not an empty verdict.
@@ -755,7 +755,7 @@ def test_a_consumer_reading_a_receipt_the_center_lost_is_told(
     consumer who paid must be able to point at the charge that disappeared.
     """
     receipt_id = settled.store.receipts()[-1].receipt_id
-    _execute(settled.center_db, "DELETE FROM receipts WHERE receipt_id = ?", receipt_id)
+    _execute(settled.server_db, "DELETE FROM receipts WHERE receipt_id = ?", receipt_id)
 
     assert main([
         "verify", "receipt", "--config-dir", str(settled.consumer_dir),
@@ -771,13 +771,13 @@ def test_a_consumer_reading_a_receipt_somebody_edited_is_told(
     """The consumer side of an edited receipt fails the signature and names it.
 
     The operator-side twin of this check reads the same row out of the database;
-    this one reads what the center *serves* over HTTP, which is the copy a
+    this one reads what the server *serves* over HTTP, which is the copy a
     consumer can actually hold anybody to. The edit is inside the signed payload,
-    so the receipt the center hands over no longer hashes to the commitment its
+    so the receipt the server hands over no longer hashes to the commitment its
     own signature covers — the one thing a consumer can check without trusting
-    the center's arithmetic.
+    the server's arithmetic.
     """
-    from aipotluck.reconcile import verify_receipt_from_center
+    from aipotluck.reconcile import verify_receipt_from_server
 
     stored = settled.store.receipts()[-1]
     document = loads_strict(stored.receipt_json.encode("utf-8"))
@@ -786,14 +786,14 @@ def test_a_consumer_reading_a_receipt_somebody_edited_is_told(
     assert isinstance(payload, dict)
     payload["billable_tokens"] = str(int(str(payload["billable_tokens"])) + 999)
     _execute(
-        settled.center_db,
+        settled.server_db,
         "UPDATE receipts SET receipt_json = ? WHERE receipt_id = ?",
         canonicalize(document).decode("utf-8"),
         stored.receipt_id,
     )
 
     documents = settled.consumer_documents(stored.receipt_id)
-    verification = verify_receipt_from_center(
+    verification = verify_receipt_from_server(
         receipt_document=documents["receipt"],
         checkpoint_document=documents["checkpoint"],
         history_document=documents["history"],
@@ -809,16 +809,16 @@ def test_a_consumer_history_that_omits_the_receipt_is_a_named_finding(
     """A receipt served but absent from the account's own history contradicts itself.
 
     This is the check `account_history_complete` exists for on the consumer side:
-    the center can serve a receipt for a charge its books never recorded against
+    the server can serve a receipt for a charge its books never recorded against
     this account, and the two answers disagree.
     """
     receipt_id = settled.store.receipts()[-1].receipt_id
     documents = settled.consumer_documents(receipt_id)
     documents["history"]["receipt_ids"] = []
 
-    from aipotluck.reconcile import verify_receipt_from_center
+    from aipotluck.reconcile import verify_receipt_from_server
 
-    verification = verify_receipt_from_center(
+    verification = verify_receipt_from_server(
         receipt_document=documents["receipt"],
         checkpoint_document=documents["checkpoint"],
         history_document=documents["history"],
@@ -831,13 +831,13 @@ def test_a_consumer_history_truncated_against_its_own_count_fails(
     settled: Platform,
 ) -> None:
     """An entry list shorter than the count the same response carried is a gap."""
-    from aipotluck.reconcile import verify_receipt_from_center
+    from aipotluck.reconcile import verify_receipt_from_server
 
     receipt_id = settled.store.receipts()[-1].receipt_id
     documents = settled.consumer_documents(receipt_id)
     documents["history"]["entry_count"] = int(documents["history"]["entry_count"]) + 1
 
-    verification = verify_receipt_from_center(
+    verification = verify_receipt_from_server(
         receipt_document=documents["receipt"],
         checkpoint_document=documents["checkpoint"],
         history_document=documents["history"],
@@ -851,10 +851,10 @@ def test_a_consumer_served_a_contract_that_is_not_the_promised_one_fails(
 ) -> None:
     """A served allocation contract must hash to the digest bound into the receipt.
 
-    Without this the center could hand a verifier weights that justify any split
+    Without this the server could hand a verifier weights that justify any split
     at all, and `allocation_valid` would pass on the strength of its own answer.
     """
-    from aipotluck.reconcile import verify_receipt_from_center
+    from aipotluck.reconcile import verify_receipt_from_server
 
     receipt_id = settled.store.receipts()[-1].receipt_id
     documents = settled.consumer_documents(receipt_id)
@@ -862,7 +862,7 @@ def test_a_consumer_served_a_contract_that_is_not_the_promised_one_fails(
     assert isinstance(contract, dict)
     contract["weights"] = {"someone-else": 100}
 
-    verification = verify_receipt_from_center(
+    verification = verify_receipt_from_server(
         receipt_document=documents["receipt"],
         checkpoint_document=documents["checkpoint"],
         history_document=documents["history"],
@@ -881,13 +881,13 @@ def test_a_consumer_verdict_without_a_checkpoint_key_does_not_pass_blindly(
     ``pass`` without an authenticated root. Silently passing either would be the
     failure mode the whole module exists to avoid.
     """
-    from aipotluck.reconcile import verify_receipt_from_center
+    from aipotluck.reconcile import verify_receipt_from_server
 
     receipt_id = settled.store.receipts()[-1].receipt_id
     documents = settled.consumer_documents(receipt_id)
     del documents["checkpoint"]["public_key_b64"]
 
-    verification = verify_receipt_from_center(
+    verification = verify_receipt_from_server(
         receipt_document=documents["receipt"],
         checkpoint_document=documents["checkpoint"],
         history_document=documents["history"],
@@ -899,23 +899,23 @@ def test_a_consumer_verdict_without_a_checkpoint_key_does_not_pass_blindly(
 
 
 # ---------------------------------------------------------------------------
-# The center-side invariants, one at a time
+# The server-side invariants, one at a time
 # ---------------------------------------------------------------------------
 
 
-def _inspection(platform: Platform) -> CenterInspection:
-    """Open the platform's center for reading, the way the CLI does."""
-    return load_center_for_inspection(platform.center_json)
+def _inspection(platform: Platform) -> ServerInspection:
+    """Open the platform's server for reading, the way the CLI does."""
+    return load_server_for_inspection(platform.server_json)
 
 
 def test_admin_reconcile_reports_an_orphan_receipt(settled: Platform) -> None:
     """A receipt no settlement names points at a mint outside the settlement path."""
     stored = settled.store.receipts()[-1]
     _execute(
-        settled.center_db,
+        settled.server_db,
         "DELETE FROM settlements WHERE receipt_id = ?", stored.receipt_id,
     )
-    differences = _center_differences(settled)
+    differences = _server_differences(settled)
     assert "orphan_receipt" in _kinds(differences)
     assert f"receipt {stored.receipt_id}" in _subjects(differences)
 
@@ -925,8 +925,8 @@ def test_admin_reconcile_reports_a_settled_attempt_with_no_settlement(
 ) -> None:
     """The attempt says it was billed; the settlements table has nothing to show."""
     attempt_id = _only_attempt_id(settled)
-    _execute(settled.center_db, "DELETE FROM settlements")
-    differences = _center_differences(settled)
+    _execute(settled.server_db, "DELETE FROM settlements")
+    differences = _server_differences(settled)
     kinds = _kinds(differences)
     assert "settled_attempt_without_settlement" in kinds
     assert f"attempt {attempt_id}" in _subjects(differences)
@@ -947,11 +947,11 @@ def test_admin_reconcile_reports_a_receipt_whose_journal_disagrees_on_amount(
     receipt_id = settled.store.receipts()[-1].receipt_id
     attempt_id = _only_attempt_id(settled)
     _execute(
-        settled.center_db,
+        settled.server_db,
         "UPDATE attempts SET usage_tokens = usage_tokens + 500 WHERE attempt_id = ?",
         attempt_id,
     )
-    differences = _center_differences(settled)
+    differences = _server_differences(settled)
     assert "receipt_usage_amount_mismatch" in _kinds(differences)
     assert f"receipt {receipt_id}" in _subjects(differences)
 
@@ -963,11 +963,11 @@ def test_admin_reconcile_reports_an_unbalanced_journal(settled: Platform) -> Non
     assert isinstance(document, dict)
     journal_id = document["payload"]["journal_id"]
     _execute(
-        settled.center_db,
+        settled.server_db,
         "UPDATE ledger_events SET payload_json = ? WHERE kind = 'journal'",
         _unbalanced_journal(settled, str(journal_id)),
     )
-    differences = _center_differences(settled)
+    differences = _server_differences(settled)
     assert "unbalanced_journal" in _kinds(differences)
 
 
@@ -989,8 +989,8 @@ def test_admin_reconcile_reports_a_receipt_with_no_winner_attempt(
 ) -> None:
     """A receipt pointing at an attempt the table lost cannot be checked at all."""
     attempt_id = _only_attempt_id(settled)
-    _execute(settled.center_db, "DELETE FROM attempts WHERE attempt_id = ?", attempt_id)
-    differences = _center_differences(settled)
+    _execute(settled.server_db, "DELETE FROM attempts WHERE attempt_id = ?", attempt_id)
+    differences = _server_differences(settled)
     assert "receipt_without_winner_attempt" in _kinds(differences)
 
 
@@ -998,7 +998,7 @@ def test_admin_reconcile_reports_a_duplicate_receipt_hash(settled: Platform) -> 
     """Two receipt rows under one hash mean one commitment was logged twice."""
     stored = settled.store.receipts()[-1]
     _execute(
-        settled.center_db,
+        settled.server_db,
         "INSERT INTO receipts (receipt_id, request_id, receipt_hash, log_index,"
         " receipt_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         f"{stored.receipt_id}-copy",
@@ -1008,43 +1008,43 @@ def test_admin_reconcile_reports_a_duplicate_receipt_hash(settled: Platform) -> 
         stored.receipt_json,
         stored.created_at.isoformat(),
     )
-    differences = _center_differences(settled)
+    differences = _server_differences(settled)
     assert "duplicate_receipt_hash" in _kinds(differences)
 
 
-def _center_differences(platform: Platform) -> list[Difference]:
-    """Run the center-side cross-check against the platform's database."""
-    store = CenterStore.open(platform.center_db)
+def _server_differences(platform: Platform) -> list[Difference]:
+    """Run the server-side cross-check against the platform's database."""
+    store = ServerStore.open(platform.server_db)
     try:
-        return reconcile_center(store=store)
+        return reconcile_server(store=store)
     finally:
         store.close()
 
 
-def test_a_clean_center_has_no_differences(settled: Platform) -> None:
+def test_a_clean_server_has_no_differences(settled: Platform) -> None:
     """The invariant list is empty on an untouched chain, so it can gate on emptiness."""
-    assert _center_differences(settled) == []
+    assert _server_differences(settled) == []
     inspection = _inspection(settled)
     try:
-        assert reconcile_center(store=inspection.store) == []
+        assert reconcile_server(store=inspection.store) == []
     finally:
         inspection.close()
 
 
 def test_inspection_writes_nothing(settled: Platform) -> None:
-    """Opening a center for inspection must not change a byte of its books.
+    """Opening a server for inspection must not change a byte of its books.
 
-    `load_center` funds floats and provisions credentials; the inspection handle
+    `load_server` funds floats and provisions credentials; the inspection handle
     deliberately does neither, because an audit command that altered what it
-    audited would be unusable on a live center.
+    audited would be unusable on a live server.
     """
-    before = _database_digest(settled.center_db)
+    before = _database_digest(settled.server_db)
     inspection = _inspection(settled)
     try:
-        reconcile_center(store=inspection.store)
+        reconcile_server(store=inspection.store)
     finally:
         inspection.close()
-    assert _database_digest(settled.center_db) == before
+    assert _database_digest(settled.server_db) == before
 
 
 def _database_digest(database: Path) -> str:
@@ -1080,21 +1080,21 @@ def _cell(value: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def test_the_registry_learned_from_a_center_can_verify_its_own_receipt(
+def test_the_registry_learned_from_a_server_can_verify_its_own_receipt(
     settled: Platform,
 ) -> None:
-    """An inspection registry is the same trust set a running center uses.
+    """An inspection registry is the same trust set a running server uses.
 
     Pinned because the whole operator-side verification rests on it: if the
     replay dropped the joined consumer's key or the device binding, `signature_valid`
     would fail on a clean chain and the command would be useless.
     """
-    from aipotluck_server.reconcile import verify_receipt_at_center
+    from aipotluck_server.reconcile import verify_receipt_at_server
 
     receipt_id = settled.store.receipts()[-1].receipt_id
     inspection = _inspection(settled)
     try:
-        verification = verify_receipt_at_center(
+        verification = verify_receipt_at_server(
             store=inspection.store, registry=inspection.registry, receipt_id=receipt_id
         )
     finally:
@@ -1106,11 +1106,11 @@ def test_the_registry_learned_from_a_center_can_verify_its_own_receipt(
 
 def test_a_receipt_id_nobody_ever_issued_is_reported(settled: Platform) -> None:
     """An unknown id is a finding, not an exception: the answer is still about a record."""
-    from aipotluck_server.reconcile import verify_receipt_at_center
+    from aipotluck_server.reconcile import verify_receipt_at_server
 
     inspection = _inspection(settled)
     try:
-        verification = verify_receipt_at_center(
+        verification = verify_receipt_at_server(
             store=inspection.store,
             registry=inspection.registry,
             receipt_id="R-never-issued",
@@ -1125,14 +1125,14 @@ def test_an_empty_registry_cannot_verify_a_receipt(settled: Platform) -> None:
     """A verifier holding no trusted keys fails the signature dimension.
 
     Fail closed: without the settlement key there is nothing to check the
-    receipt against, and passing would mean trusting the center's own claim.
+    receipt against, and passing would mean trusting the server's own claim.
     """
-    from aipotluck_server.reconcile import verify_receipt_at_center
+    from aipotluck_server.reconcile import verify_receipt_at_server
 
     receipt_id = settled.store.receipts()[-1].receipt_id
-    store = CenterStore.open(settled.center_db)
+    store = ServerStore.open(settled.server_db)
     try:
-        verification = verify_receipt_at_center(
+        verification = verify_receipt_at_server(
             store=store, registry=IdentityRegistry(), receipt_id=receipt_id
         )
     finally:
@@ -1150,24 +1150,24 @@ def test_two_settled_requests_reconcile_together(settled: Platform) -> None:
     settled.settle_one_request()
     receipts = settled.store.receipts()
     assert len(receipts) == 2
-    assert _center_differences(settled) == []
+    assert _server_differences(settled) == []
     for stored in receipts:
         assert server_main([
-            "verify", "receipt", "--config", str(settled.center_json),
+            "verify", "receipt", "--config", str(settled.server_json),
             "--receipt-id", stored.receipt_id,
         ]) == 0
     assert main(["share", "reconcile", "--config", str(settled.node_json)]) == 0
 
 
 # ---------------------------------------------------------------------------
-# The receipt a node is shown is the revision the center itself reads
+# The receipt a node is shown is the revision the server itself reads
 # ---------------------------------------------------------------------------
 
 
 def test_a_node_view_names_the_latest_settlement_revision(settled: Platform) -> None:
     """A settlement correction is what the contributor sees, not the revision it replaced.
 
-    `reconcile_center` reads a settlement by its highest revision, because a
+    `reconcile_server` reads a settlement by its highest revision, because a
     revision is immutable and a later one supersedes the earlier. The node
     endpoint reads the same rows for the same question — which receipt did this
     attempt settle into — so it has to apply the same rule, or one reconciliation

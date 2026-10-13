@@ -1,7 +1,7 @@
 [project]
 name = "ai-potluck-server"
 version = "0.1.0"
-description = "AI potluck center: gateway, settlement books, and operator tooling over the ai-potluck protocol core"
+description = "AI potluck server: gateway, settlement books, and operator tooling over the ai-potluck protocol core"
 readme = "README.md"
 license = "MIT"
 authors = [

@@ -49,7 +49,7 @@ What this file canNOT prove
   process, so the "interruption" is an exception raised from a named method. It
   exercises the transaction boundaries, not ``SIGKILL``, WAL recovery, or the OS.
 * It does not make the offer/acceptance context survive a restart. When a
-  settlement is interrupted and the center is then *rebuilt*, the resend can no
+  settlement is interrupted and the server is then *rebuilt*, the resend can no
   longer settle (`GatewayError: no permit context`) and the request converges as
   unknown — see `test_an_interrupted_settlement_survives_a_restart_as_an_untouched_request`,
   which asserts that honestly rather than papering over it.
@@ -98,16 +98,16 @@ from aipotluck.wire import (
 )
 from conftest import Keyring
 
-from aipotluck_server.deploy import load_center
+from aipotluck_server.deploy import load_server
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, Credential
+from aipotluck_server.persistence import Credential, ServerStore
 
 BASE = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
 MODEL = "coding-pool"
 DELIVERY = "buffered_complete"
 
 #: The five durable writes an interruption can land on. Each name is a method on
-#: `CenterStore`; the first is the event-acceptance write and the rest are the
+#: `ServerStore`; the first is the event-acceptance write and the rest are the
 #: steps of the atomic settlement bundle.
 BOUNDARIES = (
     "append_event",
@@ -196,7 +196,7 @@ def _usage_envelope(
     """Build a `usage.final` event carrying a device-signed usage report.
 
     `signing_key_id` and `claimed_device_id` are separate so a test can present a
-    report signed by a key the center did *not* offer the work to, which is the
+    report signed by a key the server did *not* offer the work to, which is the
     "wrong authority" refusal case.
     """
     report = UsageReport(
@@ -294,11 +294,11 @@ class _Rig:
         self.tmp_path = tmp_path
         self.keyring = Keyring()
         self.registry = self.keyring.registry
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=self.keyring.private_b64["settlement-key-1"],
@@ -332,7 +332,7 @@ class _Rig:
             invite_code=code,
             identity={"public_key_b64": public_b64, "display_name": None},
             device=None,
-            center_url="http://center.test",
+            server_url="http://server.test",
             now=BASE,
         )
         self.joined_private = load_private_key(private_b64)
@@ -404,15 +404,15 @@ class _Rig:
 
     # -- restart ------------------------------------------------------------
 
-    def write_center_json(self) -> Path:
-        """Write a `center.json` naming only the settlement and device keys."""
-        path = self.tmp_path / "center.json"
+    def write_server_json(self) -> Path:
+        """Write a `server.json` naming only the settlement and device keys."""
+        path = self.tmp_path / "server.json"
         path.write_text(
             json.dumps(
                 {
                     "host": "127.0.0.1",
                     "port": 0,
-                    "database_path": str(self.tmp_path / "center.db"),
+                    "database_path": str(self.tmp_path / "server.db"),
                     "platform_id": "platform-1",
                     "settlement_key_id": "settlement-key-1",
                     "settlement_private_key_b64": self.keyring.private_b64[
@@ -440,7 +440,7 @@ class _Rig:
     def rebuild(self) -> Any:
         """Close the store and return a fresh deployment over the same database."""
         self.close()
-        return load_center(self.write_center_json())
+        return load_server(self.write_server_json())
 
 
 @pytest.fixture
@@ -458,12 +458,12 @@ def rig(tmp_path: Path) -> _Rig:
 # --------------------------------------------------------------------------
 
 
-def _journals(store: CenterStore) -> list[dict[str, Any]]:
+def _journals(store: ServerStore) -> list[dict[str, Any]]:
     """Return every ledger-replay journal payload, in order."""
     return [payload for _seq, kind, payload in store.ledger_events() if kind == "journal"]
 
 
-def _assert_no_orphans(store: CenterStore, request_id: str) -> None:
+def _assert_no_orphans(store: ServerStore, request_id: str) -> None:
     """A leaf, a receipt, a settlement and a journal exist together, or not at all."""
     leaves = store.log_leaves()
     settlement = store.get_settlement(request_id, 1)
@@ -525,7 +525,7 @@ def _assert_settled_once(rig: _Rig, request_id: str, attempt_id: str) -> dict[st
 
 
 @contextlib.contextmanager
-def _interrupt_at(store: CenterStore, method: str):
+def _interrupt_at(store: ServerStore, method: str):
     """Make one durable write raise, as an interruption at that boundary does."""
     from unittest import mock
 
@@ -695,7 +695,7 @@ def test_an_interrupted_settlement_survives_a_restart_as_an_untouched_request(
 
     After an interruption at the settlement write and a rebuild, the database
     must not contain a leaf, a receipt or a journal for a request that never
-    settled. The honest consequence is then pinned too: the rebuilt center has
+    settled. The honest consequence is then pinned too: the rebuilt server has
     lost the offer terms (G01·f), so a resent ``usage.final`` is refused with
     "no permit context" rather than settled — the request converges as unknown
     through the recovery path, not by silently completing.
@@ -765,7 +765,7 @@ def test_a_rejected_usage_report_is_refused_every_time_it_is_resent(
 ) -> None:
     """A refused report never becomes a success by being sent again.
 
-    Two refusals are pinned: a report signed by a device the center never
+    Two refusals are pinned: a report signed by a device the server never
     offered the work to (identity binding), and a report whose acceptance hash
     is not the one the node returned. Both are refused on the first delivery and
     on the resend, and neither moves credit nor leaves a receipt.

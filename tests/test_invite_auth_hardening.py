@@ -59,26 +59,26 @@ from aipotluck.wire import (
 )
 from conftest import Keyring
 
-from aipotluck_server.deploy import load_center
+from aipotluck_server.deploy import load_server
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, Credential
+from aipotluck_server.persistence import Credential, ServerStore
 
 BASE = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
 MODEL = "coding-pool"
 DELIVERY = "buffered_complete"
 
 
-class _Center:
+class _Server:
     """A real service over a real store, with invites minted by a helper."""
 
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
         self.keyring = Keyring()
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=self.keyring.private_b64["settlement-key-1"],
@@ -111,14 +111,14 @@ class _Center:
             identity["key_id"] = claimed_key_id
         return self.service.join(
             invite_code=code, identity=identity, device=device,
-            center_url="http://center.test", now=BASE,
+            server_url="http://server.test", now=BASE,
         )
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> _Center:
-    """Return a center over a fresh store, closed at the end of the test."""
-    built = _Center(tmp_path)
+def server(tmp_path: Path) -> _Server:
+    """Return a server over a fresh store, closed at the end of the test."""
+    built = _Server(tmp_path)
     yield built
     built.close()
 
@@ -157,19 +157,19 @@ def _authorization(private_key: Any, key_id: str, *, request_id: str, consumer_i
 # --------------------------------------------------------------------------
 
 
-def test_two_joiners_claiming_the_same_subject_stay_isolated(center: _Center) -> None:
+def test_two_joiners_claiming_the_same_subject_stay_isolated(server: _Server) -> None:
     """Both claim ``alice``; the server must still separate them completely."""
-    center.service.fund_account(
+    server.service.fund_account(
         account_id="alice", kind="consumer_available", amount=100_000, now=BASE
     )
     first_public, first_private = generate_key_pair()
     second_public, second_private = generate_key_pair()
-    center.mint("code-a")
-    center.mint("code-b")
+    server.mint("code-a")
+    server.mint("code-b")
 
-    first = center.join("code-a", public_key_b64=first_public, claimed_subject_id="alice",
+    first = server.join("code-a", public_key_b64=first_public, claimed_subject_id="alice",
                         claimed_key_id="alice-key")
-    second = center.join("code-b", public_key_b64=second_public, claimed_subject_id="alice",
+    second = server.join("code-b", public_key_b64=second_public, claimed_subject_id="alice",
                          claimed_key_id="alice-key")
 
     # Their tenants and accounts are distinct, and neither is "alice".
@@ -193,14 +193,14 @@ def test_two_joiners_claiming_the_same_subject_stay_isolated(center: _Center) ->
         consumer_id=first.subject_id, payer_account_id=first.subject_id,
         messages=(user_message("hi"),),
     )
-    center.service.admit_request(
+    server.service.admit_request(
         credential=first_credential, idempotency_key="idem-a",
         messages=(user_message("hi"),),
         authorization=first_authorization, model=MODEL, max_charge_milli_credits=20_000,
         delivery_mode=DELIVERY, max_attempts=2, now=BASE,
     )
     with pytest.raises(IdentityBindingError):
-        center.service.request_status(credential=second_credential, request_id="R-a")
+        server.service.request_status(credential=second_credential, request_id="R-a")
 
     # B cannot sign a charge against alice's funded account either.
     forged = _authorization(
@@ -208,7 +208,7 @@ def test_two_joiners_claiming_the_same_subject_stay_isolated(center: _Center) ->
         consumer_id="alice", payer_account_id="alice", messages=(user_message("steal"),),
     )
     with pytest.raises(IdentityBindingError):
-        center.service.admit_request(
+        server.service.admit_request(
             credential=second_credential, idempotency_key="idem-b",
             messages=(user_message("steal"),),
             authorization=forged, model=MODEL, max_charge_milli_credits=20_000,
@@ -216,50 +216,50 @@ def test_two_joiners_claiming_the_same_subject_stay_isolated(center: _Center) ->
         )
 
 
-def test_a_join_body_claiming_another_identity_changes_nothing(center: _Center) -> None:
+def test_a_join_body_claiming_another_identity_changes_nothing(server: _Server) -> None:
     """A body that names someone else's key id must not create that key id."""
     public_b64, _private = generate_key_pair()
-    center.mint("code-claim")
-    result = center.join(
+    server.mint("code-claim")
+    result = server.join(
         "code-claim", public_key_b64=public_b64,
         claimed_subject_id="alice", claimed_key_id="alice-key",
     )
 
     assert result.key_id != "alice-key"
     assert result.subject_id != "alice"
-    assert center.store.get_identity("alice-key") is None
-    row = center.store.get_identity(result.key_id)
+    assert server.store.get_identity("alice-key") is None
+    row = server.store.get_identity(result.key_id)
     assert row is not None
     assert row.owner_id == result.subject_id
 
 
-def test_join_requires_a_public_key(center: _Center) -> None:
+def test_join_requires_a_public_key(server: _Server) -> None:
     """Without key material there is nothing to derive an identity from."""
-    center.mint("code-nokey")
+    server.mint("code-nokey")
     with pytest.raises(ProtocolError):
-        center.join("code-nokey", public_key_b64="")
+        server.join("code-nokey", public_key_b64="")
 
 
-def test_an_auto_join_funds_its_own_account_once(center: _Center) -> None:
+def test_an_auto_join_funds_its_own_account_once(server: _Server) -> None:
     """Join mints the identity's account with the invite's quota, idempotently."""
     public_b64, _private = generate_key_pair()
-    center.mint("code-quota", tenant="auto", quota=12_345)
-    first = center.join("code-quota", public_key_b64=public_b64)
-    assert center.service.balance(first.subject_id) == 12_345
+    server.mint("code-quota", tenant="auto", quota=12_345)
+    first = server.join("code-quota", public_key_b64=public_b64)
+    assert server.service.balance(first.subject_id) == 12_345
 
     # Re-joining with the same key returns the same identity and adds nothing.
-    second = center.join("code-quota", public_key_b64=public_b64)
+    second = server.join("code-quota", public_key_b64=public_b64)
     assert second == first
-    assert center.service.balance(first.subject_id) == 12_345
+    assert server.service.balance(first.subject_id) == 12_345
 
 
-def test_a_concrete_tenant_invite_still_shares_the_tenant(center: _Center) -> None:
+def test_a_concrete_tenant_invite_still_shares_the_tenant(server: _Server) -> None:
     """A named scope is shared by design, so two joiners land in one tenant."""
     first_public, _first_private = generate_key_pair()
     second_public, _second_private = generate_key_pair()
-    center.mint("code-shared", tenant="tenant-shared", max_uses=2)
-    first = center.join("code-shared", public_key_b64=first_public)
-    second = center.join("code-shared", public_key_b64=second_public)
+    server.mint("code-shared", tenant="tenant-shared", max_uses=2)
+    first = server.join("code-shared", public_key_b64=first_public)
+    second = server.join("code-shared", public_key_b64=second_public)
 
     assert first.tenant_id == "tenant-shared"
     assert second.tenant_id == "tenant-shared"
@@ -271,34 +271,34 @@ def test_a_concrete_tenant_invite_still_shares_the_tenant(center: _Center) -> No
 # --------------------------------------------------------------------------
 
 
-def test_the_store_refuses_two_identities_for_one_owner(center: _Center) -> None:
+def test_the_store_refuses_two_identities_for_one_owner(server: _Server) -> None:
     """``(role, owner_id)`` is unique, so a second key for one owner is refused."""
     public_one, _p1 = generate_key_pair()
     public_two, _p2 = generate_key_pair()
-    center.store.add_identity(
+    server.store.add_identity(
         key_id="k-1", owner_id="owner-1", purpose="consumer", public_key_b64=public_one,
         tenant_id="tenant-1", role="consumer", display_name=None, provider_id=None,
         account_id="owner-1", registered_at=BASE,
     )
     with pytest.raises(ConflictError):
-        center.store.add_identity(
+        server.store.add_identity(
             key_id="k-2", owner_id="owner-1", purpose="consumer", public_key_b64=public_two,
             tenant_id="tenant-2", role="consumer", display_name=None, provider_id=None,
             account_id="owner-1", registered_at=BASE,
         )
 
 
-def test_the_store_refuses_two_auto_identities_sharing_a_tenant(center: _Center) -> None:
+def test_the_store_refuses_two_auto_identities_sharing_a_tenant(server: _Server) -> None:
     """Two auto-scoped identities may not silently share one private tenant."""
     public_one, _p1 = generate_key_pair()
     public_two, _p2 = generate_key_pair()
-    center.store.add_identity(
+    server.store.add_identity(
         key_id="k-1", owner_id="owner-1", purpose="consumer", public_key_b64=public_one,
         tenant_id="t-collide", role="consumer", display_name=None, provider_id=None,
         account_id="owner-1", registered_at=BASE,
     )
     with pytest.raises(ConflictError):
-        center.store.add_identity(
+        server.store.add_identity(
             key_id="k-2", owner_id="owner-2", purpose="consumer", public_key_b64=public_two,
             tenant_id="t-collide", role="consumer", display_name=None, provider_id=None,
             account_id="owner-2", registered_at=BASE,
@@ -310,23 +310,23 @@ def test_the_store_refuses_two_auto_identities_sharing_a_tenant(center: _Center)
 # --------------------------------------------------------------------------
 
 
-def _node_join(center: _Center) -> tuple[Any, str, str]:
+def _node_join(server: _Server) -> tuple[Any, str, str]:
     """Join a node, returning its identity, the device private key, and its id."""
     node_public, _node_private = generate_key_pair()
     device_public, device_private = generate_key_pair()
-    center.mint("code-node", role="node")
-    result = center.join(
+    server.mint("code-node", role="node")
+    result = server.join(
         "code-node", public_key_b64=node_public,
         device={"public_key_b64": device_public},
     )
     assert result.device_key_id is not None
-    device_row = center.store.get_identity(result.device_key_id)
+    device_row = server.store.get_identity(result.device_key_id)
     assert device_row is not None
     return result, device_private, device_row.key_id
 
 
 def _drive_to_usage_final(
-    center: _Center, *, device_key_id: str, node_token: str, consumer: Any,
+    server: _Server, *, device_key_id: str, node_token: str, consumer: Any,
     consumer_key_id: str, private_key: Any,
 ) -> tuple[AttemptOffer, dict[str, Any]]:
     """Drive an attempt to the edge of settlement; return the offer and facts.
@@ -337,17 +337,17 @@ def _drive_to_usage_final(
     """
     from aipotluck.wire import AttemptDecision
 
-    device_row = center.store.get_identity(device_key_id)
+    device_row = server.store.get_identity(device_key_id)
     assert device_row is not None
     device_id = device_row.owner_id
     provider_id = device_row.provider_id
     assert provider_id is not None
 
-    node_credential = center.store.resolve_credential(node_token, BASE)
+    node_credential = server.store.resolve_credential(node_token, BASE)
     assert node_credential is not None
     node_id = device_id
     received: list[Envelope] = []
-    center.service.register_node(
+    server.service.register_node(
         credential=node_credential,
         hello=NodeHello(
             node_id=node_id, device_id=device_id, device_key_id=device_key_id,
@@ -357,7 +357,7 @@ def _drive_to_usage_final(
         ),
         enqueue=received.append, now=BASE,
     )
-    center.service.admit_request(
+    server.service.admit_request(
         credential=consumer, idempotency_key="idem-1", messages=(user_message("hi"),),
         authorization=_authorization(
             private_key, consumer_key_id, request_id="R-1",
@@ -379,7 +379,7 @@ def _drive_to_usage_final(
         attempt_id=offer.attempt_id, epoch=offer.epoch, adapter_name="mock-adapter",
         accepted_at=BASE,
     )
-    center.service.handle_node_message(
+    server.service.handle_node_message(
         node_id=node_id,
         envelope=Envelope(
             type="attempt.accept",
@@ -390,7 +390,7 @@ def _drive_to_usage_final(
         ),
         now=BASE,
     )
-    center.service.handle_node_message(
+    server.service.handle_node_message(
         node_id=node_id,
         envelope=Envelope(
             type="attempt.event",
@@ -404,12 +404,12 @@ def _drive_to_usage_final(
                    "acceptance_hash": acceptance_hash, "ref": ref}
 
 
-def test_a_revoked_device_key_cannot_settle_usage(center: _Center) -> None:
+def test_a_revoked_device_key_cannot_settle_usage(server: _Server) -> None:
     """After ``admin revoke-key`` drops the device, its report buys nothing."""
     public_b64, private_b64 = generate_key_pair()
-    center.mint("code-consumer")
-    joined = center.join("code-consumer", public_key_b64=public_b64)
-    node_result, device_private, device_key_id = _node_join(center)
+    server.mint("code-consumer")
+    joined = server.join("code-consumer", public_key_b64=public_b64)
+    node_result, device_private, device_key_id = _node_join(server)
     assert node_result.role == "node"
 
     consumer = Credential(
@@ -417,14 +417,14 @@ def test_a_revoked_device_key_cannot_settle_usage(center: _Center) -> None:
         account_id=joined.subject_id,
     )
     offer, facts = _drive_to_usage_final(
-        center, device_key_id=device_key_id,
+        server, device_key_id=device_key_id,
         node_token=str(node_result.node_token),
         consumer=consumer, consumer_key_id=joined.key_id,
         private_key=load_private_key(private_b64),
     )
 
     # Revoke the device key through the store, exactly as `admin revoke-key` does.
-    center.store.revoke_identity(device_key_id, BASE)
+    server.store.revoke_identity(device_key_id, BASE)
 
     report = UsageReport(
         report_id=f"rep-{offer.attempt_id}",
@@ -464,23 +464,23 @@ def test_a_revoked_device_key_cannot_settle_usage(center: _Center) -> None:
     )
 
     with pytest.raises(KeyRevokedError):
-        center.service.handle_node_message(
+        server.service.handle_node_message(
             node_id=facts["node_id"], envelope=envelope, now=BASE
         )
-    assert center.store.get_settlement("R-1", 1) is None
+    assert server.store.get_settlement("R-1", 1) is None
 
     # A restart must not resurrect the key: the store row, replayed by
-    # `load_center`, is what the rebuilt center trusts.
-    center_path = center.tmp_path / "center.json"
-    center_path.write_text(
+    # `load_server`, is what the rebuilt server trusts.
+    server_path = server.tmp_path / "server.json"
+    server_path.write_text(
         json.dumps(
             {
                 "host": "127.0.0.1",
                 "port": 0,
-                "database_path": str(center.tmp_path / "center.db"),
+                "database_path": str(server.tmp_path / "server.db"),
                 "platform_id": "platform-1",
                 "settlement_key_id": "settlement-key-1",
-                "settlement_private_key_b64": center.keyring.private_b64["settlement-key-1"],
+                "settlement_private_key_b64": server.keyring.private_b64["settlement-key-1"],
                 "certfile": None,
                 "keyfile": None,
                 "credentials": [],
@@ -490,8 +490,8 @@ def test_a_revoked_device_key_cannot_settle_usage(center: _Center) -> None:
         ),
         encoding="utf-8",
     )
-    center.store.close()
-    deployment = load_center(center_path)
+    server.store.close()
+    deployment = load_server(server_path)
     try:
         assert deployment.store.get_identity(device_key_id).revoked_at is not None
         with pytest.raises(KeyRevokedError):
@@ -522,18 +522,18 @@ def _auth_kwargs(private_key: Any, key_id: str, *, nonce: str) -> dict[str, Any]
     }
 
 
-def test_flooding_one_key_does_not_evict_another_keys_nonce(center: _Center) -> None:
+def test_flooding_one_key_does_not_evict_another_keys_nonce(server: _Server) -> None:
     """A busy key cannot push a quiet key's spent nonce out of the replay window."""
     first_public, first_private = generate_key_pair()
     second_public, second_private = generate_key_pair()
-    center.mint("code-flood-a")
-    center.mint("code-flood-b")
-    first = center.join("code-flood-a", public_key_b64=first_public)
-    second = center.join("code-flood-b", public_key_b64=second_public)
+    server.mint("code-flood-a")
+    server.mint("code-flood-b")
+    first = server.join("code-flood-a", public_key_b64=first_public)
+    second = server.join("code-flood-b", public_key_b64=second_public)
 
     first_nonce = "nonce-first-key"
     first_kwargs = _auth_kwargs(load_private_key(first_private), first.key_id, nonce=first_nonce)
-    center.service.authenticate_signed_request(**first_kwargs)  # spends the nonce
+    server.service.authenticate_signed_request(**first_kwargs)  # spends the nonce
 
     # Flood the *other* key's bucket past the capacity.
     capacity = 4096
@@ -541,11 +541,11 @@ def test_flooding_one_key_does_not_evict_another_keys_nonce(center: _Center) -> 
         kwargs = _auth_kwargs(
             load_private_key(second_private), second.key_id, nonce=f"flood-{index}"
         )
-        center.service.authenticate_signed_request(**kwargs)
+        server.service.authenticate_signed_request(**kwargs)
 
     # The first key's spent nonce must still be refused.
     with pytest.raises(ProtocolError):
-        center.service.authenticate_signed_request(**first_kwargs)
+        server.service.authenticate_signed_request(**first_kwargs)
     assert second.key_id  # keeps the value used above from being lint-dead
 
 
@@ -554,49 +554,49 @@ def test_flooding_one_key_does_not_evict_another_keys_nonce(center: _Center) -> 
 # --------------------------------------------------------------------------
 
 
-def test_a_failed_join_rolls_back_the_registry_key(center: _Center, monkeypatch: Any) -> None:
+def test_a_failed_join_rolls_back_the_registry_key(server: _Server, monkeypatch: Any) -> None:
     """If a later join step fails, the registered key must be pulled again."""
     public_b64, _private = generate_key_pair()
-    center.mint("code-rollback")
+    server.mint("code-rollback")
 
     registered: list[str] = []
-    original = center.keyring.registry.register_key
+    original = server.keyring.registry.register_key
 
     def record(key_id: str, *args: Any, **kwargs: Any) -> Any:
         registered.append(key_id)
         return original(key_id, *args, **kwargs)
 
-    monkeypatch.setattr(center.keyring.registry, "register_key", record)
+    monkeypatch.setattr(server.keyring.registry, "register_key", record)
 
     def boom(**_kwargs: Any) -> Any:
         raise ConflictError("simulated persistence failure")
 
-    monkeypatch.setattr(center.store, "add_identity", boom)
+    monkeypatch.setattr(server.store, "add_identity", boom)
     with pytest.raises(ConflictError):
-        center.join("code-rollback", public_key_b64=public_b64)
+        server.join("code-rollback", public_key_b64=public_b64)
 
     # No identity row survives, and the key registered mid-join was withdrawn
     # again, so nothing is left that could authenticate with no row behind it.
     assert registered, "the join should have registered a key before failing"
-    assert center.store.identities() == []
+    assert server.store.identities() == []
     for key_id in registered:
-        assert center.keyring.registry.get_key(key_id).status == "revoked"
+        assert server.keyring.registry.get_key(key_id).status == "revoked"
 
 
-def test_a_binding_conflict_does_not_burn_the_invite(center: _Center, monkeypatch: Any) -> None:
+def test_a_binding_conflict_does_not_burn_the_invite(server: _Server, monkeypatch: Any) -> None:
     """A registry binding conflict is decided before the invite is consumed."""
     public_b64, _private = generate_key_pair()
-    center.mint("code-conflict")
+    server.mint("code-conflict")
 
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
         raise IdentityBindingError("simulated binding conflict")
 
-    monkeypatch.setattr(center.keyring.registry, "register_key", refuse)
+    monkeypatch.setattr(server.keyring.registry, "register_key", refuse)
     with pytest.raises(IdentityBindingError):
-        center.join("code-conflict", public_key_b64=public_b64)
+        server.join("code-conflict", public_key_b64=public_b64)
 
-    assert center.store.get_invite("code-conflict").used_count == 0
-    assert center.store.identities() == []
+    assert server.store.get_invite("code-conflict").used_count == 0
+    assert server.store.identities() == []
 
 
 # --------------------------------------------------------------------------
@@ -604,15 +604,15 @@ def test_a_binding_conflict_does_not_burn_the_invite(center: _Center, monkeypatc
 # --------------------------------------------------------------------------
 
 
-def test_register_key_refuses_a_same_owner_different_public_key(center: _Center) -> None:
+def test_register_key_refuses_a_same_owner_different_public_key(server: _Server) -> None:
     """Re-registering one key id with new material must not be a silent no-op."""
     first_public, _first = generate_key_pair()
     second_public, _second = generate_key_pair()
-    center.keyring.registry.register_key("k-x", "owner-x", "consumer", first_public, BASE)
+    server.keyring.registry.register_key("k-x", "owner-x", "consumer", first_public, BASE)
     # Identical material stays a no-op.
-    center.keyring.registry.register_key("k-x", "owner-x", "consumer", first_public, BASE)
+    server.keyring.registry.register_key("k-x", "owner-x", "consumer", first_public, BASE)
     with pytest.raises(IdentityBindingError):
-        center.keyring.registry.register_key("k-x", "owner-x", "consumer", second_public, BASE)
+        server.keyring.registry.register_key("k-x", "owner-x", "consumer", second_public, BASE)
 
 
 # --------------------------------------------------------------------------
@@ -632,20 +632,20 @@ def test_the_operator_purpose_is_removed() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_a_node_join_provisions_the_link_credential_it_returns(center: _Center) -> None:
+def test_a_node_join_provisions_the_link_credential_it_returns(server: _Server) -> None:
     """The token a node join returns resolves to that node's credential.
 
     This is the seam the invite path was missing: ``join --node`` used to hand
     back an identity the node could not authenticate with, so the only working
     contributor route was an operator hand-writing ``credentials[]`` into
-    center.json and restarting the center. The token is minted by the join,
+    server.json and restarting the server. The token is minted by the join,
     returned once, and stored as a digest only — the same contract an
     ``admin invite`` code and an operator-provisioned credential both have.
     """
-    result, _device_private, _device_key_id = _node_join(center)
+    result, _device_private, _device_key_id = _node_join(server)
 
     assert result.node_token, "a first node join must return its link token"
-    credential = center.store.resolve_credential(result.node_token, BASE)
+    credential = server.store.resolve_credential(result.node_token, BASE)
     assert credential is not None
     assert credential.role == "node"
     assert credential.tenant_id == result.tenant_id
@@ -654,13 +654,13 @@ def test_a_node_join_provisions_the_link_credential_it_returns(center: _Center) 
     # At rest there is only a digest, so losing the response loses the token —
     # which is why the recovery path is a revoke plus a fresh invite.
     blob = b"".join(
-        path.read_bytes() for path in center.tmp_path.glob("center.db*") if path.is_file()
+        path.read_bytes() for path in server.tmp_path.glob("server.db*") if path.is_file()
     )
     assert result.node_token.encode() not in blob
 
 
 def test_a_node_credential_is_bound_to_the_device_the_join_derived(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """The link credential names its device, which is what scopes a node's reads.
 
@@ -670,41 +670,41 @@ def test_a_node_credential_is_bound_to_the_device_the_join_derived(
     node" could only be scoped to the tenant — and an operator who invites a
     community into one concrete ``--tenant`` would then have handed every member
     every other member's dispatch history. Recording the binding at the one
-    moment the center knows it is what lets ``GET /v1/node/attempts`` derive its
+    moment the server knows it is what lets ``GET /v1/node/attempts`` derive its
     scope from the authenticated credential alone.
     """
-    result, _device_private, _device_key_id = _node_join(center)
+    result, _device_private, _device_key_id = _node_join(server)
 
-    credential = center.store.resolve_credential(str(result.node_token), BASE)
+    credential = server.store.resolve_credential(str(result.node_token), BASE)
     assert credential is not None
     assert credential.device_id == result.device_id
     # The connector dials as its device, so the binding is the node id a scoped
     # read has to answer for — and only that one.
-    assert center.service.node_attempts(credential=credential)["node_ids"] == [
+    assert server.service.node_attempts(credential=credential)["node_ids"] == [
         result.device_id
     ]
 
 
-def test_a_consumer_join_provisions_no_node_credential(center: _Center) -> None:
+def test_a_consumer_join_provisions_no_node_credential(server: _Server) -> None:
     """A consumer must not acquire a credential that could open a node link."""
     public_b64, _private = generate_key_pair()
-    center.mint("code-consumer-only")
-    result = center.join("code-consumer-only", public_key_b64=public_b64)
+    server.mint("code-consumer-only")
+    result = server.join("code-consumer-only", public_key_b64=public_b64)
 
     assert result.node_token is None
     assert "node_token" not in result.to_payload()
 
 
-def test_rejoining_a_node_mints_no_second_credential(center: _Center) -> None:
+def test_rejoining_a_node_mints_no_second_credential(server: _Server) -> None:
     """Idempotency covers the token: one identity, one credential, one use."""
     node_public, _node_private = generate_key_pair()
     device_public, _device_private = generate_key_pair()
-    center.mint("code-node-once", role="node")
-    first = center.join(
+    server.mint("code-node-once", role="node")
+    first = server.join(
         "code-node-once", public_key_b64=node_public,
         device={"public_key_b64": device_public},
     )
-    second = center.join(
+    second = server.join(
         "code-node-once", public_key_b64=node_public,
         device={"public_key_b64": device_public},
     )
@@ -715,12 +715,12 @@ def test_rejoining_a_node_mints_no_second_credential(center: _Center) -> None:
         first.tenant_id, first.subject_id, first.key_id
     )
     # The first token still resolves, and the invite was not spent twice.
-    assert center.store.resolve_credential(str(first.node_token), BASE) is not None
-    assert center.store.get_invite("code-node-once").used_count == 1
+    assert server.store.resolve_credential(str(first.node_token), BASE) is not None
+    assert server.store.get_invite("code-node-once").used_count == 1
 
 
 def test_the_provisioned_token_opens_a_node_link_and_receives_an_offer(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """Handshake, then dispatch, authenticated by nothing but the join token.
 
@@ -734,14 +734,14 @@ def test_the_provisioned_token_opens_a_node_link_and_receives_an_offer(
     the node id the credential is bound to (its device), the only one
     `register_node` accepts from a join-minted credential.
     """
-    result, _device_private, device_key_id = _node_join(center)
-    node_credential = center.store.resolve_credential(str(result.node_token), BASE)
+    result, _device_private, device_key_id = _node_join(server)
+    node_credential = server.store.resolve_credential(str(result.node_token), BASE)
     assert node_credential is not None
-    device_row = center.store.get_identity(device_key_id)
+    device_row = server.store.get_identity(device_key_id)
     assert device_row is not None and device_row.provider_id is not None
 
     received: list[Envelope] = []
-    center.service.register_node(
+    server.service.register_node(
         credential=node_credential,
         hello=NodeHello(
             node_id=device_row.owner_id,
@@ -761,9 +761,9 @@ def test_the_provisioned_token_opens_a_node_link_and_receives_an_offer(
     assert [envelope.type for envelope in received] == ["hello.ack"]
 
     consumer_public, consumer_private = generate_key_pair()
-    center.mint("code-consumer-for-node", quota=100_000)
-    consumer = center.join("code-consumer-for-node", public_key_b64=consumer_public)
-    center.service.admit_request(
+    server.mint("code-consumer-for-node", quota=100_000)
+    consumer = server.join("code-consumer-for-node", public_key_b64=consumer_public)
+    server.service.admit_request(
         credential=Credential(
             tenant_id=consumer.tenant_id, subject_id=consumer.subject_id,
             role="consumer", account_id=consumer.subject_id,

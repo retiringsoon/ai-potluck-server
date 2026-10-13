@@ -10,20 +10,20 @@ timeout is the canonical case — two facts must be kept apart:
 
 A node that only counts fact 2 cannot tell a timeout from an attempt that never
 ran, so it reports ``certainty="not_submitted"`` for a call that may have
-consumed tokens. The center then treats the attempt as `never_started`, retries
+consumed tokens. The server then treats the attempt as `never_started`, retries
 it, and the operator's upstream quota is spent twice while the first
 consumption is recorded as nothing. This file pins, on both sides of the wire:
 
 * **G04·a (node)** the durable facts a timed-out call leaves behind — the
   adapter's own call counter versus the execution row's ``upstream_calls`` — and
   the state/certainty the node reports for it.
-* **G04·b (center)** a failure report never becomes zero usage: the attempt's
+* **G04·b (server)** a failure report never becomes zero usage: the attempt's
   usage goes to ``UNKNOWN`` with a ``NULL`` total and no settlement is recorded.
-* **G04·c (center)** a ``not_submitted`` report opens exactly one replacement
+* **G04·c (server)** a ``not_submitted`` report opens exactly one replacement
   attempt, and the per-request attempt budget (`max_attempts`) bounds the total.
-* **G04·d (center)** an ``unknown`` report is **not** retried; the request
+* **G04·d (server)** an ``unknown`` report is **not** retried; the request
   converges as ``OUTCOME_UNKNOWN`` with usage left unknown.
-* **G04·e (center)** with two concurrent requests, only the one whose node
+* **G04·e (server)** with two concurrent requests, only the one whose node
   reported an un-submitted failure is retried; the other settles normally, and a
   superseded branch can never publish output.
 
@@ -36,7 +36,7 @@ the node could not support. The fix gives the dispatch boundary a name:
 adapters raise ``AdapterOutcomeUnknown`` when the request was sent but the
 answer was lost, and the connector answers that by recording the submission,
 finishing the execution ``UNKNOWN``, and spooling **no** failure event — the
-center's tick probe and reconciliation decide, so a possibly-running call is
+server's tick probe and reconciliation decide, so a possibly-running call is
 never retried into a second bill. The formerly ``xfail(strict=True)`` test now
 runs as a plain assertion of the fixed behaviour.
 
@@ -45,7 +45,7 @@ What this file canNOT prove
 * It does not prove the node survives a real network timeout; the adapter is a
   test-local stand-in that raises the error the connector treats as one.
 * It does not exercise the socket, the WebSocket framing, or TLS: every node
-  message goes through `Connector.handle_message` and every center message
+  message goes through `Connector.handle_message` and every server message
   through `GatewayService.handle_node_message`.
 * It does not prove the HTTP adapter classifies every real transport failure
   exactly; only that the boundary contract (unavailable vs outcome-unknown vs
@@ -92,7 +92,7 @@ from aipotluck.wire import (
 from conftest import Keyring
 
 from aipotluck_server.gateway_service import GatewayConfig, GatewayService
-from aipotluck_server.persistence import CenterStore, Credential
+from aipotluck_server.persistence import Credential, ServerStore
 
 BASE = dt.datetime(2026, 10, 6, 12, 0, 0, tzinfo=dt.UTC)
 MODEL = "coding-pool"
@@ -196,7 +196,7 @@ def _node(tmp_path: Path, adapter: Any, **overrides: Any) -> _Node:
     """Build a connector over a fresh node database with `adapter`."""
     _public_b64, private_b64 = generate_key_pair()
     values: dict[str, Any] = {
-        "center_url": "ws://127.0.0.1:1/v1/node-link",
+        "server_url": "ws://127.0.0.1:1/v1/node-link",
         "node_id": "node-1",
         "device_id": "device-1",
         "device_key_id": "device-key-1",
@@ -291,7 +291,7 @@ def test_a_timed_out_call_counts_as_a_request_but_not_as_a_response(tmp_path: Pa
     assert record.upstream_calls == 1, "the submission is a durable fact, not a success"
     assert record.state == "UNKNOWN", "whether the upstream ran is unknowable"
 
-    # No failure event: the outcome is the center's to reconcile, via the tick
+    # No failure event: the outcome is the server's to reconcile, via the tick
     # probe asking for this attempt's state.
     assert node.spooled("A1") == []
 
@@ -303,7 +303,7 @@ def test_a_timed_out_upstream_call_is_reported_as_unknown(tmp_path: Path) -> Non
     the answer was lost — so the node cannot say whether the upstream ran. The
     attempt state must carry ``certainty="unknown"`` with the submission visible
     (``upstream_calls >= 1``) and no fabricated failure, because a clean failure
-    report would let the center open a replacement attempt while the original
+    report would let the server open a replacement attempt while the original
     call may still be running upstream.
     """
     node = _node(tmp_path, _TimingOutAdapter())
@@ -358,22 +358,22 @@ def test_a_completion_without_usage_is_labelled_unknown_not_silently_zero(
 
 
 # --------------------------------------------------------------------------
-# The center side: a real gateway over a real SQLite file
+# The server side: a real gateway over a real SQLite file
 # --------------------------------------------------------------------------
 
 
-class _Center:
+class _Server:
     """A real `GatewayService` over a real store, with one connected node."""
 
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
         self.keyring = Keyring()
         self.registry = self.keyring.registry
-        self.store = CenterStore.open(tmp_path / "center.db")
+        self.store = ServerStore.open(tmp_path / "server.db")
         self.config = GatewayConfig(
             host="127.0.0.1",
             port=0,
-            database_path=str(tmp_path / "center.db"),
+            database_path=str(tmp_path / "server.db"),
             platform_id="platform-1",
             settlement_key_id="settlement-key-1",
             settlement_private_key_b64=self.keyring.private_b64["settlement-key-1"],
@@ -417,7 +417,7 @@ class _Center:
             invite_code=code,
             identity={"public_key_b64": public_b64, "display_name": None},
             device=None,
-            center_url="http://center.test",
+            server_url="http://server.test",
             now=BASE,
         )
         self.joined_private = load_private_key(private_b64)
@@ -431,7 +431,7 @@ class _Center:
     def admit(self, *, request_id: str, messages: tuple[Any, ...]) -> AttemptOffer:
         """Admit one request and return the offer it produced.
 
-        Every offer the center sends is accumulated in `received`, so a test can
+        Every offer the server sends is accumulated in `received`, so a test can
         ask for the offers of one request after several admissions.
         """
         assert self.credential is not None
@@ -454,7 +454,7 @@ class _Center:
         return self.offers(request_id)[-1]
 
     def offers(self, request_id: str | None = None) -> list[AttemptOffer]:
-        """Return the offers the center sent, optionally for one request."""
+        """Return the offers the server sent, optionally for one request."""
         return [
             AttemptOffer.from_payload(envelope.payload)
             for envelope in self.received
@@ -607,9 +607,9 @@ class _Center:
 
 
 @pytest.fixture
-def center(tmp_path: Path) -> _Center:
-    """Return a center over a fresh store, closed at the end of the test."""
-    built = _Center(tmp_path)
+def server(tmp_path: Path) -> _Server:
+    """Return a server over a fresh store, closed at the end of the test."""
+    built = _Server(tmp_path)
     built.connect()
     built.join("code-g04")
     try:
@@ -623,26 +623,26 @@ def center(tmp_path: Path) -> _Center:
 # --------------------------------------------------------------------------
 
 
-def test_a_failed_upstream_call_leaves_usage_unknown_and_never_zero(center: _Center) -> None:
+def test_a_failed_upstream_call_leaves_usage_unknown_and_never_zero(server: _Server) -> None:
     """A timeout is a failed attempt whose usage is unknown, not a free one.
 
-    The node reports the failure and nothing else. The center must move the
+    The node reports the failure and nothing else. The server must move the
     attempt's usage to `UNKNOWN` with a `NULL` total, settle nothing and mint no
     receipt — the opposite of writing a 0 that would later read as "free".
     """
-    offer = center.admit(request_id="req-to", messages=(user_message("timed out"),))
-    center.accept(offer)
-    replies = center.node_failed(offer, seq=1, detail="upstream read timed out")
+    offer = server.admit(request_id="req-to", messages=(user_message("timed out"),))
+    server.accept(offer)
+    replies = server.node_failed(offer, seq=1, detail="upstream read timed out")
     assert [reply.type for reply in replies] == ["event.ack"]
 
-    attempt = center.store.get_attempt(offer.attempt_id)
+    attempt = server.store.get_attempt(offer.attempt_id)
     assert attempt is not None
     assert attempt.usage_status == "UNKNOWN"
     assert attempt.usage_tokens is None, "an unknown consumption is never stored as zero"
-    assert center.store.get_settlement("req-to", 1) is None
-    assert center.store.log_size() == 0
-    assert center.service.balance("provider-A/pending") == 0
-    document = center.status("req-to")
+    assert server.store.get_settlement("req-to", 1) is None
+    assert server.store.log_size() == 0
+    assert server.service.balance("provider-A/pending") == 0
+    document = server.status("req-to")
     assert document["settlement"] is None
     assert document["output"]["committed"] is False
 
@@ -653,7 +653,7 @@ def test_a_failed_upstream_call_leaves_usage_unknown_and_never_zero(center: _Cen
 
 
 def test_a_not_submitted_report_opens_one_replacement_and_respects_the_cap(
-    center: _Center,
+    server: _Server,
 ) -> None:
     """Retries are bounded by the signed `max_attempts`, and branches are demoted.
 
@@ -662,30 +662,30 @@ def test_a_not_submitted_report_opens_one_replacement_and_respects_the_cap(
     time a branch is opened the previous one is demoted, so only one branch can
     ever be output-eligible.
     """
-    first = center.admit(request_id="req-cap", messages=(user_message("retry me"),))
-    center.accept(first)
-    center.node_state(
+    first = server.admit(request_id="req-cap", messages=(user_message("retry me"),))
+    server.accept(first)
+    server.node_state(
         first, state="FAILED", certainty="not_submitted", upstream_calls=0
     )
 
-    replacements = center.offers("req-cap")
+    replacements = server.offers("req-cap")
     assert [offer.attempt_id for offer in replacements] == ["req-cap-a1", "req-cap-a2"]
     second = replacements[1]
     assert second.attempt_id != first.attempt_id
 
-    attempts = center.store.attempts_for_request("req-cap")
+    attempts = server.store.attempts_for_request("req-cap")
     assert len(attempts) == 2
     eligible = [attempt.attempt_id for attempt in attempts if attempt.output_eligible]
     assert eligible == ["req-cap-a2"], "only the newest branch may publish output"
 
     # A second un-submitted report cannot open a third attempt: the budget is spent.
-    center.accept(second)
-    center.node_state(
+    server.accept(second)
+    server.node_state(
         second, state="FAILED", certainty="not_submitted", upstream_calls=0
     )
-    assert len(center.store.attempts_for_request("req-cap")) == 2
-    assert center.status("req-cap")["status"] == "FAILED"
-    assert center.store.get_attempt("req-cap-a2") is not None
+    assert len(server.store.attempts_for_request("req-cap")) == 2
+    assert server.status("req-cap")["status"] == "FAILED"
+    assert server.store.get_attempt("req-cap-a2") is not None
 
 
 # --------------------------------------------------------------------------
@@ -693,26 +693,26 @@ def test_a_not_submitted_report_opens_one_replacement_and_respects_the_cap(
 # --------------------------------------------------------------------------
 
 
-def test_an_unknown_report_is_not_retried_and_keeps_usage_unknown(center: _Center) -> None:
-    """When the node cannot say whether it ran, the center does not guess by retrying.
+def test_an_unknown_report_is_not_retried_and_keeps_usage_unknown(server: _Server) -> None:
+    """When the node cannot say whether it ran, the server does not guess by retrying.
 
     `certainty="unknown"` is the one answer that must *not* produce a replacement
     offer: a retry could double-consume the upstream. The request converges as
     `OUTCOME_UNKNOWN`, usage stays `NULL`, and no receipt is issued.
     """
-    offer = center.admit(request_id="req-unknown", messages=(user_message("maybe ran"),))
-    center.accept(offer)
-    center.node_state(offer, state="FAILED", certainty="unknown", upstream_calls=0)
+    offer = server.admit(request_id="req-unknown", messages=(user_message("maybe ran"),))
+    server.accept(offer)
+    server.node_state(offer, state="FAILED", certainty="unknown", upstream_calls=0)
 
-    assert center.offers("req-unknown") == [offer], "no replacement attempt is offered"
-    assert len(center.store.attempts_for_request("req-unknown")) == 1
-    attempt = center.store.get_attempt(offer.attempt_id)
+    assert server.offers("req-unknown") == [offer], "no replacement attempt is offered"
+    assert len(server.store.attempts_for_request("req-unknown")) == 1
+    attempt = server.store.get_attempt(offer.attempt_id)
     assert attempt is not None
     assert attempt.status == "OUTCOME_UNKNOWN"
     assert attempt.usage_status == "UNKNOWN"
     assert attempt.usage_tokens is None
-    assert center.store.get_settlement("req-unknown", 1) is None
-    assert center.status("req-unknown")["status"] == "FAILED"
+    assert server.store.get_settlement("req-unknown", 1) is None
+    assert server.status("req-unknown")["status"] == "FAILED"
 
 
 # --------------------------------------------------------------------------
@@ -720,7 +720,7 @@ def test_an_unknown_report_is_not_retried_and_keeps_usage_unknown(center: _Cente
 # --------------------------------------------------------------------------
 
 
-def test_of_two_requests_only_the_timed_out_one_is_retried(center: _Center) -> None:
+def test_of_two_requests_only_the_timed_out_one_is_retried(server: _Server) -> None:
     """The healthy request settles untouched while the failed one gets one retry.
 
     Both requests are admitted while the node is connected. The first is reported
@@ -729,65 +729,65 @@ def test_of_two_requests_only_the_timed_out_one_is_retried(center: _Center) -> N
     A late delta from the demoted first branch is refused with a `superseded`
     cancel, so the two branches can never both publish output.
     """
-    timed_out = center.admit(request_id="req-1", messages=(user_message("will time out"),))
-    healthy = center.admit(request_id="req-2", messages=(user_message("will succeed"),))
-    center.accept(timed_out)
-    healthy_acceptance = center.accept(healthy)
+    timed_out = server.admit(request_id="req-1", messages=(user_message("will time out"),))
+    healthy = server.admit(request_id="req-2", messages=(user_message("will succeed"),))
+    server.accept(timed_out)
+    healthy_acceptance = server.accept(healthy)
 
     # The healthy request publishes output and settles.
-    center.delta(healthy, 1, "the answer")
-    replies = center.usage(healthy, healthy_acceptance)
+    server.delta(healthy, 1, "the answer")
+    replies = server.usage(healthy, healthy_acceptance)
     assert [reply.type for reply in replies] == ["event.ack"]
-    assert center.status("req-2")["status"] == "SUCCEEDED"
-    assert center.status("req-2")["settlement"]["log_index"] == 0
-    assert len(center.store.attempts_for_request("req-2")) == 1
+    assert server.status("req-2")["status"] == "SUCCEEDED"
+    assert server.status("req-2")["settlement"]["log_index"] == 0
+    assert len(server.store.attempts_for_request("req-2")) == 1
 
     # The timed-out request is reported and gets exactly one replacement.
-    center.node_state(timed_out, state="FAILED", certainty="not_submitted", upstream_calls=0)
-    offers = center.offers("req-1")
+    server.node_state(timed_out, state="FAILED", certainty="not_submitted", upstream_calls=0)
+    offers = server.offers("req-1")
     assert [offer.attempt_id for offer in offers] == ["req-1-a1", "req-1-a2"]
-    assert center.offers("req-2") == [healthy], "the healthy request is not retried"
-    assert len(center.store.attempts_for_request("req-2")) == 1
+    assert server.offers("req-2") == [healthy], "the healthy request is not retried"
+    assert len(server.store.attempts_for_request("req-2")) == 1
 
     # A delta from the demoted branch is refused and told to wind down.
-    late = center.delta(timed_out, 2, "stale text")
+    late = server.delta(timed_out, 2, "stale text")
     assert [reply.type for reply in late] == ["attempt.cancel", "event.ack"]
     assert late[0].payload["origin"] == "superseded"
-    assert center.store.output_commit("req-1") is None
+    assert server.store.output_commit("req-1") is None
 
     # And the healthy request's settlement is still the only one on the log.
-    assert center.store.log_size() == 1
-    assert center.store.get_settlement("req-2", 1) is not None
-    assert center.store.get_settlement("req-1", 1) is None
-    assert center.service.balance("provider-A/pending") == 1_000
+    assert server.store.log_size() == 1
+    assert server.store.get_settlement("req-2", 1) is not None
+    assert server.store.get_settlement("req-1", 1) is None
+    assert server.service.balance("provider-A/pending") == 1_000
 
 
 # --------------------------------------------------------------------------
-# The center's retry rule is only as good as the node's classification
+# The server's retry rule is only as good as the node's classification
 # --------------------------------------------------------------------------
 
 
-def test_the_center_retries_because_the_node_claimed_not_submitted(center: _Center) -> None:
-    """The coupling the node-side defect exploits, stated at the center.
+def test_the_server_retries_because_the_node_claimed_not_submitted(server: _Server) -> None:
+    """The coupling the node-side defect exploits, stated at the server.
 
-    The center's re-offer is not a bug: `not_submitted` with zero upstream calls
+    The server's re-offer is not a bug: `not_submitted` with zero upstream calls
     is exactly the contract's trigger for a retry. The bug is that a timed-out
     call *is* classified that way (see
     `test_a_timed_out_upstream_call_is_reported_as_unknown`), so this test shows
     the exact path by which the node's misclassification spends the upstream
     quota twice.
     """
-    offer = center.admit(request_id="req-couple", messages=(user_message("one upstream call"),))
-    center.accept(offer)
-    center.node_state(offer, state="FAILED", certainty="not_submitted", upstream_calls=0)
+    offer = server.admit(request_id="req-couple", messages=(user_message("one upstream call"),))
+    server.accept(offer)
+    server.node_state(offer, state="FAILED", certainty="not_submitted", upstream_calls=0)
 
-    offered = center.offers("req-couple")
+    offered = server.offers("req-couple")
     assert len(offered) == 2, (
         "a not_submitted report authorises one replacement attempt, so the same "
         "conversation would be sent upstream a second time"
     )
-    assert center.store.get_attempt("req-couple-a2") is not None
-    assert center.store.get_attempt("req-couple-a1").status == "FAILED"  # type: ignore[union-attr]
+    assert server.store.get_attempt("req-couple-a2") is not None
+    assert server.store.get_attempt("req-couple-a1").status == "FAILED"  # type: ignore[union-attr]
 
 
 # --------------------------------------------------------------------------
