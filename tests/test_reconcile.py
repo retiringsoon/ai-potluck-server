@@ -1083,6 +1083,7 @@ def _database_diff(before: str, after: str, database: Path) -> str:
     slow runner the operator needs the offending table and rows, not two hashes.
     """
     import sqlite3
+
     from aipotluck.canonical import canonical_digest
 
     connection = sqlite3.connect(database)
