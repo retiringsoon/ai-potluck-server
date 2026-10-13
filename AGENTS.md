@@ -29,10 +29,13 @@ without trusting the server. Never make the client import from this package.
 | `persistence.py` | Durable server store; keeps the whole world replayable (attempt winners, books, checkpoints) |
 | `deploy.py` | `server.json` schema, provisioning, and inspection |
 | `reconcile.py` | Operator-side reconciliation: read the server's own books |
+| `admin_ui.py` | Operator dashboard behind `serve --admin-ui`: loopback-only listener, one dependency-free page, five read-only aggregates |
 | `cli.py` | `potluck-server` entry point (`serve`, `admin`, `verify`); `__main__.py` mirrors it |
 
 Also: `tests/` (server suite + cross-package integration paths),
-`scripts/release_gate.sh` (end-to-end install-and-run gate for both packages).
+`scripts/release_gate.sh` (end-to-end install-and-run gate for both packages),
+[docs/admin-ui.md](docs/admin-ui.md) (the dashboard's endpoints, invariants and
+number semantics).
 Operator deployment docs live in the client repo:
 [server-deployment.md](https://github.com/retiringsoon/ai-potluck/blob/dev/docs/server-deployment.md).
 
@@ -81,6 +84,11 @@ sibling client checkout to be clean, so run it against committed work.
    old path and updating all its callers happens in the same change set. The
    only exception is persisted data formats (the SQLite store), which need a
    migration script.
+5. **The admin page reads and stays local.** `admin_ui` opens the store
+   `mode=ro` and binds an IPv4 loopback literal; it authenticates nobody and
+   offers no action. Never give it a write path, a reachable bind address, or a
+   dependency the page fetches from another host — and keep its numbers the
+   store's own aggregates, not a second opinion about them.
 
 ## Agent hygiene
 

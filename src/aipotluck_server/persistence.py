@@ -535,6 +535,168 @@ def _as_utc(value: dt.datetime) -> dt.datetime:
 
 
 
+# --------------------------------------------------------------------------
+# Operator dashboard read model
+#
+# Aggregate views over the tables above, read by the loopback admin page
+# (`admin_ui`). Every one of them is a plain read: the page opens the store
+# with `open_read_only`, so SQLite itself refuses a write, and nothing here
+# holds state the books do not already hold.
+#
+# Two definitions the views share, spelled once:
+#
+# * A request's tokens and charge are read from its *current* receipt — the
+#   highest log index for that request — because a settlement correction writes
+#   a second receipt whose `billable_tokens` is the corrected total, not the
+#   difference. Summing every revision would count a corrected request twice.
+# * Tokens are the receipt's own measured total and milli-credits are what the
+#   winning attempt recorded, which is the pair `reconcile_server` cross-checks.
+#   They are equal while pricing is face value and are kept apart so a rate card
+#   that changes one does not silently change the other.
+# --------------------------------------------------------------------------
+
+#: How far back the dashboard counts a consumer as active.
+ADMIN_ACTIVE_WINDOW = dt.timedelta(days=7)
+
+#: The request status the dispatch queue is made of: a request nothing could
+#: take this instant waits in it, which is the same set the admission gate
+#: counts against `max_queue_depth`.
+QUEUED_REQUEST_STATUS = "ROUTING"
+
+#: The request statuses that mean work a node is running right now, as distinct
+#: from work still waiting for one.
+IN_FLIGHT_REQUEST_STATUSES: tuple[str, ...] = ("RUNNING", "RECOVERING")
+
+#: Every subject this server knows as a consumer: the two rows a join or a
+#: provisioned config entry writes, plus any subject a request names. In a
+#: healthy store the three agree; a store where they do not still reports every
+#: subject it has seen rather than hiding one behind the table that lost it.
+_ADMIN_CONSUMER_SUBJECTS_SQL = (
+    "SELECT subject_id AS subject_id FROM credentials WHERE role = 'consumer'"
+    " UNION SELECT owner_id AS subject_id FROM identities WHERE role = 'consumer'"
+    " UNION SELECT subject_id AS subject_id FROM requests"
+)
+
+#: The settled-request view every money and token aggregate reads.
+_ADMIN_SETTLED_SQL = """
+WITH latest_receipt AS (
+    SELECT request_id AS request_id, MAX(log_index) AS log_index
+    FROM receipts GROUP BY request_id
+),
+settled AS (
+    SELECT receipt.request_id AS request_id,
+           request.subject_id AS subject_id,
+           request.status AS request_status,
+           request.created_at AS requested_at,
+           receipt.receipt_id AS receipt_id,
+           receipt.log_index AS log_index,
+           receipt.created_at AS settled_at,
+           attempt.node_id AS node_id,
+           CAST(json_extract(receipt.receipt_json, '$.payload.billable_tokens') AS INTEGER)
+               AS tokens,
+           attempt.usage_tokens AS milli_credits
+    FROM latest_receipt
+    JOIN receipts AS receipt
+        ON receipt.request_id = latest_receipt.request_id
+        AND receipt.log_index = latest_receipt.log_index
+    JOIN requests AS request ON request.request_id = receipt.request_id
+    LEFT JOIN attempts AS attempt
+        ON attempt.attempt_id = json_extract(receipt.receipt_json, '$.payload.winner_attempt_id')
+)
+"""
+
+
+@dataclass(frozen=True)
+class AdminOverview:
+    """The dashboard's health row: one number per card, read in one pass.
+
+    The windowed numbers are a *cohort*: each counts the requests admitted
+    inside the window together with the tokens and credit those requests
+    settled, so "today" answers what today's requests cost rather than what
+    settled while the clock said today. A request admitted at 23:59 and settled
+    at 00:01 belongs to the day it was admitted, and to no other.
+    """
+
+    consumers_total: int
+    consumers_active_7d: int
+    nodes_total: int
+    nodes_connected: int
+    nodes_share_disabled: int
+    requests_today: int
+    requests_7d: int
+    tokens_today: int
+    tokens_7d: int
+    milli_credits_today: int
+    milli_credits_7d: int
+    tokens_last_hour: int
+    tokens_last_24h: int
+    queued: int
+    in_flight: int
+    database_bytes: int
+    database_wal_bytes: int
+
+
+@dataclass(frozen=True)
+class AdminConsumer:
+    """One consumer subject's lifetime totals, as the dashboard ranks them.
+
+    `last_seen_at` is the last moment the server touched one of this subject's
+    requests, and is `None` for a subject that joined and never asked — which is
+    itself something an operator looks at a dashboard to find.
+    """
+
+    subject_id: str
+    requests: int
+    tokens: int
+    milli_credits: int
+    sessions: int
+    last_seen_at: dt.datetime | None
+
+
+@dataclass(frozen=True)
+class AdminNode:
+    """One contribution node with the work the books billed it for.
+
+    `requests_served` counts the requests this node's attempt won, so it and the
+    tokens and credit beside it all describe settled work: an offer a node
+    refused, or a superseded branch that spent tokens nobody was billed for,
+    shows in the attempt table and `admin reconcile`, not here.
+    """
+
+    node_id: str
+    model: str
+    provider_id: str
+    connected: bool
+    share_enabled: bool
+    requests_served: int
+    tokens: int
+    milli_credits: int
+    last_seen_at: dt.datetime
+
+
+@dataclass(frozen=True)
+class AdminReceipt:
+    """One receipt's dashboard row: who it bills, what it measured, when.
+
+    `request_status` is the status of the request the receipt settled, which is
+    the closest thing a receipt has to a state of its own: a receipt is durable
+    and never changes, and the request it backs is what an operator asks about.
+    Tokens and credit are `None` only if the receipt's own winner attempt is
+    missing from the attempts table — a defect `admin reconcile` names, and one
+    this view reports as a hole rather than as a zero.
+    """
+
+    receipt_id: str
+    request_id: str
+    subject_id: str
+    node_id: str | None
+    tokens: int | None
+    milli_credits: int | None
+    request_status: str
+    log_index: int
+    settled_at: dt.datetime
+
+
 #: Dispatch inputs: the conversation to execute, the parameters the platform
 #: forwards with it, and the signed pre-authorization settlement is measured
 #: against. All three must survive a restart, or a request can neither be
@@ -864,11 +1026,23 @@ class _Store:
     #: while still failing loudly rather than hanging forever.
     _BUSY_TIMEOUT_MS = 5000
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
+        """Open a store over the database at `path`.
+
+        Args:
+            path: The database file.
+            read_only: Connect through a ``mode=ro`` URI, so SQLite itself
+                refuses every write, and skip the schema creation and migration
+                a reader has no business running. A read-only store also
+                creates nothing on the way in: no parent directory, no database
+                file, no schema. It reads the tables the process that owns the
+                database wrote, and a database missing a table this build
+                expects is a defect to report rather than one to migrate away
+                from under its owner.
+        """
         self._path = str(path)
-        parent = Path(self._path).parent
-        if str(parent) not in ("", "."):
-            parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = read_only
+        self._uri = f"{Path(self._path).resolve().as_uri()}?mode=ro" if read_only else None
         self._tls = threading.local()
         self._registry_lock = threading.Lock()
         # Keyed by owning thread id: sqlite3 refuses to close a connection from a
@@ -876,6 +1050,11 @@ class _Store:
         # which connections `close` may close directly and which it can only drop.
         self._connections: dict[int, sqlite3.Connection] = {}
         self._closed = False
+        if read_only:
+            return
+        parent = Path(self._path).parent
+        if str(parent) not in ("", "."):
+            parent.mkdir(parents=True, exist_ok=True)
         with self._immediate(self._connection()) as conn:
             conn.executescript(_SCHEMA)
             self._retire_request_inputs_prompt(conn)
@@ -986,6 +1165,44 @@ class _Store:
         Raises:
             PotluckError: If `path` is not an existing file with content in it.
         """
+        cls._require_existing_database(path)
+        return cls(path)
+
+    @classmethod
+    def open_read_only(cls, path: str | Path) -> Self:
+        """Open the existing database at `path` so that no write can succeed.
+
+        The connection is a ``file:...?mode=ro`` URI, which makes read-only
+        SQLite's own guarantee rather than a caller's promise: a statement that
+        writes answers ``attempt to write a readonly database``, and so does the
+        schema creation and migration `open` runs, which is why neither is
+        attempted here. A reader that opened the database read-write and then
+        refrained from writing would be one code path away from changing the
+        books it was asked to report on.
+
+        Readers do not block the server's single writer: the database is in WAL
+        mode, so this connection reads the committed state the writer left,
+        including rows committed after it opened.
+
+        The file has to exist and hold a schema, exactly as for `open_existing`,
+        and nothing here creates a file or a directory.
+
+        Raises:
+            PotluckError: If `path` is not an existing file with content in it.
+        """
+        cls._require_existing_database(path)
+        return cls(path, read_only=True)
+
+    @staticmethod
+    def _require_existing_database(path: str | Path) -> None:
+        """Refuse a database file that is not there, or that holds no schema.
+
+        Shared by every opener that reads somebody else's database, so a lost
+        path is reported in the same words whichever command hit it.
+
+        Raises:
+            PotluckError: If `path` is not an existing file with content in it.
+        """
         candidate = Path(path)
         if not candidate.is_file():
             raise PotluckError(
@@ -1002,7 +1219,6 @@ class _Store:
                 "(`potluck serve` for a server, `potluck share run` for a node) "
                 "create a fresh one"
             )
-        return cls(path)
 
     def close(self) -> None:
         """Release this store's connections.
@@ -1037,10 +1253,19 @@ class _Store:
             return conn
         # isolation_level=None disables sqlite3's implicit transaction handling
         # so this module controls every BEGIN/COMMIT explicitly.
-        conn = sqlite3.connect(self._path, isolation_level=None)
+        uri = self._uri
+        conn = sqlite3.connect(
+            uri if uri is not None else self._path,
+            isolation_level=None,
+            uri=uri is not None,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={self._BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA journal_mode=WAL")
+        if uri is None:
+            # Asking a read-only connection for WAL is asking it to write, which
+            # is the one thing it must never do; the database it reads is
+            # already in WAL mode, set by the process that owns it.
+            conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         self._tls.conn = conn
         with self._registry_lock:
@@ -3374,6 +3599,242 @@ class ServerStore(_Store):
                 (_to_text(at), outbox_id),
             )
 
+    # -- operator dashboard reads -------------------------------------------
+
+    def admin_overview(self, *, now: dt.datetime) -> AdminOverview:
+        """Return the dashboard's health numbers, as at `now`.
+
+        Every window is anchored to `now` rather than to a wall clock read
+        inside the query, so a caller — and a test — decides what "today" means
+        and the numbers it gets back are the numbers that instant implies.
+        "Today" starts at UTC midnight, which is the only day boundary a store
+        that writes every instant in UTC can name without guessing a timezone.
+
+        The database sizes come from the filesystem rather than from a table, so
+        they are the same bytes an operator's backup would copy, including the
+        write-ahead log the running server has not checkpointed yet.
+        """
+        moment = _as_utc(now)
+        day_start = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = moment - ADMIN_ACTIVE_WINDOW
+        hour_start = moment - dt.timedelta(hours=1)
+        day_before = moment - dt.timedelta(days=1)
+        conn = self._connection()
+        consumers_total = int(
+            conn.execute(
+                f"SELECT COUNT(*) AS n FROM ({_ADMIN_CONSUMER_SUBJECTS_SQL})"
+            ).fetchone()["n"]
+        )
+        consumers_active = int(
+            conn.execute(
+                "SELECT COUNT(DISTINCT subject_id) AS n FROM requests WHERE created_at >= ?",
+                (_to_text(week_start),),
+            ).fetchone()["n"]
+        )
+        nodes = conn.execute(
+            "SELECT COUNT(*) AS total,"
+            " COALESCE(SUM(connected), 0) AS connected,"
+            " COALESCE(SUM(1 - share_enabled), 0) AS share_disabled FROM nodes"
+        ).fetchone()
+        in_flight_marks = ", ".join("?" for _ in IN_FLIGHT_REQUEST_STATUSES)
+        requests = conn.execute(
+            "SELECT"
+            " COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS today,"
+            " COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS week,"
+            " COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS queued,"
+            f" COALESCE(SUM(CASE WHEN status IN ({in_flight_marks}) THEN 1 ELSE 0 END), 0)"
+            " AS in_flight FROM requests",
+            (
+                _to_text(day_start),
+                _to_text(week_start),
+                QUEUED_REQUEST_STATUS,
+                *IN_FLIGHT_REQUEST_STATUSES,
+            ),
+        ).fetchone()
+        settled = conn.execute(
+            _ADMIN_SETTLED_SQL
+            + "SELECT"
+            " COALESCE(SUM(CASE WHEN requested_at >= ? THEN COALESCE(tokens, 0) ELSE 0 END), 0)"
+            " AS tokens_today,"
+            " COALESCE(SUM(CASE WHEN requested_at >= ? THEN COALESCE(tokens, 0) ELSE 0 END), 0)"
+            " AS tokens_week,"
+            " COALESCE(SUM(CASE WHEN requested_at >= ? THEN COALESCE(tokens, 0) ELSE 0 END), 0)"
+            " AS tokens_hour,"
+            " COALESCE(SUM(CASE WHEN requested_at >= ? THEN COALESCE(tokens, 0) ELSE 0 END), 0)"
+            " AS tokens_day,"
+            " COALESCE(SUM(CASE WHEN requested_at >= ?"
+            " THEN COALESCE(milli_credits, 0) ELSE 0 END), 0) AS credits_today,"
+            " COALESCE(SUM(CASE WHEN requested_at >= ?"
+            " THEN COALESCE(milli_credits, 0) ELSE 0 END), 0) AS credits_week"
+            " FROM settled",
+            (
+                _to_text(day_start),
+                _to_text(week_start),
+                _to_text(hour_start),
+                _to_text(day_before),
+                _to_text(day_start),
+                _to_text(week_start),
+            ),
+        ).fetchone()
+        database = Path(self._path)
+        write_ahead = Path(f"{self._path}-wal")
+        return AdminOverview(
+            consumers_total=consumers_total,
+            consumers_active_7d=consumers_active,
+            nodes_total=int(nodes["total"]),
+            nodes_connected=int(nodes["connected"]),
+            nodes_share_disabled=int(nodes["share_disabled"]),
+            requests_today=int(requests["today"]),
+            requests_7d=int(requests["week"]),
+            tokens_today=int(settled["tokens_today"]),
+            tokens_7d=int(settled["tokens_week"]),
+            milli_credits_today=int(settled["credits_today"]),
+            milli_credits_7d=int(settled["credits_week"]),
+            tokens_last_hour=int(settled["tokens_hour"]),
+            tokens_last_24h=int(settled["tokens_day"]),
+            queued=int(requests["queued"]),
+            in_flight=int(requests["in_flight"]),
+            database_bytes=database.stat().st_size,
+            database_wal_bytes=(
+                write_ahead.stat().st_size if write_ahead.is_file() else 0
+            ),
+        )
+
+    def admin_consumers(self, *, limit: int) -> list[AdminConsumer]:
+        """Rank every consumer subject this server knows by what it spent.
+
+        A subject that never asked is listed too, with zeros and no last-seen
+        instant: who joined and then did not use the pool is a question the
+        dashboard exists to answer, and dropping those rows would answer it with
+        a silence an operator has to notice.
+
+        Args:
+            limit: The most rows to return.
+
+        Raises:
+            PotluckError: If `limit` is below 1, which would return nothing and
+                read as "this server has no consumers".
+        """
+        conn = self._connection()
+        rows = conn.execute(
+            _ADMIN_SETTLED_SQL
+            + "SELECT subject.subject_id AS subject_id,"
+            " COALESCE(requests.requests, 0) AS requests,"
+            " COALESCE(usage.tokens, 0) AS tokens,"
+            " COALESCE(usage.milli_credits, 0) AS milli_credits,"
+            " COALESCE(session_count.sessions, 0) AS sessions,"
+            " requests.last_seen_at AS last_seen_at"
+            f" FROM ({_ADMIN_CONSUMER_SUBJECTS_SQL}) AS subject"
+            " LEFT JOIN (SELECT subject_id AS subject_id, COUNT(*) AS requests,"
+            " MAX(updated_at) AS last_seen_at FROM requests GROUP BY subject_id) AS requests"
+            " ON requests.subject_id = subject.subject_id"
+            " LEFT JOIN (SELECT subject_id AS subject_id, SUM(tokens) AS tokens,"
+            " SUM(milli_credits) AS milli_credits FROM settled GROUP BY subject_id) AS usage"
+            " ON usage.subject_id = subject.subject_id"
+            " LEFT JOIN (SELECT subject_id AS subject_id, COUNT(*) AS sessions"
+            " FROM sessions GROUP BY subject_id) AS session_count"
+            " ON session_count.subject_id = subject.subject_id"
+            " ORDER BY milli_credits DESC, requests DESC, subject.subject_id"
+            " LIMIT ?",
+            (_checked_limit(limit),),
+        ).fetchall()
+        return [_admin_consumer_from_row(row) for row in rows]
+
+    def admin_nodes(self, *, limit: int) -> list[AdminNode]:
+        """Rank every node this server knows by the work it settled.
+
+        The rows come from the node table and the settled work is joined onto
+        them, so a node that is connected and has served nothing appears with
+        zeros — the state an operator most wants to see, and the one a listing
+        built from the attempts alone would never show.
+
+        Args:
+            limit: The most rows to return.
+
+        Raises:
+            PotluckError: If `limit` is below 1.
+        """
+        conn = self._connection()
+        rows = conn.execute(
+            _ADMIN_SETTLED_SQL
+            + "SELECT node.node_id AS node_id, node.model AS model,"
+            " node.provider_id AS provider_id, node.connected AS connected,"
+            " node.share_enabled AS share_enabled, node.last_seen_at AS last_seen_at,"
+            " COALESCE(served.requests_served, 0) AS requests_served,"
+            " COALESCE(served.tokens, 0) AS tokens,"
+            " COALESCE(served.milli_credits, 0) AS milli_credits"
+            " FROM nodes AS node"
+            " LEFT JOIN (SELECT node_id AS node_id, COUNT(*) AS requests_served,"
+            " SUM(tokens) AS tokens, SUM(milli_credits) AS milli_credits"
+            " FROM settled WHERE node_id IS NOT NULL GROUP BY node_id) AS served"
+            " ON served.node_id = node.node_id"
+            " ORDER BY milli_credits DESC, requests_served DESC, node.node_id"
+            " LIMIT ?",
+            (_checked_limit(limit),),
+        ).fetchall()
+        return [_admin_node_from_row(row) for row in rows]
+
+    def admin_sessions(self, *, limit: int) -> list[SessionRecord]:
+        """Return the most recently active session aggregates, bounded.
+
+        `sessions` returns every aggregate an operator's listing asks for; this
+        is the same rows under a cap, because a dashboard that polls every ten
+        seconds has no use for — and should not read — an unbounded table.
+
+        Args:
+            limit: The most rows to return.
+
+        Raises:
+            PotluckError: If `limit` is below 1.
+        """
+        conn = self._connection()
+        rows = conn.execute(
+            "SELECT * FROM sessions ORDER BY last_seen_at DESC, subject_id, session_id"
+            " LIMIT ?",
+            (_checked_limit(limit),),
+        ).fetchall()
+        return [_session_from_row(row) for row in rows]
+
+    def admin_receipts(self, *, limit: int) -> list[AdminReceipt]:
+        """Return the most recently settled requests' current receipts.
+
+        One row per request, being that request's highest log index: a
+        settlement correction writes a second receipt for the same request, and
+        a listing that showed both would show the same money twice. The
+        corrected-away revision stays in the table, in the transparency log and
+        in `admin reconcile`'s reach; it is simply not the current one.
+
+        Args:
+            limit: The most rows to return.
+
+        Raises:
+            PotluckError: If `limit` is below 1.
+        """
+        conn = self._connection()
+        rows = conn.execute(
+            _ADMIN_SETTLED_SQL
+            + "SELECT receipt_id AS receipt_id, request_id AS request_id,"
+            " subject_id AS subject_id, node_id AS node_id, tokens AS tokens,"
+            " milli_credits AS milli_credits, request_status AS request_status,"
+            " log_index AS log_index, settled_at AS settled_at"
+            " FROM settled ORDER BY log_index DESC LIMIT ?",
+            (_checked_limit(limit),),
+        ).fetchall()
+        return [_admin_receipt_from_row(row) for row in rows]
+
+
+def _checked_limit(limit: int) -> int:
+    """Return `limit` once it is a bound a listing can be read against.
+
+    Raises:
+        PotluckError: If `limit` is below 1, because a listing that returns
+            nothing and a store that holds nothing are the same picture, and
+            only one of them is true.
+    """
+    if limit < 1:
+        raise PotluckError(f"a dashboard listing needs a limit >= 1, got {limit}")
+    return limit
+
 
 
 # --------------------------------------------------------------------------
@@ -3567,3 +4028,43 @@ def _outbox_from_row(row: Any) -> OutboxRecord:
     )
 
 
+
+
+def _admin_consumer_from_row(row: Any) -> AdminConsumer:
+    last_seen = row["last_seen_at"]
+    return AdminConsumer(
+        subject_id=str(row["subject_id"]),
+        requests=int(row["requests"]),
+        tokens=int(row["tokens"]),
+        milli_credits=int(row["milli_credits"]),
+        sessions=int(row["sessions"]),
+        last_seen_at=None if last_seen is None else _from_text(str(last_seen)),
+    )
+
+
+def _admin_node_from_row(row: Any) -> AdminNode:
+    return AdminNode(
+        node_id=str(row["node_id"]),
+        model=str(row["model"]),
+        provider_id=str(row["provider_id"]),
+        connected=bool(int(row["connected"])),
+        share_enabled=bool(int(row["share_enabled"])),
+        requests_served=int(row["requests_served"]),
+        tokens=int(row["tokens"]),
+        milli_credits=int(row["milli_credits"]),
+        last_seen_at=_from_text(str(row["last_seen_at"])),
+    )
+
+
+def _admin_receipt_from_row(row: Any) -> AdminReceipt:
+    return AdminReceipt(
+        receipt_id=str(row["receipt_id"]),
+        request_id=str(row["request_id"]),
+        subject_id=str(row["subject_id"]),
+        node_id=_opt_text(row["node_id"]),
+        tokens=_opt_int(row["tokens"]),
+        milli_credits=_opt_int(row["milli_credits"]),
+        request_status=str(row["request_status"]),
+        log_index=int(row["log_index"]),
+        settled_at=_from_text(str(row["settled_at"])),
+    )

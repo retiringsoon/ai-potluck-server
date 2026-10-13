@@ -56,6 +56,32 @@ class ModelUnavailable(PotluckError):
     """
 
 
+class AdminUiError(PotluckError):
+    """Raised when the operator's admin page cannot be started.
+
+    The page is an optional second listener the operator switches on with
+    ``serve --admin-ui``, so its refusals are named rather than folded into the
+    gateway's: a server whose admin page failed to start has to say that it was
+    the admin page, and a server that started without one has to be told why.
+    """
+
+
+class NonLoopbackAdminBindError(AdminUiError):
+    """Raised for an admin-page bind address that is not an IPv4 loopback literal.
+
+    A distinct type rather than a message match, for the same reason the client's
+    local endpoint has its own: refusing to become reachable from another machine
+    is this listener's one security invariant, and a caller must be able to tell
+    it apart from a port that was merely busy. ``0.0.0.0`` and ``::`` mean every
+    interface, a hostname is resolved through host files this process does not
+    control, and ``::1`` is a second address family — all four are refused.
+
+    The page holds no credential and offers no action, but it names every subject
+    and node this server has settled for, and it is served over plain HTTP: on a
+    reachable interface that is a public read-out of the operator's books.
+    """
+
+
 class QueueFull(PotluckError):
     """Raised when the server's dispatch queue is already at its bound.
 
