@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import inspect
 import json
+import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from aipotluck.errors import ConflictError, PotluckError
 from aipotluck.identity import generate_key_pair
 
+from aipotluck_server import deploy
 from aipotluck_server.deploy import load_server
 from aipotluck_server.gateway_service import DEFAULT_MAX_QUEUE_DEPTH
 from aipotluck_server.persistence import Credential
@@ -36,6 +39,24 @@ def _write_json(path: Path, document: dict[str, Any]) -> Path:
     """Write a strict-JSON configuration file."""
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
+
+
+#: The docstring line the documented ``server.json`` example follows.
+_EXAMPLE_MARKER = "``server.json`` — one server process::"
+
+
+def _documented_example() -> dict[str, Any]:
+    """Return the ``server.json`` example parsed out of `deploy`'s docstring.
+
+    Read from the docstring rather than retyped in a test, so the example an
+    operator copies is the example that is checked.
+    """
+    text = inspect.getdoc(deploy) or ""
+    lines = text[text.index(_EXAMPLE_MARKER) :].splitlines()
+    start = next(n for n, line in enumerate(lines) if line.strip() == "{")
+    end = next(n for n, line in enumerate(lines) if n > start and line.strip() == "}")
+    block = textwrap.dedent("\n".join(lines[start : end + 1]))
+    return cast("dict[str, Any]", json.loads(block))
 
 
 def _server_document(tmp_path: Path, *, database_name: str = "server.db") -> dict[str, Any]:
@@ -115,6 +136,37 @@ def test_load_server_provisions_and_starts(tmp_path: Path) -> None:
     text = repr(deployment)
     assert "settlement_private_key_b64" not in text
     assert CONSUMER_TOKEN not in text
+
+
+def test_the_documented_server_json_example_boots(tmp_path: Path) -> None:
+    """The example in `deploy`'s own docstring loads and starts, as written.
+
+    Only what cannot be committed is substituted: real key material for the two
+    placeholders, a database path inside this test's own directory, and a port
+    that needs no privilege. A field the loader comes to require without a
+    matching edit to the documented example is the drift an operator meets when
+    they copy the example and it refuses to start, and this test fails first.
+    """
+    document = _documented_example()
+    _settlement_public, settlement_private = generate_key_pair()
+    device_public, _device_private = generate_key_pair()
+    document["settlement_private_key_b64"] = settlement_private
+    document["providers"][0]["public_key_b64"] = device_public
+    document["database_path"] = str(tmp_path / "server.db")
+    document["port"] = 0
+
+    deployment = load_server(_write_json(tmp_path / "server.json", document), start=True)
+    try:
+        assert deployment.server.url.startswith("http://127.0.0.1:")
+        assert deployment.provider_ids == ("provider-1",)
+        assert deployment.service.balance("consumer-X") == 100_000
+        assert deployment.service.balance("provider-1") == 5_000
+        registry = deployment.service._registry
+        registry.check_device_binding("device-1", "provider-1")
+        assert registry.get_key("settlement-key-1").owner_id == document["platform_id"]
+    finally:
+        deployment.server.stop()
+        deployment.store.close()
 
 
 def test_load_server_restart_reprovisions_without_double_funding(tmp_path: Path) -> None:
