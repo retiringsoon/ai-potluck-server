@@ -46,6 +46,7 @@ from aipotluck.websocket import ClientConnection, WebSocketClosed, WebSocketProt
 from aipotluck.wire import Envelope, HelloAck, NodeHello, NodePolicy
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from aipotluck_server import gateway_server
 from aipotluck_server.gateway_server import (
     MAX_HTTP_BODY_BYTES,
     GatewayConfig,
@@ -511,6 +512,22 @@ def _port(server: GatewayServer) -> int:
     parts = urllib.parse.urlsplit(server.url)
     assert parts.port is not None
     return parts.port
+
+
+def _wait_until(condition: Any, *, timeout: float = 10.0, what: str = "condition") -> None:
+    """Block until `condition()` is truthy, failing with a readable message."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def _wait_readable(sock: socket.socket, *, timeout: float) -> bool:
+    """Return whether `sock` has something to read, or has ended, in `timeout`."""
+    readable, _, _ = select.select([sock], [], [], timeout)
+    return bool(readable)
 
 
 def _http(
@@ -1423,7 +1440,9 @@ def test_a_refusal_for_a_body_the_sender_is_still_writing_reaches_the_sender(
         sender.start()
         # Read late, the way a proxy does while its own upload is still in flight:
         # a reset that lands before the read discards an answer that was written.
-        time.sleep(1.0)
+        # "Late" means once there is an answer to read, which is the ordering this
+        # test needs without a guessed interval to get it wrong on a busy machine.
+        assert _wait_readable(sock, timeout=30.0), "the gateway never answered"
         raw, reset = _read_until_closed(sock)
         sender.join(timeout=30)
 
@@ -1537,27 +1556,39 @@ def test_sse_delivers_new_events_appended_after_the_stream_is_open(
         stream.close()
 
 
-def test_an_abandoned_stream_stops_being_polled(gateway: Callable[..., GatewayServer]) -> None:
+def test_an_abandoned_stream_stops_being_polled(
+    gateway: Callable[..., GatewayServer], monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = _StubService()
     service.statuses["req-s"] = "RUNNING"
+    # The two intervals that pace the noticing are shrunk together: the writer
+    # waits `_WRITER_POLL_S` on an empty buffer before it looks for a peer that
+    # left, and the producer waits `sse_poll_interval_s` between its polls. What
+    # the test asserts is a count of polls, so it means the same at any pace.
+    monkeypatch.setattr(gateway_server, "_WRITER_POLL_S", 0.05)
     server = gateway(service)
+    server.tuning = replace(server.tuning, sse_poll_interval_s=0.05)
     stream = _sse_open(server, "req-s")
-    time.sleep(0.4)
+    _wait_until(lambda: service.poll_calls > 0, what="the producer to poll at all")
+    left_at = service.poll_calls
     stream.close()
 
     # The request stays RUNNING forever, so only the peer's departure can stop
-    # the producer. Wait for the poll count to stop moving on its own.
+    # the producer. Wait for the poll count to stop moving on its own, across a
+    # window several writer polls wide: a narrower one would read the polls still
+    # in flight as a producer that never stopped.
     stopped_at: int | None = None
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        time.sleep(0.2)
         before = service.poll_calls
-        time.sleep(0.7)
+        time.sleep(0.3)
         if service.poll_calls == before:
             stopped_at = before
             break
     assert stopped_at is not None, "the producer polled a dead stream until the deadline"
-    assert stopped_at < 10
+    assert stopped_at - left_at < 10, (
+        f"the producer polled {stopped_at - left_at} more times after its peer left"
+    )
 
 
 def test_sse_emits_a_heartbeat_comment_when_idle(gateway: Callable[..., GatewayServer]) -> None:

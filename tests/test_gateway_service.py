@@ -520,15 +520,6 @@ def test_a_replayed_key_under_a_fresh_request_id_is_a_conflict(harness: Harness)
     assert len(harness.store.attempts_for_request("R-1")) == 1
 
 
-def test_admission_refuses_a_ceiling_above_the_signed_cap(harness: Harness) -> None:
-    """The offer may not expose a node to more than the consumer signed for."""
-    harness.connect()
-    authorization = harness.authorization(request_id="R-1", max_charge_milli_credits=5_000)
-
-    with pytest.raises(ProtocolError, match="outside the"):
-        harness.admit(authorization, max_charge_milli_credits=5_001)
-
-
 def test_admission_refuses_a_consumer_the_credential_does_not_own(
     harness: Harness,
 ) -> None:

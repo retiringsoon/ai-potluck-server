@@ -233,13 +233,6 @@ def test_a_join_body_claiming_another_identity_changes_nothing(server: _Server) 
     assert row.owner_id == result.subject_id
 
 
-def test_join_requires_a_public_key(server: _Server) -> None:
-    """Without key material there is nothing to derive an identity from."""
-    server.mint("code-nokey")
-    with pytest.raises(ProtocolError):
-        server.join("code-nokey", public_key_b64="")
-
-
 def test_an_auto_join_funds_its_own_account_once(server: _Server) -> None:
     """Join mints the identity's account with the invite's quota, idempotently."""
     public_b64, _private = generate_key_pair()

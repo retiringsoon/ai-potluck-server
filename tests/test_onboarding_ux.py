@@ -362,27 +362,31 @@ def _submitted_model(bodies: list[dict[str, Any]]) -> str:
     return str(bodies[0]["model"])
 
 
-class _SlowBufferedAdapter(FakeUpstreamAdapter):
-    """A fake upstream whose buffered completion takes a moment.
+class _GatedBufferedAdapter(FakeUpstreamAdapter):
+    """A fake upstream whose buffered completion waits for the test to release it.
 
     The buffered path exists precisely so a caller can tell "the whole answer
-    arrived at once" from "the answer arrived in pieces". Without a slow
-    ``complete`` that distinction is invisible from the outside: both appear as
-    the same text arriving before the test can look. This adapter keeps the
-    ``complete`` contract (one scripted response, one upstream call) and only
-    adds a pause, so streaming is still impossible on this path.
+    arrived at once" from "the answer arrived in pieces". Without a ``complete``
+    that is still running that distinction is invisible from the outside: both
+    appear as the same text arriving before the test can look. A gate rather than
+    a delay holds the window open for exactly as long as the assertion needs and
+    no longer, so the assertion cannot be won or lost by how busy the machine is.
+    It keeps the ``complete`` contract — one scripted response, one upstream call
+    — so streaming is still impossible on this path.
     """
 
-    def __init__(self, *, upstream: FakeUpstream, model: str, delay_s: float) -> None:
-        """Wrap `upstream`, pausing `delay_s` inside every buffered call."""
+    def __init__(self, *, upstream: FakeUpstream, model: str) -> None:
+        """Wrap `upstream`, holding every buffered call on a test-owned gate."""
         super().__init__(upstream=upstream, model=model)
-        self._delay_s = delay_s
+        self.entered = threading.Event()
+        self.gate = threading.Event()
 
     def complete(
         self, messages: Any, *, request_digest: str, parameters: Any
     ) -> Any:
-        """Pause, then return the scripted response like the base adapter."""
-        time.sleep(self._delay_s)
+        """Announce entry, wait for the gate, then return the scripted response."""
+        self.entered.set()
+        assert self.gate.wait(timeout=60), "the test never released the buffered call"
         return super().complete(
             messages, request_digest=request_digest, parameters=parameters
         )
@@ -437,7 +441,7 @@ def test_ask_buffered_says_it_is_waiting_and_prints_the_answer_once(
     """Buffered mode must be visibly buffered, not a fake stream."""
     server, _keyring, _nodes, tmp_path = harness
     upstream = _streaming_upstream(("alpha ", "beta ", "gamma"))
-    adapter = _SlowBufferedAdapter(upstream=upstream, model=MODEL, delay_s=1.5)
+    adapter = _GatedBufferedAdapter(upstream=upstream, model=MODEL)
     _start_node(harness, upstream, adapter=adapter)
     identity = tmp_path / "identity"
     server.join_consumer(identity)
@@ -456,11 +460,13 @@ def test_ask_buffered_says_it_is_waiting_and_prints_the_answer_once(
     thread.start()
     try:
         assert err.wait_for("waiting for generation...", timeout=15.0), err.text()
-        # The model is still "thinking" for another second, so nothing may have
+        _wait_until(lambda: adapter.entered.is_set(), what="the buffered call to start")
+        # The node is inside `complete` and has not returned, so nothing may have
         # reached stdout: had the answer been chunked, its first words would be
         # here by now. That is the difference between buffered and streamed.
         assert out.text() == "", f"buffered mode leaked partial output: {out.text()!r}"
     finally:
+        adapter.gate.set()
         thread.join(timeout=30)
 
     assert result["code"] == 0, err.text()
@@ -592,7 +598,14 @@ def test_ask_stream_cancel_is_a_real_end_to_end_cancellation(
 ) -> None:
     """Ctrl-C must stop the node's in-flight attempt, not just the client."""
     server, _keyring, _nodes, tmp_path = harness
-    node = _start_node(harness, _streaming_upstream(("a", "b", "c", "d", "e", "f"), delay=0.5))
+    # Words rather than single letters, so the interrupt below can wait on an
+    # increment it cannot mistake for part of the client's own narration.
+    node = _start_node(
+        harness,
+        _streaming_upstream(
+            ("one ", "two ", "three ", "four ", "five ", "six "), delay=0.35
+        ),
+    )
     identity = tmp_path / "identity"
     server.join_consumer(identity)
 
@@ -606,17 +619,22 @@ def test_ask_stream_cancel_is_a_real_end_to_end_cancellation(
         return result
 
     monkeypatch.setattr(SignedClient, "post", recording_post)
-
-    def _interrupt() -> None:
-        time.sleep(0.8)
-        os.kill(os.getpid(), signal.SIGINT)
-
-    timer = threading.Thread(target=_interrupt, daemon=True)
-    timer.start()
     out = _Recorder()
     err = _Recorder()
     monkeypatch.setattr("sys.stdout", out)
     monkeypatch.setattr("sys.stderr", err)
+
+    def _interrupt() -> None:
+        # Interrupt once the answer is visibly mid-flight, rather than a fixed
+        # interval in: five blocks and their usage frame are still to come, so
+        # the cancellation lands inside the stream on a machine at any speed.
+        assert out.wait_for("one ", timeout=30.0), (
+            f"the stream never displayed its first increment: {out.text()!r}"
+        )
+        os.kill(os.getpid(), signal.SIGINT)
+
+    timer = threading.Thread(target=_interrupt, daemon=True)
+    timer.start()
     code = main(["ask", "hi", "--config-dir", str(identity), "--stream", "--timeout", "30"])
     timer.join(timeout=5)
 
@@ -857,8 +875,11 @@ def test_ask_prints_the_servers_reason_for_a_request_it_cancelled(
             str(identity),
             "--model",
             MODEL,
+            # One second, matching the sibling test above: the rule under test is
+            # that a wait which did not succeed prints the server's note, and how
+            # long that wait was is not part of it.
             "--timeout",
-            "2",
+            "1",
             "--no-node-grace",
             "30",
         ]
@@ -979,23 +1000,26 @@ def test_unknown_usage_never_becomes_a_zero_cost(
 ) -> None:
     """A cancelled request whose usage is unknown says it is to be confirmed, never 0."""
     server, _keyring, _nodes, tmp_path = harness
-    # A 1s-per-chunk stream leaves a wide mid-flight window, so the Ctrl-C at
-    # 0.6s deterministically lands before the answer is complete — the point
-    # being that the usage is then unknown, and must never read as zero.
-    _start_node(harness, _streaming_upstream(("only ", "part"), delay=1.0))
+    # Three paced blocks put the first increment on screen while the usage frame
+    # is still a second away, so the interrupt below lands mid-stream on a
+    # machine at any speed and the usage is genuinely unknown at that moment.
+    _start_node(harness, _streaming_upstream(("only ", "part ", "of it"), delay=0.5))
     identity = tmp_path / "identity"
     server.join_consumer(identity)
 
-    def _interrupt() -> None:
-        time.sleep(0.6)
-        os.kill(os.getpid(), signal.SIGINT)
-
-    timer = threading.Thread(target=_interrupt, daemon=True)
-    timer.start()
     out = _Recorder()
     err = _Recorder()
     monkeypatch.setattr("sys.stdout", out)
     monkeypatch.setattr("sys.stderr", err)
+
+    def _interrupt() -> None:
+        assert out.wait_for("only ", timeout=30.0), (
+            f"the stream never displayed its first increment: {out.text()!r}"
+        )
+        os.kill(os.getpid(), signal.SIGINT)
+
+    timer = threading.Thread(target=_interrupt, daemon=True)
+    timer.start()
     main(["ask", "hi", "--config-dir", str(identity), "--stream", "--timeout", "30"])
     timer.join(timeout=5)
 
