@@ -9,6 +9,9 @@ presentation and signal helpers from there rather than growing second copies.
   startup lines name the bind URL, the node URL, and every provisioned
   provider. They carry no secret: the config's tokens are held by the store as
   digests, and the settlement private key never leaves the process.
+  ``--admin-ui PORT`` additionally starts the operator's dashboard on that
+  loopback port: a read-only page over the same database, off unless asked for
+  and unreachable from another machine either way.
 * ``admin invite`` mints a single-use-or-capped invite code, printing the
   plaintext once, and ``--with-api-key`` marks it so the join that redeems it
   also mints an API key for the OpenAI-compatible endpoint; ``admin
@@ -62,7 +65,13 @@ from aipotluck.errors import PotluckError
 from aipotluck.reconcile import ReceiptVerification
 from aipotluck.wire import SESSION_HEADER
 
-from .deploy import ServerInspection, load_server, load_server_for_inspection
+from .admin_ui import ADMIN_LOOPBACK_HOST, AdminUiServer
+from .deploy import (
+    ServerDeployment,
+    ServerInspection,
+    load_server,
+    load_server_for_inspection,
+)
 from .gateway_service import MAX_DEADLINE_MS, generate_api_key
 from .persistence import ServerStore
 from .reconcile import reconcile_server, verify_receipt_at_server
@@ -154,6 +163,21 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="PATH",
         help="server.json produced for this deployment.",
+    )
+    serve.add_argument(
+        "--admin-ui",
+        default=None,
+        type=int,
+        dest="admin_ui",
+        metavar="PORT",
+        help=(
+            "Also serve the operator's read-only dashboard on this port of "
+            f"{ADMIN_LOOPBACK_HOST} (0 asks the OS for one, and the URL is "
+            "printed). Off unless named. The page authenticates nobody, so it "
+            "binds loopback only and is refused on any other address; reach it "
+            "from another machine through a tunnel, e.g. ssh -L "
+            f"9802:{ADMIN_LOOPBACK_HOST}:9802 <host>."
+        ),
     )
     serve.set_defaults(handler=_cmd_serve)
 
@@ -474,28 +498,109 @@ def _configure_gateway_logging() -> None:
     logger.setLevel(logging.INFO)
 
 
+def _admin_ui_port(port: int | None) -> int | None:
+    """Return the ``--admin-ui`` port once it is one a socket can bind.
+
+    Checked before a server is loaded rather than after, so a typo in the flag
+    costs nothing but the command: starting the gateway only to refuse the page
+    beside it would leave an operator with a running server and a message about
+    a port.
+
+    Args:
+        port: The port the flag named, or `None` for no page.
+
+    Returns:
+        The same port, or `None`.
+
+    Raises:
+        PotluckError: If the port is outside ``0..65535``.
+    """
+    if port is None:
+        return None
+    if port < 0 or port > 65535:
+        raise PotluckError(
+            f"--admin-ui must be a port between 0 and 65535, got {port}: 0 asks "
+            "the operating system for a free port and prints the URL it chose"
+        )
+    return port
+
+
+def _start_admin_ui(deployment: ServerDeployment, port: int | None) -> AdminUiServer | None:
+    """Start the operator's dashboard beside a running server, if it was asked for.
+
+    ``None`` in, ``None`` out: without ``--admin-ui`` no socket is bound, no
+    thread is started and the database is not opened a second time, so a server
+    that was not asked for a dashboard has exactly the surface it had before
+    this flag existed.
+
+    The page reads the same database the gateway writes, opened read-only, and
+    binds an IPv4 loopback literal — both enforced by `AdminUiServer`'s
+    construction, which is why the refusals surface here rather than at the
+    first request.
+
+    Args:
+        deployment: The running server whose database and platform id the page
+            reports on.
+        port: The loopback port to bind, or `None` to serve no page.
+
+    Returns:
+        The started listener, or `None` when no page was asked for.
+
+    Raises:
+        PotluckError: If the port is outside the range a socket can bind, or the
+            database cannot be opened for reading.
+        NonLoopbackAdminBindError: If the address this would bind is not IPv4
+            loopback, which the flag cannot ask for and a programmatic caller can.
+    """
+    bound = _admin_ui_port(port)
+    if bound is None:
+        return None
+    ui = AdminUiServer(
+        database_path=deployment.config.database_path,
+        platform_id=deployment.config.platform_id,
+        version=_package_version(),
+        port=bound,
+    )
+    ui.start()
+    return ui
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     """Run the ``serve`` subcommand: a server until SIGINT/SIGTERM.
 
     The startup lines name the bind URL, the node URL, and every provisioned
     provider. They carry no secret: the config's tokens are held by the store
     as digests, and the settlement private key never leaves the process.
+
+    ``--admin-ui`` adds one more line naming the dashboard's loopback URL, and
+    one more listener to stop on the way out.
     """
     config: Path = args.config
+    admin_port = _admin_ui_port(args.admin_ui)
     _configure_gateway_logging()
     deployment = load_server(config, start=True)
     server = deployment.server
-    print(
-        f"{PROG}: server {deployment.config.platform_id} serving {server.url} "
-        f"(node link {server.node_url})"
-    )
-    for provider_id in deployment.provider_ids:
-        print(f"{PROG}: provider {provider_id} provisioned (demo float funded)")
-    stop = threading.Event()
-    install_stop_handlers(stop)
+    admin_ui: AdminUiServer | None = None
     try:
+        print(
+            f"{PROG}: server {deployment.config.platform_id} serving {server.url} "
+            f"(node link {server.node_url})"
+        )
+        for provider_id in deployment.provider_ids:
+            print(f"{PROG}: provider {provider_id} provisioned (demo float funded)")
+        admin_ui = _start_admin_ui(deployment, admin_port)
+        if admin_ui is not None:
+            print(
+                f"{PROG}: admin page {admin_ui.url} (loopback only, read-only; "
+                "tunnel it with ssh -L "
+                f"{admin_ui.port}:{ADMIN_LOOPBACK_HOST}:{admin_ui.port} <host>)"
+            )
+        stop = threading.Event()
+        install_stop_handlers(stop)
         stop.wait()
     finally:
+        if admin_ui is not None:
+            admin_ui.stop()
         server.stop()
         deployment.store.close()
     return 0
