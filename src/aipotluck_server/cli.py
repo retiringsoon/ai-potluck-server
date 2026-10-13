@@ -10,8 +10,10 @@ presentation and signal helpers from there rather than growing second copies.
   provider. They carry no secret: the config's tokens are held by the store as
   digests, and the settlement private key never leaves the process.
 * ``admin invite`` mints a single-use-or-capped invite code, printing the
-  plaintext once; ``admin invite-list`` and ``admin revoke-key`` are the
-  operator views, and neither ever renders a code or a private key.
+  plaintext once, and ``--with-api-key`` marks it so the join that redeems it
+  also mints an API key for the OpenAI-compatible endpoint; ``admin
+  invite-list`` and ``admin revoke-key`` are the operator views, and neither
+  ever renders a code or a private key.
 * ``admin api-key`` mints a revocable, quota-bearing API key for the
   OpenAI-compatible endpoint and prints the plaintext once; ``admin
   api-key-list`` shows every key with what it has spent, and ``admin
@@ -61,7 +63,7 @@ from aipotluck.reconcile import ReceiptVerification
 from aipotluck.wire import SESSION_HEADER
 
 from .deploy import ServerInspection, load_server, load_server_for_inspection
-from .gateway_service import API_KEY_BYTES, API_KEY_PREFIX, MAX_DEADLINE_MS
+from .gateway_service import MAX_DEADLINE_MS, generate_api_key
 from .persistence import ServerStore
 from .reconcile import reconcile_server, verify_receipt_at_server
 
@@ -214,6 +216,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1,
         dest="max_uses",
         help="How many joins the code permits (default 1).",
+    )
+    invite.add_argument(
+        "--with-api-key",
+        action="store_true",
+        dest="with_api_key",
+        help=(
+            "Consumer invites only: the join that redeems this code also mints "
+            "an API key for the OpenAI-compatible endpoint, bound to the "
+            "identity it derived and capped by --quota. The key is printed once "
+            "by `potluck join` and never again. Without this flag a join mints "
+            "an identity and funds it, exactly as before, and issues no key."
+        ),
     )
     invite.set_defaults(handler=_cmd_admin_invite)
 
@@ -561,11 +575,38 @@ def _parse_duration(text: str) -> dt.timedelta:
 
 
 def _cmd_admin_invite(args: argparse.Namespace) -> int:
-    """Run ``admin invite``: mint a code, print it once, store only its digest."""
+    """Run ``admin invite``: mint a code, print it once, store only its digest.
+
+    ``--with-api-key`` marks the invite so the join that redeems it mints an API
+    key for the identity it derived. The mark is all this command stores: no key
+    exists until somebody joins, so an invite that is never redeemed leaves no
+    credential behind, and one that is redeemed leaves a key the operator can
+    list and revoke like any other.
+
+    Raises:
+        PotluckError: If the invite would admit nobody, fund nothing, or issue a
+            key that could not be used.
+    """
     if args.max_uses < 1:
         raise PotluckError("--max-uses must be >= 1")
     if args.quota < 0:
         raise PotluckError("--quota must be >= 0")
+    if args.with_api_key:
+        # The same two refusals `admin api-key` makes, moved to the moment the
+        # operator can still fix them: an invite that promises a key which would
+        # authenticate and then fail at settlement is a mistake worth reporting
+        # now rather than a surprise for whoever joins with it.
+        if args.role != "consumer":
+            raise PotluckError(
+                f"--with-api-key needs --role consumer, got {args.role!r}: an API "
+                "key spends a consumer account, and a node has none"
+            )
+        if args.quota < 1:
+            raise PotluckError(
+                f"--with-api-key needs --quota >= 1 milli-credit, got {args.quota}: "
+                "the key a join mints is capped by this quota, and a key with no "
+                "quota admits nothing"
+            )
     now = dt.datetime.now(dt.UTC)
     expires_at = now + _parse_duration(args.expires_in)
     code = secrets.token_urlsafe(24)
@@ -579,16 +620,18 @@ def _cmd_admin_invite(args: argparse.Namespace) -> int:
             created_at=now,
             expires_at=expires_at,
             quota_milli_credits=args.quota,
+            issues_api_key=bool(args.with_api_key),
         )
     finally:
         store.close()
     # The plaintext code goes to stdout exactly once; nothing else prints it and
     # only its digest was stored.
     print(code)
+    issues = ", issues an API key at join" if args.with_api_key else ""
     print(
         f"{PROG}: invite minted (role {args.role}, tenant {args.tenant}, "
         f"max uses {args.max_uses}, quota {args.quota} milli-credits, "
-        f"expires {expires_at.isoformat()}); shown once",
+        f"expires {expires_at.isoformat()}{issues}); shown once",
         file=sys.stderr,
     )
     return 0
@@ -604,9 +647,11 @@ def _cmd_admin_invite_list(args: argparse.Namespace) -> int:
     for invite in invites:
         expires = invite.expires_at.isoformat() if invite.expires_at else "never"
         state = "revoked" if invite.revoked_at else "active"
+        issues = "yes" if invite.issues_api_key else "no"
         print(
             f"{invite.code_digest[:23]}… role={invite.role} tenant={invite.tenant_scope} "
-            f"uses={invite.used_count}/{invite.max_uses} expires={expires} {state}"
+            f"api-key={issues} uses={invite.used_count}/{invite.max_uses} "
+            f"expires={expires} {state}"
         )
     return 0
 
@@ -686,11 +731,11 @@ def _cmd_admin_api_key(args: argparse.Namespace) -> int:
                 "then `potluck join`) or name a consumer credential from "
                 "server.json"
             )
-        key_id = f"apikey-{secrets.token_hex(6)}"
-        plaintext = API_KEY_PREFIX + secrets.token_urlsafe(API_KEY_BYTES)
+        generated = generate_api_key()
+        plaintext = generated.plaintext
         record = store.add_api_key(
             plaintext,
-            key_id=key_id,
+            key_id=generated.key_id,
             name=str(args.name),
             subject_id=binding.subject_id,
             tenant_id=binding.tenant_id,

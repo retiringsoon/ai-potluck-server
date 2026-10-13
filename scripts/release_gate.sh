@@ -37,7 +37,13 @@
 #      settled into a receipt the operator side verifies. This is the second
 #      admission path, and a gate that only ever signs a request cannot see a
 #      defect only an API-key admission can reach;
-#   8. the receipt verifies on both sides, and both reconciliations agree. After
+#   8. an invite minted `--with-api-key` hands the joining consumer a key on
+#      stdout — the only channel that plaintext ever travels on — and that key
+#      answers a chat completion against the same real node and settles into a
+#      receipt the operator side verifies. This is the path a member takes with
+#      no operator round trip, and the one where a key that authenticated but
+#      could never settle would be invisible to every step above;
+#   9. the receipt verifies on both sides, and both reconciliations agree. After
 #      a restart the node side may name exactly one class of difference: an offer
 #      the node never accepted, which the server holds as FAILED with the
 #      settlement HELD and no receipt. Anything else — a *settled* attempt the
@@ -188,13 +194,16 @@ trap cleanup EXIT INT TERM
 UPSTREAM_KEY="sk-smoke-fake-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 NODE_INVITE=""
 CONSUMER_INVITE=""
+KEYED_INVITE=""
+JOIN_API_KEY=""
 
 # Fail-closed redaction: the smoke only ever uses fake secrets and single-use
 # invite codes for a throwaway server, but a failure log must never become a
 # place a real one could accumulate if this script is reused.
 redact_log() {
     sed -e 's|[Bb]earer [A-Za-z0-9._~+/-]*|Bearer <redacted>|g' "$1" > "$1.redacted"
-    for secret in "$UPSTREAM_KEY" "$NODE_INVITE" "$CONSUMER_INVITE"; do
+    for secret in "$UPSTREAM_KEY" "$NODE_INVITE" "$CONSUMER_INVITE" "$KEYED_INVITE" \
+            "$JOIN_API_KEY"; do
         [ -n "$secret" ] || continue
         mv "$1.redacted" "$1.redacted.tmp"
         sed -e "s|$secret|<redacted>|g" "$1.redacted.tmp" > "$1.redacted"
@@ -231,10 +240,13 @@ step() {
 # `--model`, no `--max-charge` and no `--node-token-file` was passed.
 show() {
     line=$(printf '%s' "$*" | sed -e "s|$UPSTREAM_KEY|<upstream-key>|g")
-    for secret in "$NODE_INVITE" "$CONSUMER_INVITE"; do
+    for secret in "$NODE_INVITE" "$CONSUMER_INVITE" "$KEYED_INVITE"; do
         [ -n "$secret" ] || continue
         line=$(printf '%s' "$line" | sed -e "s|$secret|<invite>|g")
     done
+    if [ -n "$JOIN_API_KEY" ]; then
+        line=$(printf '%s' "$line" | sed -e "s|$JOIN_API_KEY|<api key>|g")
+    fi
     printf 'release_gate.sh:     $ %s\n' "$line"
 }
 
@@ -739,10 +751,11 @@ PY
 # which is why the command this runs is echoed by the step rather than by this
 # function.
 run_openai_completion() {
-    mode=$1
-    question=$2
-    err=$3
-    printf '%s\n' "$API_KEY" \
+    key=$1
+    mode=$2
+    question=$3
+    err=$4
+    printf '%s\n' "$key" \
         | MODE="$mode" QUESTION="$question" SERVER_URL="$SERVER_URL" MODEL="$MODEL" \
             REPLY_MARKER="$REPLY_MARKER" "$HOME_PY" "$WORK/openai_smoke.py" 2>"$err"
 }
@@ -778,7 +791,7 @@ printf 'release_gate.sh:     minted %s for %s (the plaintext is never written to
 
 step 'the API key answers a buffered chat completion against the real node'
 show 'POST /openai/v1/chat/completions (Authorization: Bearer <api key>, "stream": false)'
-OPENAI_BUFFERED=$(run_openai_completion buffered 'gate api-key buffered' \
+OPENAI_BUFFERED=$(run_openai_completion "$API_KEY" buffered 'gate api-key buffered' \
     "$WORK/logs/openai-buffered.err") \
     || { tail -20 "$WORK/logs/openai-buffered.err" >&2
          fail 'the buffered chat completion on an API key was not answered'; }
@@ -787,7 +800,7 @@ OPENAI_BUFFERED_REQUEST=$(printf '%s\n' "$OPENAI_BUFFERED" | tail -1)
 
 step 'the same key answers a streaming chat completion'
 show 'POST /openai/v1/chat/completions (Authorization: Bearer <api key>, "stream": true)'
-OPENAI_STREAM=$(run_openai_completion stream 'gate api-key streaming' \
+OPENAI_STREAM=$(run_openai_completion "$API_KEY" stream 'gate api-key streaming' \
     "$WORK/logs/openai-stream.err") \
     || { tail -20 "$WORK/logs/openai-stream.err" >&2
          fail 'the streaming chat completion on an API key was not answered'; }
@@ -810,6 +823,71 @@ for OPENAI_REQUEST in "$OPENAI_BUFFERED_REQUEST" "$OPENAI_STREAM_REQUEST"; do
              fail "the receipt $OPENAI_RECEIPT for $OPENAI_REQUEST did not verify"; }
     printf 'release_gate.sh:     %s -> %s verified\n' "$OPENAI_REQUEST" "$OPENAI_RECEIPT"
 done
+
+# --------------------------------------------------------------------------
+# The shorter path: an invite that issues its own key
+# --------------------------------------------------------------------------
+
+# Every step above mints a key by hand, for a subject an operator read out of a
+# listing. The path a member actually takes is one command shorter: the invite
+# carries the instruction, and `potluck join` is the only channel the key's
+# plaintext ever travels on. That channel is what this proves — the key a join
+# printed is a live key, bound to the identity that just joined, and it reaches a
+# settled receipt through the same real node. A key that authenticated and then
+# could never settle (a subject with no account, a quota of zero) would answer
+# every step above and fail only here.
+
+step 'mint an invite that issues its own API key when redeemed'
+show "potluck-server admin invite --config server.json --role consumer --tenant $TENANT --with-api-key --quota $API_KEY_QUOTA"
+KEYED_INVITE=$("$POTLUCK_SERVER" admin invite --config "$SERVER_JSON" --role consumer \
+    --tenant "$TENANT" --with-api-key --quota "$API_KEY_QUOTA" \
+    2>>"$WORK/logs/invite.log" </dev/null) || fail 'minting a key-issuing invite failed'
+[ -n "$KEYED_INVITE" ] || fail 'the key-issuing invite came back empty'
+
+step 'a second consumer joins on it and is handed the key'
+show "potluck join --server $SERVER_URL --invite <invite> --config-dir consumer-keyed"
+# stdout is captured, not logged: it carries the plaintext exactly once, and a
+# log file is the one place a credential must not accumulate.
+JOIN_OUT=$("$POTLUCK" join --server "$SERVER_URL" --invite "$KEYED_INVITE" \
+    --config-dir "$WORK/consumer-keyed" 2>"$WORK/logs/consumer-keyed-join.err" </dev/null) \
+    || { tail -30 "$WORK/logs/consumer-keyed-join.err" >&2
+         fail 'the join on a key-issuing invite failed'; }
+JOIN_API_KEY=$(printf '%s\n' "$JOIN_OUT" | grep -m1 '^ak-') \
+    || fail 'join printed no API key for an invite minted --with-api-key'
+case "$JOIN_OUT" in
+    *"$SERVER_URL/openai/v1"*) : ;;
+    *) fail 'join did not name the base_url the issued key belongs to' ;;
+esac
+case "$JOIN_OUT" in
+    *'shown once; store it now'*) : ;;
+    *) fail 'join did not say the issued key is shown once' ;;
+esac
+printf 'release_gate.sh:     join issued %s to the identity it saved (the plaintext is never written to a log)\n' \
+    "$(printf '%s' "$JOIN_API_KEY" | cut -c1-6)..."
+
+step 'the key join issued answers a chat completion against the real node'
+show 'POST /openai/v1/chat/completions (Authorization: Bearer <the key join issued>, "stream": false)'
+KEYED_COMPLETION=$(run_openai_completion "$JOIN_API_KEY" buffered 'gate join-issued key' \
+    "$WORK/logs/openai-keyed.err") \
+    || { tail -20 "$WORK/logs/openai-keyed.err" >&2
+         fail 'the chat completion on the key join issued was not answered'; }
+check_openai_completion buffered "$KEYED_COMPLETION" "$WORK/logs/openai-keyed.err"
+KEYED_REQUEST=$(printf '%s\n' "$KEYED_COMPLETION" | tail -1)
+if [ "$KEYED_REQUEST" = "$OPENAI_BUFFERED_REQUEST" ] \
+        || [ "$KEYED_REQUEST" = "$OPENAI_STREAM_REQUEST" ]; then
+    fail 'the join-issued key was answered as one of the earlier requests'
+fi
+
+step 'that request settled into a receipt an operator can verify'
+KEYED_RECEIPT=$(receipt_for_request "$KEYED_REQUEST" </dev/null)
+[ -n "$KEYED_RECEIPT" ] \
+    || fail "the join-issued key's request $KEYED_REQUEST settled into no receipt"
+show "potluck-server verify receipt --config server.json --receipt-id $KEYED_RECEIPT"
+"$POTLUCK_SERVER" verify receipt --config "$SERVER_JSON" --receipt-id "$KEYED_RECEIPT" \
+    >"$WORK/logs/verify-keyed-$KEYED_RECEIPT.log" 2>&1 </dev/null \
+    || { tail -20 "$WORK/logs/verify-keyed-$KEYED_RECEIPT.log" >&2
+         fail "the receipt $KEYED_RECEIPT for the join-issued key did not verify"; }
+printf 'release_gate.sh:     %s -> %s verified\n' "$KEYED_REQUEST" "$KEYED_RECEIPT"
 
 # --------------------------------------------------------------------------
 # After the restart the records still have to add up
@@ -878,5 +956,7 @@ printf 'release_gate.sh: fresh server (no hand-written credentials) + invite-onl
 printf 'release_gate.sh: default-model/default-charge asks: streaming (first increment before completion), buffered, repeat, after restart\n'
 printf 'release_gate.sh: an API key answered /openai/v1/chat/completions buffered and streaming against the real node: %s %s\n' \
     "$OPENAI_BUFFERED_REQUEST" "$OPENAI_STREAM_REQUEST"
+printf 'release_gate.sh: an invite minted --with-api-key handed its key to the consumer join, which answered %s\n' \
+    "$KEYED_REQUEST"
 printf 'release_gate.sh: receipts %s %s %s distinct; verified on both sides; node and server reconcile clean\n' \
     "$RECEIPT_ID" "$BUFFERED_RECEIPT_ID" "$RESTART_RECEIPT_ID"

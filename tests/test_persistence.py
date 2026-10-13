@@ -787,6 +787,57 @@ def test_a_database_from_before_the_device_binding_gains_the_column(
         store.close()
 
 
+def test_a_database_from_before_key_issuing_invites_gains_the_column(
+    tmp_path: Path,
+) -> None:
+    """An upgraded server keeps its invites, and none of them starts issuing keys.
+
+    ``_migrate`` adds the column an existing database is missing. Without its
+    entry for ``invites.issues_api_key``, every read of an invite on an upgraded
+    server would raise on a column that is not there — and the failure would land
+    on ``POST /v1/join``, the one endpoint a stranger can reach. The default is
+    the behaviour those invites were promised: an invite minted before the flag
+    existed admits a joiner, funds its account, and issues no credential.
+    """
+    path = tmp_path / "server.db"
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE invites (code_digest TEXT PRIMARY KEY, role TEXT NOT NULL,"
+            " tenant_scope TEXT NOT NULL, expires_at TEXT, max_uses INTEGER NOT NULL,"
+            " used_count INTEGER NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT,"
+            " quota_milli_credits INTEGER NOT NULL DEFAULT 20000)"
+        )
+        connection.execute(
+            "INSERT INTO invites (code_digest, role, tenant_scope, max_uses, used_count,"
+            " created_at, quota_milli_credits) VALUES (?, ?, ?, ?, 0, ?, ?)",
+            (
+                canonical_digest("code-legacy"), "consumer", "auto", 1,
+                T0.strftime("%Y-%m-%dT%H:%M:%S.%f%z"), 20000,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = ServerStore.open(path)
+    try:
+        legacy = store.get_invite("code-legacy")
+        assert legacy is not None
+        assert legacy.issues_api_key is False
+        assert legacy.quota_milli_credits == 20_000
+        # The upgraded table takes a flagged invite beside the legacy row.
+        store.add_invite("code-flagged", "consumer", "auto", max_uses=1, created_at=T1,
+                         issues_api_key=True)
+        flagged = store.get_invite("code-flagged")
+        assert flagged is not None and flagged.issues_api_key is True
+        assert [invite.code_digest for invite in store.list_invites()] == [
+            legacy.code_digest, flagged.code_digest,
+        ]
+    finally:
+        store.close()
+
+
 def _legacy_request_inputs(path: Path, rows: tuple[tuple[str, str], ...]) -> None:
     """Write the `request_inputs` table a server from before the conversation model holds.
 

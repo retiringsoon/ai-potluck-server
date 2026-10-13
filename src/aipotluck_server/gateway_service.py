@@ -222,6 +222,13 @@ API_KEY_RATE_WINDOW_S = 60.0
 #: per-request cap is always the smaller of this and the key's remaining quota.
 API_KEY_DEFAULT_MAX_CHARGE_MILLI_CREDITS = 20_000
 
+#: The label an API key gets when a join mints it, rather than an operator
+#: naming the tool that will hold it. `admin api-key-list` shows it, so an
+#: operator auditing keys can tell the ones an invite issued at join from the
+#: ones somebody minted by hand — which matters because only the second kind has
+#: an operator who remembers choosing a quota and a deadline for it.
+JOIN_API_KEY_NAME = "issued at join"
+
 #: How much longer a server-signed authorization stays valid than the request's
 #: own deadline. Settlement happens after the answer does, and an authorization
 #: that expired in between would leave a node's tokens spent and unbillable.
@@ -363,14 +370,38 @@ class AdmitResult:
 
 
 @dataclass(frozen=True)
+class NewApiKey:
+    """A freshly generated API key: its operator-facing id and its plaintext.
+
+    The two are generated together so the two places that mint a key —
+    ``admin api-key``, and a join redeeming an invite flagged
+    ``InviteRecord.issues_api_key`` — cannot drift apart in either the id scheme
+    or the key's entropy. The plaintext exists only in this value and in the one
+    stdout line or join response that carries it away; the store keeps a digest.
+    """
+
+    key_id: str
+    plaintext: str
+
+
+def generate_api_key() -> NewApiKey:
+    """Generate one API key, with `API_KEY_BYTES` of entropy behind the prefix."""
+    return NewApiKey(
+        key_id=f"apikey-{secrets.token_hex(6)}",
+        plaintext=API_KEY_PREFIX + secrets.token_urlsafe(API_KEY_BYTES),
+    )
+
+
+@dataclass(frozen=True)
 class JoinResult:
     """The identity a redeemed invite produced.
 
-    Carries exactly one secret, and only once: `node_token`. Everything else is
-    an identifier the server derived, which the joiner needs in order to know
-    what identity (and, for a node, which device/provider ids) it now holds. The
-    invite code is never echoed back, and neither is any private key — the
-    joiner already holds the key it generated.
+    Carries at most one secret per join role, and only once: `node_token` for a
+    node, `api_key` for a consumer whose invite was minted ``--with-api-key``.
+    Everything else is an identifier the server derived, which the joiner needs
+    in order to know what identity (and, for a node, which device/provider ids)
+    it now holds. The invite code is never echoed back, and neither is any
+    private key — the joiner already holds the key it generated.
     """
 
     tenant_id: str
@@ -390,6 +421,16 @@ class JoinResult:
     #: same "shown once" contract an ``admin invite`` code has. An idempotent
     #: re-join leaves it `None` rather than minting a second credential.
     node_token: str | None = None
+    #: The plaintext API key for the OpenAI-compatible surface, present **only**
+    #: on the consumer join that redeemed an invite flagged ``issues_api_key``,
+    #: and only on the join that created the identity. Minted here rather than
+    #: pre-minted with the invite, so a code nobody has redeemed yet has no key
+    #: behind it and an unredeemed invite carries no spending authority at all.
+    #: Like `node_token`, only its digest is stored: this response is the one
+    #: channel the plaintext ever travels on, inside the same TLS session the
+    #: join arrived on, and an idempotent re-join leaves it `None` rather than
+    #: minting a second key.
+    api_key: str | None = None
 
     def to_payload(self) -> dict[str, str]:
         """Return the response document ``POST /v1/join`` answers with."""
@@ -408,6 +449,8 @@ class JoinResult:
             payload["provider_id"] = self.provider_id
         if self.node_token is not None:
             payload["node_token"] = self.node_token
+        if self.api_key is not None:
+            payload["api_key"] = self.api_key
         return payload
 
 
@@ -732,12 +775,36 @@ class GatewayService:
         and only its digest is stored — an operator who lost it cannot read it
         back, and the recovery path is ``admin revoke-key`` plus a fresh invite.
 
+        A consumer join on an invite flagged ``issues_api_key``
+        (``admin invite --role consumer --with-api-key``) additionally mints an
+        API key for the OpenAI-compatible surface, bound to the identity this
+        join derived, capped by the invite's quota, and returned once in this
+        response — so a tool that speaks OpenAI's API can be pointed at the pool
+        with no operator round trip. Three properties are the security contract
+        here, and none of them is incidental:
+
+        * **An unredeemed invite can spend nothing.** The key is minted at this
+          moment and not before; there is no key row, no subject and no quota
+          behind a code nobody has joined with, so a leaked code is still only a
+          way to join.
+        * **The key is a separate credential from the identity.** Revoking it
+          (``admin api-key-revoke``) withdraws one tool and leaves the identity
+          signing requests; revoking the identity (``admin revoke-key``)
+          withdraws the identity and every key it holds.
+        * **Admission strength is unchanged.** A request on this key is
+          authorized by the server's own settlement key as
+          ``gateway_authenticated``, exactly like a key an operator minted by
+          hand, and never as a consumer signature. Receipts keep telling the two
+          apart; a key issued at join is not a stronger credential for having
+          arrived with an identity.
+
         Idempotency is keyed on the public key, not on the invite's remaining
         uses: a re-join presenting a key this server already minted returns the
         existing identity and does **not** consume another use, re-fund the
-        account, or mint a second node credential. This holds even after a
-        single-use code is spent — the identity, not the code, stays
-        authoritative once it exists — while an unknown code still fails closed.
+        account, mint a second node credential, or mint a second API key. This
+        holds even after a single-use code is spent — the identity, not the code,
+        stays authoritative once it exists — while an unknown code still fails
+        closed.
 
         Args:
             invite_code: The plaintext code from ``potluck admin invite``.
@@ -752,8 +819,10 @@ class GatewayService:
 
         Returns:
             The minted (or pre-existing) identity. `node_token` is set only on
-            the node join that created it; a re-join carries no token, because
-            the server kept the digest and cannot reproduce the plaintext.
+            the node join that created it, and `api_key` only on the consumer
+            join that redeemed a key-issuing invite and created the identity; a
+            re-join carries neither, because the server kept the digest and
+            cannot reproduce the plaintext.
 
         Raises:
             ProtocolError: If the invite is unusable, the identity names no
@@ -818,6 +887,11 @@ class GatewayService:
             # try block, a success has nothing after it that could fail and need
             # the token withdrawn again.
             node_token: str | None = None
+            # The consumer's API key, minted below when the invite asked for one.
+            # It stays `None` unless `add_api_key` returned, for the same reason
+            # as the node token: a failed join must not leave a usable key
+            # registered that no response ever showed anybody.
+            api_key: str | None = None
             try:
                 self._registry.register_key(
                     key_id, subject_id, purpose, public_key_b64, moment
@@ -867,6 +941,39 @@ class GatewayService:
                         amount=invite.quota_milli_credits,
                         now=moment,
                     )
+                if role == "consumer" and invite.issues_api_key:
+                    # The invite asked for a key, so the key is minted here, at
+                    # the moment the identity it belongs to comes into existence
+                    # — never before. Until this line runs there is no key row,
+                    # no subject and no spending authority behind the code, which
+                    # is what keeps an unredeemed invite (or a leaked one) worth
+                    # exactly what it looks like: a way to join.
+                    #
+                    # The key is bound to the identity this join derived and
+                    # capped by the invite's own quota, so it can spend only the
+                    # account the join just funded. It is a separate credential
+                    # from that identity: `admin api-key-revoke` withdraws this
+                    # key alone, while `admin revoke-key` withdraws the identity
+                    # and, through it, every key the identity holds. It carries no
+                    # expiry and no deadline of its own, so it lives as long as
+                    # the identity and each request on it gets the surface's own
+                    # default window.
+                    #
+                    # This is the last step of the consumer path, exactly as the
+                    # credential mint below is the last of the node path: nothing
+                    # after it can fail and leave a plaintext key registered that
+                    # no response ever carried away.
+                    minted_key = generate_api_key()
+                    self._store.add_api_key(
+                        minted_key.plaintext,
+                        key_id=minted_key.key_id,
+                        name=JOIN_API_KEY_NAME,
+                        subject_id=subject_id,
+                        tenant_id=tenant_id,
+                        quota_milli_credits=invite.quota_milli_credits,
+                        created_at=moment,
+                    )
+                    api_key = minted_key.plaintext
                 if role == "node":
                     # An invited node dials ``/v1/node-link`` with a bearer
                     # token, so the join that creates its identity also
@@ -909,6 +1016,7 @@ class GatewayService:
                 device_key_id=device_row["device_key_id"] if device_row else None,
                 provider_id=device_row["provider_id"] if device_row else None,
                 node_token=node_token,
+                api_key=api_key,
             )
 
     def _check_join_shape(self, *, role: str, device: dict[str, Any] | None) -> None:

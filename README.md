@@ -39,6 +39,7 @@ in the client repository:
 ```bash
 potluck-server serve --config server.json
 potluck-server admin invite --config server.json --role consumer --tenant friends
+potluck-server admin invite --config server.json --role consumer --with-api-key
 potluck-server admin reconcile --config server.json
 potluck-server verify receipt --config server.json --receipt-id R-1
 ```
@@ -56,6 +57,15 @@ potluck-server admin api-key --config server.json \
 # ak-…  (printed once; only its digest is stored)
 ```
 
+An invite can carry that instruction instead, so the person who redeems it needs
+no second command and no operator to run one:
+
+```bash
+potluck-server admin invite --config server.json --role consumer \
+    --tenant friends --quota 500000 --with-api-key
+# <code>  (printed once)   -> `potluck join` prints the key it issued, once
+```
+
 ```python
 client = OpenAI(base_url="https://<server>/openai/v1", api_key="ak-…")
 client.chat.completions.create(model="coding-pool", messages=[…])
@@ -63,7 +73,10 @@ client.chat.completions.create(model="coding-pool", messages=[…])
 
 A key is capped by its own quota, revocable without a restart, rate-limited per
 key, and it spends the **subject's own account** through the same metering,
-settlement, transparency log and receipts as a signed request. The full
+settlement, transparency log and receipts as a signed request. One issued at join
+is minted at that moment and not before — an unredeemed invite can spend nothing
+— inherits the invite's quota, and stays a separate credential: revoking it
+withdraws one tool, not the member. The full
 reference — parameters, response and stream shape, the error table, limits,
 observability, and exactly how a key-authorized receipt differs in evidence from
 a consumer-signed one — is [docs/openai-endpoint.md](docs/openai-endpoint.md).

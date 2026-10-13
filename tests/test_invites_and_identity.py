@@ -63,7 +63,12 @@ from conftest import Keyring
 from aipotluck_server.cli import main as server_main
 from aipotluck_server.deploy import load_server
 from aipotluck_server.gateway_server import GatewayServer
-from aipotluck_server.gateway_service import GatewayConfig, GatewayService
+from aipotluck_server.gateway_service import (
+    API_KEY_PREFIX,
+    JOIN_API_KEY_NAME,
+    GatewayConfig,
+    GatewayService,
+)
 from aipotluck_server.persistence import Credential, ServerStore
 
 #: The instant every test works from; also the midpoint of an authorization's
@@ -113,11 +118,14 @@ class _Setup:
 
     def mint(self, code: str, *, role: str = "consumer", tenant: str = "auto",
              max_uses: int = 1, created_at: dt.datetime = BASE,
-             expires_at: dt.datetime | None = None) -> None:
+             expires_at: dt.datetime | None = None,
+             quota_milli_credits: int = 20_000,
+             issues_api_key: bool = False) -> None:
         """Register an invite under `code` through the store."""
         self.store.add_invite(
             code, role, tenant, max_uses=max_uses, created_at=created_at,
-            expires_at=expires_at,
+            expires_at=expires_at, quota_milli_credits=quota_milli_credits,
+            issues_api_key=issues_api_key,
         )
 
     def join(self, code: str, *, subject_id: str, key_id: str, public_key_b64: str,
@@ -560,8 +568,155 @@ def test_the_store_never_stores_the_plaintext_invite_code(setup: _Setup) -> None
 
 
 # --------------------------------------------------------------------------
+# An invite that issues an API key at join (domain level)
+# --------------------------------------------------------------------------
+
+
+def test_a_key_issuing_invite_holds_no_key_until_somebody_redeems_it(
+    setup: _Setup,
+) -> None:
+    """The mark is a promise; the key comes into existence at the join.
+
+    This is the property the flag has to keep. An invite that has not been
+    redeemed has no identity behind it, so a key minted with the invite would
+    speak for a subject that does not exist: spendable by whoever could read the
+    row, and unattributable in the books. Minting at the join is what makes an
+    unredeemed invite — including a leaked one — worth exactly what it looks
+    like, which is a way to join and nothing else.
+    """
+    setup.mint("code-keyed", issues_api_key=True, quota_milli_credits=30_000)
+
+    assert setup.store.get_invite("code-keyed").issues_api_key is True
+    assert setup.store.list_api_keys() == []
+
+
+def test_the_join_that_redeems_a_keyed_invite_mints_one_key_for_that_identity(
+    setup: _Setup,
+) -> None:
+    """One join, one key: bound to the derived identity, capped by the invite.
+
+    The quota is *inherited*, not chosen again: the key may draw exactly what
+    the join funded the account with, so an operator who set one number on the
+    invite has set the whole budget for the tool that joins with it.
+    """
+    public_b64, _private = generate_key_pair()
+    setup.mint("code-keyed", issues_api_key=True, quota_milli_credits=30_000)
+
+    result = setup.join("code-keyed", subject_id="user-1", key_id="key-1",
+                        public_key_b64=public_b64)
+
+    assert result.api_key is not None
+    assert result.api_key.startswith(API_KEY_PREFIX)
+    assert len(result.api_key) == len(API_KEY_PREFIX) + 43
+    keys = setup.store.list_api_keys()
+    assert len(keys) == 1
+    record = keys[0]
+    assert (record.subject_id, record.tenant_id) == (result.subject_id, result.tenant_id)
+    assert record.quota_milli_credits == 30_000
+    assert record.used_milli_credits == 0
+    assert record.name == JOIN_API_KEY_NAME
+    # No lifetime and no deadline of its own: the key lives as long as the
+    # identity it was minted for, revocable either way, and each request on it
+    # gets the surface's own default window.
+    assert record.expires_at is None
+    assert record.deadline_ms is None
+    assert record.status == "active"
+    # What the store kept is a digest that resolves; what it never kept is the
+    # plaintext, so the one response that carried it is the only copy.
+    resolved = setup.store.resolve_api_key(result.api_key, BASE)
+    assert resolved is not None and resolved.key_id == record.key_id
+    blob = b"".join(
+        path.read_bytes() for path in setup.tmp_path.glob("server.db*") if path.is_file()
+    )
+    assert result.api_key.encode() not in blob
+
+
+def test_an_ordinary_invite_still_mints_an_identity_and_no_key(setup: _Setup) -> None:
+    """Without the mark, a join funds the account and issues no credential."""
+    public_b64, _private = generate_key_pair()
+    setup.mint("code-plain", quota_milli_credits=30_000)
+
+    result = setup.join("code-plain", subject_id="user-1", key_id="key-1",
+                        public_key_b64=public_b64)
+
+    assert result.api_key is None
+    assert "api_key" not in result.to_payload()
+    assert setup.store.list_api_keys() == []
+    # The mark adds a credential; it does not move the quota onto one.
+    assert setup.service.balance(result.subject_id) == 30_000
+
+
+def test_rejoining_a_keyed_invite_mints_no_second_key(setup: _Setup) -> None:
+    """Idempotency covers the key: the plaintext is not reproducible, so a
+    re-join carries none and leaves the one key the first join minted alone."""
+    public_b64, _private = generate_key_pair()
+    setup.mint("code-keyed", issues_api_key=True)
+    first = setup.join("code-keyed", subject_id="user-1", key_id="key-1",
+                       public_key_b64=public_b64)
+    second = setup.join("code-keyed", subject_id="user-1", key_id="key-1",
+                        public_key_b64=public_b64)
+
+    assert first.api_key is not None
+    assert second.api_key is None
+    assert second.subject_id == first.subject_id
+    assert len(setup.store.list_api_keys()) == 1
+    # The key the first join showed is still the live one.
+    assert setup.store.resolve_api_key(first.api_key, BASE) is not None
+
+
+def test_only_a_consumer_invite_with_a_quota_can_promise_a_key(setup: _Setup) -> None:
+    """The store refuses an invite whose key could authenticate and never settle.
+
+    Refused here rather than at the join, because an invite that could only fail
+    when redeemed would fail in front of the person it was handed to, after they
+    had already been told to expect a key.
+    """
+    with pytest.raises(ValueError, match="consumer"):
+        setup.store.add_invite("code-node-keyed", "node", "auto", max_uses=1,
+                               created_at=BASE, issues_api_key=True)
+    with pytest.raises(ValueError, match="quota_milli_credits >= 1"):
+        setup.store.add_invite("code-free", "consumer", "auto", max_uses=1,
+                               created_at=BASE, quota_milli_credits=0,
+                               issues_api_key=True)
+
+
+# --------------------------------------------------------------------------
 # POST /v1/join over a real socket
 # --------------------------------------------------------------------------
+
+
+def test_join_over_http_carries_the_key_once(setup: _Setup) -> None:
+    """The unauthenticated join answers with the key it minted, and only once.
+
+    Every other field of the response is named too: the key is an addition to a
+    document `potluck join` already parses, so a change that renamed anything
+    beside it would be a break this test has to see.
+    """
+    server = _Server(setup)
+    setup.mint("code-http-keyed", issues_api_key=True, quota_milli_credits=30_000)
+    public_b64, _private = generate_key_pair()
+    body = {
+        "invite_code": "code-http-keyed",
+        "identity": {"public_key_b64": public_b64},
+        "device": None,
+    }
+    server.start()
+    try:
+        status, document = _post(server.url, "/v1/join", body)
+        rejoin_status, rejoin = _post(server.url, "/v1/join", body)
+    finally:
+        server.stop()
+
+    assert status == 200
+    assert set(document) == {
+        "tenant_id", "subject_id", "role", "key_id", "server_url", "api_key",
+    }
+    assert document["role"] == "consumer"
+    assert document["api_key"].startswith(API_KEY_PREFIX)
+    assert rejoin_status == 200
+    assert rejoin["subject_id"] == document["subject_id"]
+    assert "api_key" not in rejoin
+    assert len(setup.store.list_api_keys()) == 1
 
 
 def test_join_over_http_mints_an_identity_and_echoes_no_secret(setup: _Setup) -> None:
@@ -749,6 +904,66 @@ def test_admin_invite_prints_the_code_once_and_stores_only_its_digest(
     assert code.encode() not in blob
 
 
+def test_admin_invite_with_api_key_marks_the_invite_and_the_listing_shows_it(
+    setup: _Setup, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--with-api-key` stores a mark on the invite, and mints nothing itself.
+
+    The listing carries the mark because it is the operator's only view of what
+    an invite will do when redeemed: an invite that hands out a credential for
+    the OpenAI-compatible surface has to be distinguishable from one that only
+    admits a joiner, without reading the database.
+    """
+    config = _server_config(tmp_path)
+    assert server_main([
+        "admin", "invite", "--config", str(config), "--role", "consumer",
+        "--with-api-key", "--quota", "30000",
+    ]) == 0
+    captured = capsys.readouterr()
+    code = captured.out.strip()
+
+    assert "issues an API key at join" in captured.err
+    invite = setup.store.get_invite(code)
+    assert invite is not None
+    assert invite.issues_api_key is True
+    assert invite.quota_milli_credits == 30_000
+    assert setup.store.list_api_keys() == []
+
+    assert server_main(["admin", "invite-list", "--config", str(config)]) == 0
+    listing = capsys.readouterr().out
+    assert "api-key=yes" in listing
+    assert code not in listing
+
+
+def test_admin_invite_refuses_a_key_no_joiner_could_use(
+    setup: _Setup, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The two refusals `admin api-key` makes, at the moment they can be fixed.
+
+    A key for a node has no consumer account to spend, and a key with no quota
+    admits nothing. Either would authenticate and then fail at settlement, after
+    a node had spent real tokens on the request — and the failure would land on
+    whoever joined with the code, not on whoever minted it.
+    """
+    config = _server_config(tmp_path)
+
+    assert server_main([
+        "admin", "invite", "--config", str(config), "--role", "node", "--with-api-key",
+    ]) == 1
+    error = capsys.readouterr().err
+    assert "--with-api-key needs --role consumer" in error
+    assert "Traceback" not in error
+
+    assert server_main([
+        "admin", "invite", "--config", str(config), "--with-api-key", "--quota", "0",
+    ]) == 1
+    error = capsys.readouterr().err
+    assert "--with-api-key needs --quota >= 1" in error
+    assert "Traceback" not in error
+
+    assert setup.store.list_invites() == []
+
+
 def test_admin_invite_refuses_a_server_database_that_is_not_there(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -865,6 +1080,76 @@ def test_cli_join_saves_a_0600_key_and_a_config_and_prints_no_private_key(
     assert key_document["private_key_b64"] not in captured.out
     assert key_document["private_key_b64"] not in captured.err
     assert setup.store.get_invite("code-cli").used_count == 1
+
+
+def test_cli_join_prints_the_key_an_invite_issued_once_and_saves_no_copy(
+    setup: _Setup, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`potluck join` is the one channel the key travels on, and it explains itself.
+
+    Three things have to hold on that channel. The line printed is the *live*
+    key, which only resolving it against the store can prove. It is printed
+    exactly once, because a screen a user scrolls back through must not be a
+    place a credential accumulates. And it is written to no file: nothing this
+    client runs needs an API key (``ask`` and ``serve-openai`` sign with the
+    identity), so a saved copy would be a second place to steal one from.
+
+    Beside the key belongs the endpoint it is for — a key with no ``base_url`` is
+    a credential whose user still has to go and look up a path — and the fact
+    that the server kept only a digest, so it will not be shown again.
+    """
+    server = _Server(setup)
+    setup.mint("code-cli-keyed", issues_api_key=True, quota_milli_credits=30_000)
+    config_dir = tmp_path / "identity"
+    server.start()
+    try:
+        assert main([
+            "join", "--server", server.url, "--invite", "code-cli-keyed",
+            "--config-dir", str(config_dir),
+        ]) == 0
+    finally:
+        server.stop()
+    out = capsys.readouterr().out
+
+    printed = [line for line in out.splitlines() if line.startswith(API_KEY_PREFIX)]
+    assert len(printed) == 1, out
+    plaintext = printed[0]
+    resolved = setup.store.resolve_api_key(plaintext, dt.datetime.now(dt.UTC))
+    assert resolved is not None
+    assert resolved.quota_milli_credits == 30_000
+    assert out.count(plaintext) == 1
+    assert f"{server.url}/openai/v1" in out
+    assert "shown once; store it now" in out
+    assert sorted(path.name for path in config_dir.iterdir()) == ["config.json", "key.json"]
+    for path in config_dir.iterdir():
+        assert plaintext not in path.read_text(encoding="utf-8")
+
+
+def test_cli_join_on_an_ordinary_invite_prints_no_api_key_block(
+    setup: _Setup, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without the mark on the invite, `join`'s output is what it always was."""
+    server = _Server(setup)
+    setup.mint("code-cli-plain")
+    config_dir = tmp_path / "identity"
+    server.start()
+    try:
+        assert main([
+            "join", "--server", server.url, "--invite", "code-cli-plain",
+            "--config-dir", str(config_dir),
+        ]) == 0
+    finally:
+        server.stop()
+    captured = capsys.readouterr()
+
+    assert API_KEY_PREFIX not in captured.out
+    assert "openai/v1" not in captured.out + captured.err
+    assert "shown once; store it now" not in captured.out + captured.err
+    assert setup.store.list_api_keys() == []
+    # The identity is still saved, which is the whole of what this join does.
+    config_document = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+    assert config_document["role"] == "consumer"
+    assert captured.out.startswith("potluck: joined as consumer-")
 
 
 def test_cli_join_is_idempotent_on_rerun(

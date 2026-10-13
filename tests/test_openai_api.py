@@ -49,7 +49,12 @@ from conftest import Keyring, signed_authorization
 from aipotluck_server import gateway_server, gateway_service
 from aipotluck_server.cli import main as server_main
 from aipotluck_server.gateway_server import GatewayServer
-from aipotluck_server.gateway_service import GatewayConfig, GatewayService
+from aipotluck_server.gateway_service import (
+    API_KEY_PREFIX,
+    JOIN_API_KEY_NAME,
+    GatewayConfig,
+    GatewayService,
+)
 from aipotluck_server.persistence import ServerStore
 
 MODEL = "coding-pool"
@@ -136,7 +141,13 @@ class Server:
         self.server.stop()
         self.store.close()
 
-    def join_consumer(self, invite_code: str = "code-openai") -> Any:
+    def join_consumer(
+        self,
+        invite_code: str = "code-openai",
+        *,
+        quota_milli_credits: int = 50_000,
+        issues_api_key: bool = False,
+    ) -> Any:
         """Join one consumer with an invite, and return the minted identity."""
         self.store.add_invite(
             invite_code,
@@ -144,7 +155,8 @@ class Server:
             "auto",
             max_uses=1,
             created_at=BASE,
-            quota_milli_credits=50_000,
+            quota_milli_credits=quota_milli_credits,
+            issues_api_key=issues_api_key,
         )
         public_b64, _private_b64 = generate_key_pair()
         return self.service.join(
@@ -556,6 +568,112 @@ def test_a_key_minted_for_a_joined_identity_spends_that_identitys_account(
         assert record.tenant_id == joined.tenant_id
         assert record.used_milli_credits == BILLED_TOKENS
         # The join funded this identity's own account, and that is what paid.
+        assert server.service.balance(joined.subject_id) == 50_000 - BILLED_TOKENS
+    finally:
+        node.stop()
+
+
+def test_an_invite_that_issues_a_key_carries_a_joiner_to_a_verified_receipt(
+    server: Server, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The point of `--with-api-key`: one invite, and a tool can call the pool.
+
+    Nothing happens between the join and the first request — no operator minting
+    a key for a subject they read out of a listing — so the assertion that
+    matters is that the key the join response carried is the key that
+    authenticates here. And that it is a second *door*, not a second set of
+    books: the request runs the same dispatch, settles through the same ledger,
+    charges the account the join funded, counts against the quota the key
+    inherited from that invite, and leaves a receipt the operator side verifies.
+    """
+    node = Node(server)
+    try:
+        _wait_until(lambda: bool(server.store.connected_nodes()), what="the node to register")
+        node.upstream.queue(_scripted_response())
+        joined = server.join_consumer(
+            "code-keyed", quota_milli_credits=30_000, issues_api_key=True
+        )
+        assert joined.api_key is not None
+        assert joined.api_key.startswith(API_KEY_PREFIX)
+
+        status, headers, raw = _post_chat(server, _chat_body(), key=joined.api_key)
+        document = json.loads(raw)
+
+        assert status == 200, document
+        assert document["choices"][0]["message"]["content"] == ANSWER
+        assert document["usage"]["total_tokens"] == BILLED_TOKENS
+        request_id = _header(headers, "x-request-id")
+
+        record = server.store.list_api_keys()[0]
+        assert record.subject_id == joined.subject_id
+        assert record.name == JOIN_API_KEY_NAME
+        assert record.quota_milli_credits == 30_000
+        assert record.used_milli_credits == BILLED_TOKENS
+        assert record.remaining_milli_credits == 30_000 - BILLED_TOKENS
+        # The account the join funded is what paid, not the key.
+        assert server.service.balance(joined.subject_id) == 30_000 - BILLED_TOKENS
+
+        receipts = server.store.receipts()
+        assert [receipt.request_id for receipt in receipts] == [request_id]
+        verified = server_main([
+            "verify", "receipt", "--config", str(_operator_config(server)),
+            "--receipt-id", receipts[0].receipt_id,
+        ])
+        captured = capsys.readouterr()
+        assert verified == 0, captured.out + captured.err
+        # A key-admitted request is authorized by the server's own settlement
+        # key, and the stored record says so: a key an invite issued is not a
+        # stronger credential for having arrived beside an identity.
+        stored = server.store.get_request_input(request_id)
+        assert stored is not None
+        assert stored["authorization"]["payload"]["auth_method"] == "gateway_authenticated"
+        assert stored["authorization"]["signer_key_id"] == "settlement-key-1"
+    finally:
+        node.stop()
+
+
+def test_a_key_an_invite_issued_is_revoked_without_touching_the_identity(
+    server: Server, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Revoking the key withdraws one credential; the identity keeps working.
+
+    This is the independence the flag is safe *because* of. A key handed to a
+    tool has to be withdrawable on its own — otherwise the choice is between
+    leaving a leaked key live and revoking the identity behind it, which would
+    also kill every signed request that member makes. So: the revoked key is
+    refused on a running server, the identity is still unrevoked in the store,
+    and a replacement key minted for the same subject by hand is admitted and
+    spends the balance the first request left behind.
+    """
+    node = Node(server)
+    try:
+        _wait_until(lambda: bool(server.store.connected_nodes()), what="the node to register")
+        # One answer: the revoked key is refused at the door, so it never reaches
+        # a node and never spends anything.
+        node.upstream.queue(_scripted_response())
+        joined = server.join_consumer("code-keyed", issues_api_key=True)
+        assert joined.api_key is not None
+        key_id = server.store.list_api_keys()[0].key_id
+
+        assert server_main([
+            "admin", "api-key-revoke", "--config", str(server.config_path),
+            "--key-id", key_id,
+        ]) == 0
+        capsys.readouterr()
+
+        status, _headers, raw = _post_chat(server, _chat_body(), key=joined.api_key)
+        assert status == 401
+        assert json.loads(raw)["error"]["code"] == "invalid_api_key"
+        assert joined.api_key not in raw
+        # The identity is untouched: what was revoked is a key, not a member.
+        identity = server.store.get_identity(joined.key_id)
+        assert identity is not None and identity.revoked_at is None
+
+        replacement = _mint_key(server, capsys, subject=joined.subject_id, quota=20_000)
+        status, _headers, raw = _post_chat(server, _chat_body(), key=replacement)
+        assert status == 200, raw
+        assert json.loads(raw)["choices"][0]["message"]["content"] == ANSWER
+        # One request ran, so one was billed: the refused one cost nothing.
         assert server.service.balance(joined.subject_id) == 50_000 - BILLED_TOKENS
     finally:
         node.stop()
