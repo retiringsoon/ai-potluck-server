@@ -156,6 +156,15 @@ DEFAULT_READ_TIMEOUT_S = 30.0
 #: Largest request body the gateway will read, in bytes.
 MAX_HTTP_BODY_BYTES = 1024 * 1024
 
+#: Read timeout applied to every client connection. A connection that goes
+#: silent mid-request is cut off rather than pinning its handler thread until
+#: the operating system gives up, which is the defensive half of P1-11: a
+#: slowloris peer cannot exhaust the unbounded per-connection thread pool of a
+#: directly exposed `ThreadingHTTPServer`. `BaseHTTPRequestHandler.setup` pushes
+#: this onto the connection socket, and the graceful-close paths save and
+#: restore whatever timeout is in force, so it never leaks into a close.
+REQUEST_SOCKET_TIMEOUT_S = 60.0
+
 #: How long a closing connection spends discarding request bytes nobody read,
 #: and waiting on a TLS peer's own `close_notify`. Short on purpose: this runs on
 #: every connection the gateway ends, so it may not become a way for one peer to
@@ -1774,6 +1783,11 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
     server_version = "potluck-gateway"
     sys_version = ""
 
+    #: Read timeout for the connection socket. `BaseHTTPRequestHandler.setup`
+    #: applies it via `connection.settimeout`, so a peer that stalls on a read
+    #: is dropped instead of holding its thread forever (P1-11).
+    timeout = REQUEST_SOCKET_TIMEOUT_S
+
     #: The token presented on this request, kept only so response details can be
     #: redacted against it. It is never rendered, logged, or passed to the
     #: service, which receives the resolved `Credential` instead.
@@ -1805,16 +1819,19 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         header would, and a transport that logs headers leaks credentials."""
 
     def handle(self) -> None:
-        """Serve this connection, treating a peer reset as the connection ending.
+        """Serve this connection, treating a peer reset or stall as the end.
 
         `BaseHTTPRequestHandler` reads the next request line at the top of its
         keep-alive loop and lets a socket error escape, which `socketserver`
         then prints as an unhandled exception. A peer that resets a finished
         connection is not an error anybody can act on: there is no request to
-        answer and no client left to tell. Only `ConnectionError` is absorbed;
-        every other failure still surfaces loudly.
+        answer and no client left to tell. The read timeout `setup` places on
+        the socket (P1-11) is the same story in slow motion: a peer that goes
+        silent mid-request is one we deliberately cut, not a failure to report.
+        `ConnectionError` and the `TimeoutError` that timeout raises are both
+        absorbed; every other failure still surfaces loudly.
         """
-        with contextlib.suppress(ConnectionError):
+        with contextlib.suppress(ConnectionError, TimeoutError):
             super().handle()
 
     def finish(self) -> None:
@@ -2518,39 +2535,74 @@ class _GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             return None
         return cast("dict[str, Any]", parsed)
 
+    def _is_chunked(self) -> bool:
+        """Whether the request declared a chunked ``Transfer-Encoding``.
+
+        The header is case-insensitive and may carry a comma-separated list of
+        codings (e.g. ``gzip, chunked``), so membership in the token list is the
+        test, not a whole-value comparison.
+        """
+        te = self.headers.get("Transfer-Encoding")
+        if te is None:
+            return False
+        return "chunked" in {token.strip().lower() for token in te.split(",")}
+
     def _read_body(self) -> bytes | None:
         """Read the body under the size cap, refusing rather than truncating.
 
         An oversized body is refused before it is read when the declared length
-        says so, and after at most one byte past the cap when it does not. With
-        no ``Content-Length`` the body is delimited by the peer closing its
-        write side, which is the only framing HTTP leaves available once chunked
-        transfer coding is declined.
+        says so, and after at most one byte past the cap when it does not.
+
+        Framing is refused outright when it cannot be read without blocking on
+        the peer closing its write side, which is the only delimitation HTTP
+        leaves once chunked transfer coding is declined. A ``Transfer-Encoding:
+        chunked`` body is declined with ``400`` (the gateway never decodes it),
+        and a body-expecting method that arrives with neither a ``Content-Length``
+        nor chunked is refused with ``411`` to match the client gateway
+        (``localapi``), which returns ``411`` whenever no ``Content-Length`` is
+        sent. Refusing rather than reading to peer-close is P1-3: a well-formed
+        chunked upload, or any body with no declared length, must not hang a
+        handler thread until the connection times out.
 
         The bytes are cached for this request: a signed request reads the body
         to verify its signature before the handler runs, and the handler must
         see the same bytes rather than an empty socket.
 
         Returns:
-            The body, or `None` after a `400` has been sent.
+            The body, or `None` after a `400`/`411` has been sent.
         """
         if self._cached_body is not None:
             return self._cached_body
         declared = self.headers.get("Content-Length")
+        if declared is None:
+            # No length declared. Either the peer is using a framing we decline,
+            # or it sent a body-expecting request with no length at all. Neither
+            # may fall through to `rfile.read`, which would block until the peer
+            # closes its write side — exactly the hang P1-3 forbids.
+            if self._is_chunked():
+                self._refuse(400, "bad_request", "chunked transfer encoding is not supported")
+                return None
+            if self.command in ("POST", "PUT", "PATCH"):
+                self._refuse(411, "length_required", "a Content-Length header is required")
+                return None
+            # No body expected on this method and no length declared: there is
+            # nothing to read, and reading would only block on a peer that sends
+            # a body it never delimits. Treat it as an empty body.
+            self._cached_body = b""
+            return b""
         limit = MAX_HTTP_BODY_BYTES + 1
-        if declared is not None:
-            text = declared.strip()
-            if not text.isdigit():
-                self._fail(400, "bad_request", "Content-Length must be a non-negative integer")
-                return None
-            if int(text) > MAX_HTTP_BODY_BYTES:
-                self._fail(
-                    400,
-                    "payload_too_large",
-                    f"the body exceeds the {MAX_HTTP_BODY_BYTES}-byte limit",
-                )
-                return None
-            limit = int(text)
+        text = declared.strip()
+        if not text.isdigit():
+            self._fail(400, "bad_request", "Content-Length must be a non-negative integer")
+            return None
+        if int(text) > MAX_HTTP_BODY_BYTES:
+            self._fail(
+                400,
+                "payload_too_large",
+                f"the body exceeds the {MAX_HTTP_BODY_BYTES}-byte limit",
+            )
+            return None
+        limit = int(text)
         body = self.rfile.read(limit)
         if len(body) > MAX_HTTP_BODY_BYTES:
             self._fail(

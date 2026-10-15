@@ -1298,7 +1298,7 @@ def test_an_oversized_declared_body_is_refused_before_it_is_read(
     assert json.loads(body)["error"] == "payload_too_large"
 
 
-def test_an_oversized_undeclared_body_is_refused_after_the_cap(
+def test_a_body_expecting_request_without_content_length_is_refused(
     gateway: Callable[..., GatewayServer],
 ) -> None:
     server = gateway(_StubService())
@@ -1307,8 +1307,8 @@ def test_an_oversized_undeclared_body_is_refused_after_the_cap(
         f"Authorization: Bearer {CONSUMER_TOKEN}\r\n\r\n"
     ).encode("ascii")
     status, body = _raw_exchange(_port(server), head + b"x" * (OVERSIZE_BYTES + 1))
-    assert status == 400
-    assert json.loads(body)["error"] == "payload_too_large"
+    assert status == 411
+    assert json.loads(body)["error"] == "length_required"
 
 
 def test_a_body_that_is_not_an_object_is_400(gateway: Callable[..., GatewayServer]) -> None:

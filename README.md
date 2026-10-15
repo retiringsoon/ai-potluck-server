@@ -1,38 +1,28 @@
 # ai-potluck-server
 
+> **The gateway, settlement ledger, and operator tooling for the ai-potluck protocol.**  
+> One process, one SQLite database, zero external dependencies.
+
 [![ci](https://github.com/retiringsoon/ai-potluck-server/actions/workflows/ci.yml/badge.svg)](https://github.com/retiringsoon/ai-potluck-server/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](pyproject.toml)
 
+The server of an AI potluck network: runs the HTTP/WebSocket/SSE gateway, manages peer registration and dispatch queues, keeps the settlement books (deterministic ledger, Merkle transparency log, dual-signed receipts), and ships the operator CLI `potluck-server`.
 
-The server of an AI potluck network: one process over one embedded SQLite
-database. It runs the HTTP/WebSocket/SSE gateway, keeps the settlement books
-(ledger, transparency log, receipts), and ships the operator CLI
-`potluck-server` (`serve`, `admin invite|invite-list|revoke-key|api-key|api-key-list|api-key-revoke|reconcile`,
-`verify receipt`).
-
-Module layout follows one rule: the protocol and verification primitives live
-in [`ai-potluck`](../ai-potluck) — the client package this one depends on — so
-a client can verify a receipt without trusting the server. Server bookkeeping
-and the gateway live here, and this package imports those verification
-primitives from `aipotluck` to keep its own books. Consumers and contributors
-never install this package; they install `ai-potluck` and run `potluck`.
+Module layout follows one architectural invariant: the protocol and verification primitives live in [ai-potluck](https://github.com/retiringsoon/ai-potluck) — the client package this one depends on — so clients verify receipts without trusting the server. Server bookkeeping and gateway routing live here, importing those verification primitives from `aipotluck` to keep honest books. Consumers and contributors never need this package; they install `ai-potluck` and run `potluck`.
 
 ## Install
 
 ```bash
 uv venv --python 3.13 .venv
-uv pip install -e ".[dev]"           # ai-potluck comes from the package index
+uv sync --extra dev
 .venv/bin/potluck-server --help
 ```
 
-From a source checkout of both repositories (ai-potluck is not published yet):
-
-```bash
-uv pip install -e ".[dev]" -e "file://$(cd ../ai-potluck && pwd)"
-```
 
 Operator deployment (TLS, service supervision, tunnels, backups) is documented
 in the client repository:
-[ai-potluck/docs/server-deployment.md](../ai-potluck/docs/server-deployment.md).
+[ai-potluck/docs/server-deployment.md](https://github.com/retiringsoon/ai-potluck/blob/dev/docs/server-deployment.md).
 
 ## Run
 

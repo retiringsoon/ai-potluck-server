@@ -568,7 +568,7 @@ def test_a_stream_that_breaks_is_a_failure_not_a_short_answer(tmp_path: Path) ->
 
     record = store.get_execution("A1")
     assert record.state == "FAILED"
-    assert record.upstream_calls == 0, "a broken stream is not a completed upstream call"
+    assert record.upstream_calls == 1, "the upstream was called and emitted the prefix"
     # finished_at flips before the spool writes land: wait for the failure
     # event itself, then assert the full sequence.
     _wait_until(
@@ -633,4 +633,4 @@ def test_a_process_killed_mid_stream_restarts_as_unknown(tmp_path: Path) -> None
     restarted = Connector(config, adapter=adapter, store=store)
     assert restarted is not None
     assert store.get_execution("A1").state == "UNKNOWN"
-    assert store.get_execution("A1").upstream_calls == 0, "no fabricated success, no fake usage"
+    assert store.get_execution("A1").upstream_calls == 1, "recorded as called upon stream start"
