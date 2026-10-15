@@ -518,10 +518,6 @@ class GatewayService:
         self._default_now = now
         #: node_id -> the enqueue callback of its live connection.
         self._enqueues: dict[str, Callable[[Envelope], None]] = {}
-        #: attempt_id -> the offer terms, needed to build `attempt.execute`.
-        self._offers: dict[str, AttemptOffer] = {}
-        #: attempt_id -> the acceptance the node returned.
-        self._accepted: dict[str, AttemptDecision] = {}
         #: request_id -> nodes that declined work on it, so a replacement offer
         #: goes somewhere it might be accepted. Lost on restart, which only
         #: risks sending a retry back to a refuser.
@@ -2751,6 +2747,20 @@ class GatewayService:
             delivery_mode=request.delivery_mode,
             parameters=parameters,
         )
+        # The offer carries the request's own remaining budget, never a fixed
+        # window. An agent session may legitimately hold a thirty-minute or a
+        # twenty-four-hour deadline, and a node that honoured a sixty-second
+        # offer deadline would abandon work the request explicitly paid for;
+        # the contract names this field normative, so the number must mean the
+        # request's real bound. The request's deadline stays the authoritative
+        # end — the sweep enforces it either way — and this is the node-facing
+        # expression of the same number, floored at zero because a request
+        # whose deadline passed is ended by the sweep rather than offered.
+        remaining_ms = DEFAULT_DEADLINE_MS
+        if request.deadline_at is not None:
+            remaining_ms = max(
+                0, int((request.deadline_at - moment).total_seconds() * 1000)
+            )
         offer = AttemptOffer(
             request_id=attempt.request_id,
             attempt_id=attempt.attempt_id,
@@ -2759,7 +2769,7 @@ class GatewayService:
             model=inputs["model"],
             request_digest=request_digest,
             max_milli_credits=max_charge,
-            deadline_ms=DEFAULT_DEADLINE_MS,
+            deadline_ms=remaining_ms,
             delivery_mode=cast(DeliveryMode, request.delivery_mode),
             messages=messages,
             parameters=parameters,
@@ -2774,7 +2784,6 @@ class GatewayService:
                 authorization_hash=authorization_hash,
             ),
         )
-        self._offers[attempt.attempt_id] = offer
         return Envelope(type="attempt.offer", payload=offer.to_payload())
 
     def _pick_node(
@@ -2858,35 +2867,64 @@ class GatewayService:
             )
         return attempt
 
+    def _permit_hash_for(self, attempt: AttemptRecord, moment: dt.datetime) -> str:
+        """Recompute the permit hash from durable rows.
+
+        The hash a node signs its acceptance against is a pure function of the
+        request's stored dispatch inputs and the attempt's own dispatch fields, so
+        a restart that lost the in-memory offer can still verify it. Re-deriving
+        here rather than reading ``self._offers`` is what lets an executed attempt
+        settle after the server restarts, instead of being silently free.
+
+        Raises:
+            GatewayError: If the request or its dispatch inputs are missing.
+        """
+        request = self._store.get_request(attempt.request_id)
+        if request is None:
+            raise GatewayError(f"request {attempt.request_id} not found")
+        inputs = self._store.get_request_input(attempt.request_id)
+        if inputs is None:
+            raise GatewayError(f"request {attempt.request_id} has no stored dispatch inputs")
+        authorization = signed_record_from_dict(inputs["authorization"])
+        authorization_hash = canonical_digest(dict(authorization.payload))
+        max_charge = int(str(authorization.payload.get("max_charge_milli_credits", "0")))
+        messages = parse_chat_messages(inputs["messages"])
+        parameters = dict(inputs["parameters"])
+        request_digest = compute_request_digest(
+            messages=messages,
+            model=inputs["model"],
+            delivery_mode=request.delivery_mode,
+            parameters=parameters,
+        )
+        return compute_permit_hash(
+            request_id=attempt.request_id,
+            attempt_id=attempt.attempt_id,
+            epoch=attempt.dispatch_epoch,
+            model=inputs["model"],
+            request_digest=request_digest,
+            max_milli_credits=max_charge,
+            authorization_hash=authorization_hash,
+        )
+
     def _on_accept(
         self, node_id: str, envelope: Envelope, moment: dt.datetime
     ) -> list[Envelope]:
         """Record an acceptance and authorise execution.
 
+        The permit hash is re-derived from durable rows rather than read from the
+        in-memory offer, so an acceptance that arrives after a restart — when that
+        offer is gone — is still verified and still authorises execution. The
+        acceptance commitment itself is persisted, because it folds the node's own
+        accepted_at and cannot be recomputed; the matching usage report reads it
+        back to settle.
+
         Raises:
-            GatewayError: If the offer terms are no longer in memory, which is
-                the documented loss across a restart.
             ProtocolError: If the acceptance does not match the offered terms,
                 or the attempt was already accepted on different terms.
         """
         decision = AttemptDecision.from_payload(envelope.payload, accepted=True)
         attempt = self._ref_attempt(node_id, decision.ref)
-        offer = self._offers.get(attempt.attempt_id)
-        if offer is None:
-            raise GatewayError(
-                f"no permit context for attempt {attempt.attempt_id}; the offer "
-                "terms are held in memory and a restart loses them, so a late "
-                "acceptance is refused rather than trusted"
-            )
-        expected = compute_permit_hash(
-            request_id=offer.request_id,
-            attempt_id=offer.attempt_id,
-            epoch=offer.epoch,
-            model=offer.model,
-            request_digest=offer.request_digest,
-            max_milli_credits=offer.max_milli_credits,
-            authorization_hash=offer.authorization_hash,
-        )
+        expected = self._permit_hash_for(attempt, moment)
         if decision.permit_hash != expected:
             self._store.set_attempt_status(
                 attempt.attempt_id, "FAILED", at=moment, execution_state="FAILED"
@@ -2898,8 +2936,12 @@ class GatewayService:
         # regenerate its acceptance commitment, because that digest covers the
         # instant it accepted. What it may not do is change the terms, and the
         # permit-hash check above already refuses that.
-        self._accepted[attempt.attempt_id] = decision
-        self._store.set_attempt_status(attempt.attempt_id, "ACCEPTED", at=moment)
+        self._store.set_attempt_status(
+            attempt.attempt_id,
+            "ACCEPTED",
+            at=moment,
+            acceptance_hash=decision.acceptance_hash,
+        )
         return [Envelope(type="attempt.execute", payload=decision.ref.to_payload())]
 
     def _on_reject(
@@ -3249,26 +3291,18 @@ class GatewayService:
                 f"the event announces {event.usage.total_tokens} tokens while its "
                 f"signed report measures {measured}; refusing to settle either total"
             )
-        offer = self._offers.get(attempt.attempt_id)
-        if offer is None:
-            raise GatewayError(
-                f"no permit context for attempt {attempt.attempt_id}; the offer "
-                "terms are held in memory and a restart loses them"
-            )
-        expected = compute_permit_hash(
-            request_id=offer.request_id,
-            attempt_id=offer.attempt_id,
-            epoch=offer.epoch,
-            model=offer.model,
-            request_digest=offer.request_digest,
-            max_milli_credits=offer.max_milli_credits,
-            authorization_hash=offer.authorization_hash,
-        )
+        expected = self._permit_hash_for(attempt, moment)
         if str(report.payload.get("permit_hash", "")) != expected:
             raise ProtocolError("the report's permit hash is not the one the server issued")
-        decision = self._accepted.get(attempt.attempt_id)
+        stored = self._store.get_attempt(attempt.attempt_id)
+        if stored is None or stored.acceptance_hash is None:
+            raise GatewayError(
+                f"attempt {attempt.attempt_id} has no stored acceptance; it was "
+                "accepted before acceptance persistence existed, so its usage "
+                "cannot be verified after a restart"
+            )
         claimed = str(report.payload.get("acceptance_hash", ""))
-        if decision is None or decision.acceptance_hash != claimed:
+        if stored.acceptance_hash != claimed:
             raise ProtocolError(
                 "the report's acceptance hash is not the one the node accepted"
             )

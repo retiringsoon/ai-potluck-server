@@ -1,5 +1,6 @@
 # CI for the ai-potluck-server package: ruff, mypy --strict, and the pytest
-# suite on the two Python versions the project supports (>=3.11).
+# suite on the Python versions the project supports (>=3.11: 3.11, 3.12, 3.13).
+# Tag pushes (releases) also trigger this workflow.
 #
 # Until ai-potluck is published to a package index, the job checks out the
 # companion repository beside this one and installs it from source; once the
@@ -16,6 +17,10 @@ name: ci
 
 on:
   push:
+    branches:
+      - "**"
+    tags:
+      - "**"
     paths:
       - "**"
   pull_request:
@@ -28,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 

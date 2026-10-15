@@ -1998,15 +1998,16 @@ def test_restart_rebuilds_the_log_and_keeps_receipts(harness: Harness) -> None:
     assert harness.status("R-1")["status"] == "SUCCEEDED"
 
 
-def test_restart_forgets_offer_context_but_keeps_the_attempt_row(
+def test_restart_reverifies_a_late_acceptance_against_stored_rows(
     harness: Harness,
 ) -> None:
-    """Documented loss: the offer's terms are in memory, so a later accept is refused.
+    """P0-3: the permit terms survive on durable rows, so a late accept is re-accepted.
 
-    The attempt row and the request's status survive, which is what lets a
-    consumer still read what happened; what is gone is the permit hash and the
-    authorization, so the server refuses to trust a late acceptance against a
-    hash it can no longer recompute.
+    The offer's permit hash is recomputed from the stored dispatch inputs, never
+    trusted from an in-memory offer the restart destroyed. A late acceptance that
+    matches the offered terms is therefore re-verified and re-accepted, and its
+    acceptance commitment is persisted — the request is neither left stuck nor
+    silently free.
     """
     harness.connect()
     harness.admit(harness.authorization(request_id="R-1"))
@@ -2016,10 +2017,23 @@ def test_restart_forgets_offer_context_but_keeps_the_attempt_row(
 
     assert harness.store.get_attempt(offer.attempt_id) is not None
     assert harness.status("R-1")["status"] == "RUNNING"
-    with pytest.raises(GatewayError, match="no permit context"):
-        harness.service.handle_node_message(
-            node_id="node-A", envelope=_accept(offer), now=BASE
-        )
+    reread_before = harness.store.get_attempt(offer.attempt_id)
+    assert reread_before is not None
+    assert reread_before.acceptance_hash is None, (
+        "the attempt was never accepted before the restart"
+    )
+
+    replies = harness.service.handle_node_message(
+        node_id="node-A", envelope=_accept(offer), now=BASE
+    )
+    assert [reply.type for reply in replies] == ["attempt.execute"]
+
+    reread = harness.store.get_attempt(offer.attempt_id)
+    assert reread is not None
+    assert reread.acceptance_hash == "acceptance-1", (
+        "the acceptance commitment must persist even after a restart"
+    )
+    assert harness.status("R-1")["status"] == "RUNNING"
 
 
 def test_construction_refuses_a_non_contiguous_log(

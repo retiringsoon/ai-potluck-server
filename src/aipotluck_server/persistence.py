@@ -271,6 +271,10 @@ class AttemptRecord:
     #: consumed no tokens, so it does not occupy a slot in the request's attempt
     #: budget; see `_ADDED_COLUMNS`.
     refused_before_execution: bool = False
+    #: The acceptance commitment the node signed when it accepted this attempt's
+    #: offer. `None` for an attempt that was never durably accepted (a row from
+    #: before this column existed); see `_ADDED_COLUMNS`.
+    acceptance_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -770,7 +774,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     settlement_status TEXT NOT NULL,
     execution_state TEXT,
     updated_at TEXT NOT NULL,
-    refused_before_execution INTEGER NOT NULL DEFAULT 0
+    refused_before_execution INTEGER NOT NULL DEFAULT 0,
+    acceptance_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_request ON attempts(request_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_node ON attempts(node_id);
@@ -1003,6 +1008,12 @@ _ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     # whole budget on zero work.
     "attempts": (
         ("refused_before_execution", "INTEGER NOT NULL DEFAULT 0"),
+        # The acceptance commitment a node signed, stored when it accepted an
+        # offer. The server cannot recompute it — it folds the node's own
+        # accepted_at — so it is persisted here so a usage report that arrives
+        # after a restart can still be verified and settled, rather than being
+        # silently free.
+        ("acceptance_hash", "TEXT"),
     ),
     # The wall-clock budget a request on this key gets. NULL means the surface's
     # own default, so a key minted before this column behaves exactly as it did.
@@ -2468,12 +2479,15 @@ class ServerStore(_Store):
         execution_state: str | None = None,
         output_eligible: bool | None = None,
         settlement_status: str | None = None,
+        acceptance_hash: str | None = None,
     ) -> None:
         """Update an attempt's status.
 
         `execution_state`, `output_eligible` and `settlement_status` are left
         unchanged when `None`, which is why the update is expressed with
-        `COALESCE`.
+        `COALESCE`. `acceptance_hash` is likewise written only when given, so the
+        acceptance commitment recorded at accept time survives a server restart
+        and the matching usage report can still be settled.
 
         Raises:
             StateTransitionError: If no such attempt exists.
@@ -2484,7 +2498,8 @@ class ServerStore(_Store):
                 "UPDATE attempts SET status = ?, updated_at = ?,"
                 " execution_state = COALESCE(?, execution_state),"
                 " output_eligible = COALESCE(?, output_eligible),"
-                " settlement_status = COALESCE(?, settlement_status)"
+                " settlement_status = COALESCE(?, settlement_status),"
+                " acceptance_hash = COALESCE(?, acceptance_hash)"
                 " WHERE attempt_id = ?",
                 (
                     status,
@@ -2492,6 +2507,7 @@ class ServerStore(_Store):
                     execution_state,
                     None if output_eligible is None else (1 if output_eligible else 0),
                     settlement_status,
+                    acceptance_hash,
                     attempt_id,
                 ),
             )
@@ -3880,6 +3896,7 @@ def _attempt_from_row(row: Any) -> AttemptRecord:
         execution_state=_opt_text(row["execution_state"]),
         updated_at=_from_text(str(row["updated_at"])),
         refused_before_execution=bool(int(row["refused_before_execution"])),
+        acceptance_hash=_opt_text(row["acceptance_hash"]),
     )
 
 

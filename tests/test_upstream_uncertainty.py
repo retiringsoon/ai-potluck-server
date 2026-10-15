@@ -113,7 +113,7 @@ class _TimingOutAdapter:
     """
 
     name: str = "timing-out-upstream"
-    model: str = "fake-model-v1"
+    model: str = MODEL
     supports_streaming: bool = False
     calls: int = 0
     detail: str = "upstream read timed out after the request was sent"
@@ -132,7 +132,7 @@ class _UsageLessAdapter:
     """An adapter that answers, but reports no usage block at all."""
 
     name: str = "usage-less-upstream"
-    model: str = "fake-model-v1"
+    model: str = MODEL
     supports_streaming: bool = False
     calls: int = 0
 
